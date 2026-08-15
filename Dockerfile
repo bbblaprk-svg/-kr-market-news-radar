@@ -1,9 +1,17 @@
 FROM node:20-alpine
 WORKDIR /app
 ENV NODE_ENV=production \
-    PORT=3000 \
-    APP_VERSION=1.7.0 \
+    APP_VERSION=1.8.1 \
+    LS_OPENAPI_ENABLED=true \
+    LS_SNAPSHOT_CACHE_MS=12000 \
+    LS_PREIGNITION_MAX_TARGETS=12 \
+    LS_TAPE_ROWS=80 \
+    LS_MARKET_SCAN_CACHE_MS=15000 \
+    LS_MARKET_SCAN_SHORTLIST=24 \
+    LS_MARKET_SCAN_MAX_UNIVERSE=320 \
+    LS_MULTI_QUOTE_BATCH=50 \
     STORE_DIR=/tmp/kr-news-radar \
+    RENDER_FREE_MODE=true \
     OFFICIAL_ONLY_FREE_MODE=true \
     OFFICIAL_FEEDS_ENABLED=true \
     FOREIGN_FIRST_MODE=true \
@@ -19,14 +27,13 @@ ENV NODE_ENV=production \
 RUN addgroup -S nodejs && adduser -S radar -G nodejs \
     && mkdir -p /tmp/kr-news-radar /tmp/build-bin \
     && chown -R radar:nodejs /tmp/kr-news-radar /app /tmp/build-bin
-COPY kr_market_news_radar_SECTOR_FORECAST_170.bin /tmp/app.tar.gz
+COPY GLOBAL_MARKET_IMPACT_RADAR_RENDER_LS_181.bin /tmp/app.tar.gz
 RUN set -eux; \
-    echo "Using release archive: kr_market_news_radar_SECTOR_FORECAST_170.bin"; \
     tar -xzf /tmp/app.tar.gz -C /app; \
     rm -f /tmp/app.tar.gz; \
     npm run check; \
     chown -R radar:nodejs /app
 USER radar
-EXPOSE 3000
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD wget -qO- http://127.0.0.1:3000/api/health >/dev/null || exit 1
+EXPOSE 10000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD wget -qO- "http://127.0.0.1:${PORT:-10000}/api/health" >/dev/null || exit 1
 CMD ["node", "server.js"]
