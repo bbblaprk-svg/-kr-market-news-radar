@@ -1,26 +1,47 @@
 FROM node:22-alpine
 WORKDIR /app
-LABEL gmir.version="2.4.2" gmir.build_id="GMIR-2402-T1717-SMART-FIX-20260817"
+LABEL gmir.version="2.4.4" gmir.build_id="GMIR-2404-FLOW-FRESH-3M-CACHE-FINAL-20260818"
 ENV NODE_ENV=production \
-    APP_VERSION=2.4.2 \
-    APP_BUILD_ID=GMIR-2402-T1717-SMART-FIX-20260817 \
+    APP_VERSION=2.4.4 \
+    APP_BUILD_ID=GMIR-2404-FLOW-FRESH-3M-CACHE-FINAL-20260818 \
     PRE_SWING_ENABLED=true \
     PRE_SWING_MIN_MARKET_CAP_KRW=500000000000 \
     PRE_SWING_MIN_AVG_AMOUNT_KRW=5000000000 \
     PRE_SWING_HISTORY_DAYS=22 \
     PRE_SWING_HISTORY_MIN_DAYS=15 \
     PRE_SWING_TOP_N=10 \
+    PRE_SWING_FLOW_WS_SLOTS=5 \
+    PRE_SWING_FLOW_ROTATION_MS=120000 \
+    PRE_SWING_FLOW_PROXY_MAX_AGE_MS=180000 \
+    PRE_SWING_FLOW_PROXY_HISTORY_MS=900000 \
+    PRE_SWING_FLOW_PROXY_MIN_MATURITY_SEC=45 \
+    PRE_SWING_FLOW_PROXY_REFRESH_MS=60000 \
+    PRE_SWING_T1717_DEADLINE_MS=20000 \
     LS_API_T1717_RPS=0.8 \
+    LS_RUNTIME_CORE_WS_MAX=20 \
+    LS_RUNTIME_CORE_WS_CHALLENGERS=5 \
+    LS_REALTIME_MAX_TARGETS=25 \
+    LS_REALTIME_RETAIN_MS=900000 \
+    LS_REALTIME_BOOK_RETAIN_MS=900000 \
     STORE_DIR=/tmp/kr-news-radar \
     RENDER_FREE_MODE=true
 RUN addgroup -S nodejs && adduser -S radar -G nodejs && mkdir -p /tmp/kr-news-radar && chown -R radar:nodejs /tmp/kr-news-radar /app
-COPY GLOBAL_MARKET_IMPACT_RADAR_2402_T1717_SMART_FIX.bin /tmp/app.tar.gz
+COPY GLOBAL_MARKET_IMPACT_RADAR_2404_FINAL_DEPLOY_SAFE.bin /tmp/app.tar.gz
 RUN set -eux; \
     tar -xzf /tmp/app.tar.gz -C /app; rm -f /tmp/app.tar.gz; \
-    test -f /app/server.js; test -f /app/lib/preSwingEngine.js; test -f /app/bootstrap/pre-swing-bootstrap.json; \
-    node --check /app/server.js; node --check /app/lib/preSwingEngine.js; node --check /app/public/app.js; \
-    node /app/scripts/check-t1717-smart.js; \
-    node -e "const p=require('/app/lib/preSwingEngine');const s=p.snapshot({kick:false});if(!Array.isArray(s.items)||s.items.length!==10)throw new Error('PRE_SWING_NOT_10_AT_COLD_START');console.log('PRE_SWING_COLD_START_OK',s.items.length,s.anchorDate,s.historyDays);"; \
+    test -f /app/server.js; test -f /app/lib/preSwingEngine.js; test -f /app/lib/preSwingFlowBridge.js; \
+    test -f /app/public/sw.js; test -f /app/public/index.html; test -f /app/public/app.js; \
+    node --check /app/server.js; node --check /app/lib/preSwingEngine.js; node --check /app/lib/runtimeCore.js; node --check /app/lib/lsRealtimeMarket.js; node --check /app/public/app.js; \
+    grep -Fq "gmir-shell-v244-final" /app/public/sw.js; \
+    grep -Fq "./app.js?v=2404f" /app/public/index.html; \
+    grep -Fq "v2.4.4" /app/public/index.html; \
+    ! grep -Fq "?v=2314" /app/public/index.html; \
+    node /app/scripts/check-service-worker.js; \
+    node /app/scripts/check-pre-swing-flow-fusion.js; \
+    node /app/scripts/check-pre-swing-flow-freshness.js; \
+    node /app/scripts/check-pre-swing-flow-slots.js; \
+    node -e "const p=require('/app/lib/preSwingEngine');const s=p.snapshot({kick:false});if(!Array.isArray(s.items)||s.items.length!==10)throw new Error('PRE_SWING_NOT_10_AT_COLD_START');if(p.FLOW_PROXY_MAX_AGE_MS!==180000||p.FLOW_PROXY_HISTORY_MS!==900000||p.FLOW_PROXY_REFRESH_MS!==60000)throw new Error('FLOW_FRESHNESS_CONFIG_MISMATCH');console.log('PRE_SWING_COLD_START_OK',s.items.length,s.anchorDate,s.historyDays,'FLOW_FRESH',p.FLOW_PROXY_MAX_AGE_MS,'HISTORY',p.FLOW_PROXY_HISTORY_MS,'REFRESH',p.FLOW_PROXY_REFRESH_MS);"; \
+    npm run check; \
     chown -R radar:nodejs /app
 USER radar
 EXPOSE 10000
