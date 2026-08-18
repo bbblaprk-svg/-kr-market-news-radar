@@ -47,7 +47,7 @@ s=Path('/app/app.py').read_text('utf-8')
 h=Path('/app/static/index.html').read_text('utf-8')
 for x in ['1.1.1-NEWS-QUALITY-LS-CONFIRM','NEWS_QUALITY_MIN','NEWS_NOISE','NEWS_CATALYST','quality_reasons','related_stocks','news_payload']:
     assert x in s,x
-for x in ['투자관련도 필터','시장반응 대기']:
+for x in ['투자관련도 필터','NOVA PRE-IGNITION','DISCOVERY']:
     assert x in h,x
 print('NOVA v1.1.1 NEWS QUALITY VERIFY: PASS')
 PY
