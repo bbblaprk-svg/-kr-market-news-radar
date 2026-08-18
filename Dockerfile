@@ -1,9 +1,11 @@
 FROM node:22-alpine
 WORKDIR /app
-LABEL gmir.version="3.0.1" gmir.build_id="GMIR-301-UI-PRE-FAILSAFE-FINAL-20260818"
+LABEL gmir.version="4.0.0" gmir.build_id="GMIR-400-PUSH-RUNTIME-FINAL-20260818"
 ENV NODE_ENV=production \
-    APP_VERSION=3.0.1 \
-    APP_BUILD_ID=GMIR-301-UI-PRE-FAILSAFE-FINAL-20260818 \
+    APP_VERSION=4.0.0 \
+    APP_BUILD_ID=GMIR-400-PUSH-RUNTIME-FINAL-20260818 \
+    GMIR_MARKET_PUSH_SAMPLE_MS=1000 \
+    GMIR_MARKET_PUSH_HEARTBEAT_MS=5000 \
     PRE_SWING_ENABLED=true \
     PRE_SWING_MIN_MARKET_CAP_KRW=500000000000 \
     PRE_SWING_MIN_AVG_AMOUNT_KRW=5000000000 \
@@ -32,21 +34,22 @@ ENV NODE_ENV=production \
     STORE_DIR=/tmp/kr-news-radar \
     RENDER_FREE_MODE=true
 RUN addgroup -S nodejs && adduser -S radar -G nodejs && mkdir -p /tmp/kr-news-radar && chown -R radar:nodejs /tmp/kr-news-radar /app
-COPY GLOBAL_MARKET_IMPACT_RADAR_301_UI_PRE_FAILSAFE_FINAL.bin /tmp/app.tar.gz
+COPY GLOBAL_MARKET_IMPACT_RADAR_400_PUSH_RUNTIME_FINAL.bin /tmp/app.tar.gz
 RUN set -eux; \
     tar -xzf /tmp/app.tar.gz -C /app; rm -f /tmp/app.tar.gz; \
     test -f /app/server.js; \
     test -f /app/lib/runtimeCore.js; \
     test -f /app/lib/lsRealtimeMarket.js; \
+    test -f /app/lib/marketStateHub.js; \
     test -f /app/lib/preSwingEngine.js; \
-    test -f /app/bootstrap/pre-swing-bootstrap.json; \
-    test -f /app/public/pre-swing-bootstrap.json; \
-    grep -Fq "const scan = state.preIgnitionMarketScan || {}" /app/public/app.js; \
-    grep -Fq "loadPreSwingStaticFallback" /app/public/app.js; \
-    grep -Fq "const TOP_N=10; // sealed" /app/lib/preSwingEngine.js; \
-    grep -Fq "gmir-shell-v301-ui-pre-failsafe" /app/public/sw.js; \
-    grep -Fq "./app.js?v=3001f" /app/public/index.html; \
-    grep -Fq "v3.0.1" /app/public/index.html; \
+    grep -Fq "event: market-state" /app/server.js; \
+    grep -Fq "pathname === '/api/market-state'" /app/server.js; \
+    grep -Fq "source.addEventListener('market-state'" /app/public/app.js; \
+    ! grep -Fq "state.preIgnitionTimer = setInterval" /app/public/app.js; \
+    grep -Fq "globalFreeze=false" /app/lib/liveRankEngine.js; \
+    grep -Fq "gmir-shell-v400-push-runtime" /app/public/sw.js; \
+    grep -Fq "./app.js?v=4000p" /app/public/index.html; \
+    grep -Fq "v4.0.0" /app/public/index.html; \
     npm run check; \
     rm -rf /app/data /app/node_modules; mkdir -p /app/data; \
     chown -R radar:nodejs /app /tmp/kr-news-radar
