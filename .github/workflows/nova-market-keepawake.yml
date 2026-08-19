@@ -3,47 +3,35 @@ name: NOVA Market Keepawake
 on:
   workflow_dispatch:
   schedule:
-    - cron: "50 22 * * 0-4"
-    - cron: "*/10 23 * * 0-4"
-    - cron: "*/10 0-10 * * 1-5"
-    - cron: "0 11 * * 1-5"
+    - cron: "50 22 * * 0-4"   # 07:50 KST Mon-Fri
+    - cron: "*/10 23 * * 0-4" # 08:00-08:50 KST Mon-Fri
+    - cron: "*/10 0-10 * * 1-5" # 09:00-19:50 KST Mon-Fri
+    - cron: "0 11 * * 1-5"    # 20:00 KST Mon-Fri
 
 jobs:
   wake:
     runs-on: ubuntu-latest
     timeout-minutes: 3
-
     steps:
       - name: Wake and keep NOVA alive
         env:
           NOVA_RENDER_URL: ${{ secrets.NOVA_RENDER_URL }}
-
         run: |
           set -euo pipefail
-
           if [ -z "${NOVA_RENDER_URL:-}" ]; then
-            echo "Missing NOVA_RENDER_URL"
+            echo "Missing GitHub Actions secret: NOVA_RENDER_URL"
             exit 1
           fi
-
           DOW="$(TZ=Asia/Seoul date +%u)"
           HM="$(TZ=Asia/Seoul date +%H%M)"
-
           echo "KST day=$DOW time=$HM"
-
           if [ "$DOW" -gt 5 ] || [ "$HM" -lt 0750 ] || [ "$HM" -gt 2000 ]; then
-            echo "Outside NOVA market window"
+            echo "Outside NOVA market window; skip."
             exit 0
           fi
-
           URL="${NOVA_RENDER_URL%/}/healthz"
-
           curl --fail --silent --show-error \
-               --retry 5 \
-               --retry-delay 15 \
-               --retry-all-errors \
-               --connect-timeout 20 \
-               --max-time 90 \
+               --retry 5 --retry-delay 15 --retry-all-errors \
+               --connect-timeout 20 --max-time 90 \
                "$URL"
-
           echo
