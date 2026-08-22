@@ -1,7 +1,7 @@
 FROM node:20-alpine
 WORKDIR /app
 ENV NODE_ENV=production \
-    APP_VERSION=1.9.8-H3 \
+    APP_VERSION=1.9.8-H3F3 \
     GMIR_ALLOWED_ORIGINS=https://bbblaprk-svg.github.io \
     LS_OPENAPI_ENABLED=true \
     LS_NEWS_ENABLED=true \
@@ -30,6 +30,15 @@ ENV NODE_ENV=production \
     LS_MARKET_SCAN_SHORTLIST=24 \
     LS_MARKET_SCAN_MAX_UNIVERSE=320 \
     LS_MULTI_QUOTE_BATCH=50 \
+    ENERGY_MIN_MARKET_CAP_EOK=500 \
+    ENERGY_BROAD_SCAN_MS=60000 \
+    ENERGY_BROAD_SHORTLIST=40 \
+    ENERGY_HISTORY_TARGETS=20 \
+    ENERGY_RESULT_LIMIT=10 \
+    ENERGY_BACKGROUND_TICK_MS=5000 \
+    ENERGY_T8407_INTERVAL_MS=230 \
+    ENERGY_T1102_INTERVAL_MS=120 \
+    ENERGY_T1305_INTERVAL_MS=1050 \
     STORE_DIR=/tmp/kr-news-radar \
     RENDER_FREE_MODE=true \
     OFFICIAL_ONLY_FREE_MODE=true \
@@ -47,7 +56,7 @@ ENV NODE_ENV=production \
 RUN addgroup -S nodejs && adduser -S radar -G nodejs \
     && mkdir -p /tmp/kr-news-radar /tmp/build-bin \
     && chown -R radar:nodejs /tmp/kr-news-radar /app /tmp/build-bin
-COPY GLOBAL_MARKET_IMPACT_RADAR_RENDER_LS_198_LS_CATALYST_H3.bin /tmp/app.tar.gz
+COPY GLOBAL_MARKET_IMPACT_RADAR_RENDER_LS_198_H3_FIX3_ENERGY_COMPRESSION_500EOK.bin /tmp/app.tar.gz
 RUN set -eux; \
     tar -xzf /tmp/app.tar.gz -C /app; \
     rm -f /tmp/app.tar.gz; \
