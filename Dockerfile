@@ -1,7 +1,7 @@
 FROM node:20-alpine
 WORKDIR /app
 ENV NODE_ENV=production \
-    APP_VERSION=1.9.8-H3F3 \
+    APP_VERSION=1.9.8-H3F4 \
     GMIR_ALLOWED_ORIGINS=https://bbblaprk-svg.github.io \
     LS_OPENAPI_ENABLED=true \
     LS_NEWS_ENABLED=true \
@@ -56,7 +56,7 @@ ENV NODE_ENV=production \
 RUN addgroup -S nodejs && adduser -S radar -G nodejs \
     && mkdir -p /tmp/kr-news-radar /tmp/build-bin \
     && chown -R radar:nodejs /tmp/kr-news-radar /app /tmp/build-bin
-COPY GLOBAL_MARKET_IMPACT_RADAR_RENDER_LS_198_H3_FIX3_ENERGY_COMPRESSION_500EOK.bin /tmp/app.tar.gz
+COPY GLOBAL_MARKET_IMPACT_RADAR_RENDER_LS_198_H3_FIX4_RANK_STABILITY.bin /tmp/app.tar.gz
 RUN set -eux; \
     tar -xzf /tmp/app.tar.gz -C /app; \
     rm -f /tmp/app.tar.gz; \
