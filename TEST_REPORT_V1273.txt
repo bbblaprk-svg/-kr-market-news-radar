@@ -1,0 +1,40 @@
+PULSE EDGE V12.7.3 TEST REPORT
+UTC 2026-10-20T04:22:17Z
+--- pulse_core ---
+test_allowlisted_private_http_requires_explicit_switch (test_v127_ls.TestLSProvider.test_allowlisted_private_http_requires_explicit_switch) ... ok
+test_baseline_archive_accepts_ls_pairs (test_v127_ls.TestLSProvider.test_baseline_archive_accepts_ls_pairs) ... ok
+test_early_rotation_is_display_only (test_v127_ls.TestLSProvider.test_early_rotation_is_display_only) ... ok
+test_exit_and_weakening_display (test_v127_ls.TestLSProvider.test_exit_and_weakening_display) ... ok
+test_ls_baseline_provenance_is_required (test_v127_ls.TestLSProvider.test_ls_baseline_provenance_is_required) ... ok
+test_ls_source_only (test_v127_ls.TestLSProvider.test_ls_source_only) ... ok
+test_partial_frame_rejected (test_v127_ls.TestLSProvider.test_partial_frame_rejected) ... ok
+test_public_http_bridge_is_rejected (test_v127_ls.TestLSProvider.test_public_http_bridge_is_rejected) ... ok
+test_rotation_sort_prefers_stage_over_absolute_turnover (test_v127_ls.TestLSProvider.test_rotation_sort_prefers_stage_over_absolute_turnover) ... ok
+test_s2_and_s3_display_stages_do_not_change_state (test_v127_ls.TestLSProvider.test_s2_and_s3_display_stages_do_not_change_state) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.012s
+
+OK
+--- pulse_bridge ---
+
+> pulse-ls1943-readonly-bridge@12.7.3 test
+> node tests.js
+
+ok - original LS1943 provider modules are byte-identical
+ok - original OAuth/REST/WS route is preserved
+ok - PULSE adapter is separate from provider modules
+ok - KRX quote normalization marks original provider lane
+ok - NXT PRE and KRX regular remain separated
+ok - PULSE deep cap is 30 even though original feed supports 40
+ok - native fallback subscription budget is bounded by adapter
+ok - bridge has no order route or order TR
+ok - provider diagnostics and PULSE endpoints are separate
+V12.7.3 separated bridge tests passed: 9
+--- python compile ---
+OK
+--- no order TR in runtime paths ---
+OK no order TR
+--- provider byte provenance ---
+ac44a47196bf00bc8dc878bc39f514265614db6c76b6c0761f03940a7b7c43f8  /mnt/data/PULSE_EDGE_V12_7_3_EARLY_ROTATION_FIRST_20261020/ls_provider_original/lib/lsOpenApi.js
+17ad7201ed3ad1273d32d8dbab619d473a90c45a634e8d7d13257ac620105013  /mnt/data/PULSE_EDGE_V12_7_3_EARLY_ROTATION_FIRST_20261020/ls_provider_original/lib/realtimeFeed.js
