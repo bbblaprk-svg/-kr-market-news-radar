@@ -308,6 +308,7 @@ class FastHistory500:
         data: Dict[str, pd.DataFrame] = {}
         errors: List[str] = []
         missing = [c for c in codes if self._needs_history_refresh(c)]
+        LOG.info("history cache hit=%d missing=%d venue=%s", len(codes) - len(missing), len(missing), self.venue)
         if missing:
             LOG.info("history bootstrap/refresh required=%d venue=%s", len(missing), self.venue)
         for i, code in enumerate(missing, 1):
@@ -793,6 +794,8 @@ class Alpha500Integrated(TwoStageDeepScanner):
                     "selection_type": selection_type,
                     "symbol": str(r.get("symbol", "")).zfill(6),
                     "name": str(r.get("name", "")),
+                    "market": str(r.get("market", "")),
+                    "venue": self.active_venue,
                     "current_price": px,
                     "change_pct": round(fnum(r.get("current_return_pct"), 0.0), 3),
                     "entry_price": px,
@@ -819,7 +822,7 @@ class Alpha500Integrated(TwoStageDeepScanner):
         top_watch = stock_rows(deep, "WATCH", self.final_top_n)
 
         # 선정 히스토리 최대 200건. FINAL 우선, FINAL이 없으면 WATCH 상위 5개를 기록한다.
-        history_path = self.result_dir / "selection_history.json"
+        history_path = self.result_dir / f"selection_history_{self.active_venue}.json"
         history: List[Dict[str, Any]] = []
         try:
             if history_path.exists():
@@ -1070,6 +1073,7 @@ class AdaptiveLSProvider(LSProvider):
     def __init__(self):
         super().__init__()
         self._tr_last: Dict[str, float] = {}
+        self._request_lock = threading.RLock()
 
     def _wait_tr(self, tr_cd: str):
         gap = self.TR_INTERVAL.get(tr_cd, 1.05)
@@ -1080,16 +1084,17 @@ class AdaptiveLSProvider(LSProvider):
         self._tr_last[tr_cd] = time.monotonic()
 
     def _post_tr(self, path: str, tr_cd: str, body: dict) -> requests.Response:
-        self._wait_tr(tr_cd)
-        r = self.s.post(
-            self.base + path,
-            headers=self._headers(tr_cd),
-            json=body,
-            timeout=self.timeout,
-        )
-        if r.status_code != 200:
-            raise BrokerError(f"LS {tr_cd} HTTP {r.status_code}: {r.text[:240]}")
-        return r
+        with self._request_lock:
+            self._wait_tr(tr_cd)
+            r = self.s.post(
+                self.base + path,
+                headers=self._headers(tr_cd),
+                json=body,
+                timeout=self.timeout,
+            )
+            if r.status_code != 200:
+                raise BrokerError(f"LS {tr_cd} HTTP {r.status_code}: {r.text[:240]}")
+            return r
 
 
 @dataclass
@@ -1105,36 +1110,34 @@ class LiquidityRow:
 
 class LiquidityHistory:
     def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
-        self.conn.execute("PRAGMA busy_timeout=30000")
-        try:
+        with self._lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
             self.conn.execute("PRAGMA journal_mode=WAL")
-        except Exception:
-            pass
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS liquidity (
-              trade_date TEXT NOT NULL,
-              code TEXT NOT NULL,
-              name TEXT,
-              market TEXT,
-              trade_value REAL,
-              market_cap_100m REAL,
-              rank_no INTEGER,
-              return_pct REAL,
-              PRIMARY KEY(trade_date, code)
+            self.conn.execute("PRAGMA busy_timeout=30000")
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS liquidity (
+                  trade_date TEXT NOT NULL,
+                  code TEXT NOT NULL,
+                  name TEXT,
+                  market TEXT,
+                  trade_value REAL,
+                  market_cap_100m REAL,
+                  rank_no INTEGER,
+                  return_pct REAL,
+                  PRIMARY KEY(trade_date, code)
+                )
+                """
             )
-            """
-        )
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_liq_date ON liquidity(trade_date)")
-        self.conn.commit()
+            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_liq_date ON liquidity(trade_date)")
+            self.conn.commit()
 
     def upsert(self, trade_date: str, rows: Sequence[LiquidityRow]):
-        if not rows:
-            return
         with self._lock:
+            if not rows:
+                return
             self.conn.executemany(
                 """
                 INSERT INTO liquidity(trade_date,code,name,market,trade_value,market_cap_100m,rank_no,return_pct)
@@ -1175,13 +1178,13 @@ class LiquidityHistory:
             GROUP BY code
             """
             df = pd.read_sql_query(q, self.conn, params=use)
-        if df.empty:
-            return df
-        max_days = max(1, len(use))
-        df["coverage_ratio"] = df["coverage_days"] / max_days
-        # 새 종목이 며칠만 등장해 평균이 과대평가되는 것을 줄인다.
-        df["liquidity_score"] = df["avg_trade_value"] * (0.65 + 0.35 * df["coverage_ratio"])
-        return df.sort_values(["liquidity_score", "avg_rank"], ascending=[False, True]).reset_index(drop=True)
+            if df.empty:
+                return df
+            max_days = max(1, len(use))
+            df["coverage_ratio"] = df["coverage_days"] / max_days
+            # 새 종목이 며칠만 등장해 평균이 과대평가되는 것을 줄인다.
+            df["liquidity_score"] = df["avg_trade_value"] * (0.65 + 0.35 * df["coverage_ratio"])
+            return df.sort_values(["liquidity_score", "avg_rank"], ascending=[False, True]).reset_index(drop=True)
 
 
 class Universe500Selector:
@@ -1414,9 +1417,12 @@ class Universe500Selector:
         else:
             universe = list(universe_all)
 
-        resolved, unresolved = self.resolve_master(master, universe)
         cap_map = self.get_cap_map()
-        cap_eligible_count = sum(1 for x in universe if cap_map.get(x.code) is None or fnum(cap_map.get(x.code), 0) >= self.min_cap_100m) if cap_map else len(universe)
+        if not cap_map:
+            raise RuntimeError("시가총액 검증 불가: 1000억원 필터를 통과시킬 수 없음")
+        universe = [x for x in universe if fnum(cap_map.get(x.code), 0) >= self.min_cap_100m]
+        resolved, unresolved = self.resolve_master(master, universe)
+        cap_eligible_count = len(universe)
         target_n = min(self.target, cap_eligible_count) if self.exchgubun == "N" else self.target
         if cap_map:
             resolved["market_cap_100m"] = resolved["code"].map(cap_map)
@@ -1612,7 +1618,8 @@ from urllib.parse import urlparse
 
 from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import Alpha500Integrated, market_session_now
 
-VERSION = "ALPHA500_LS_CLUSTER_HA_V1_6_WS_STARTFIX"
+ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_OPERATING"
+VERSION = ENGINE_VERSION
 PORT = int(os.getenv("PORT", "10000"))
 MASTER = os.getenv("UNIVERSE_MASTER", "섹터마스터_500종목_V3.csv")
 RESULT_DIR = Path(os.getenv("RESULT_DIR", "/data/results"))
@@ -1653,11 +1660,17 @@ STATE = {
     "ws_subscribed": 0,
     "ws_channels": [],
     "ws_error": None,
+    "ws_tick_count": 0,
+    "ws_last_tr": None,
+    "ws_last_symbol": None,
+    "ls_status": "STARTING",
     "rest_fallback_active": False,
 }
-LOCK = threading.Lock()
+LOCK = threading.RLock()
 ENGINE = None
-LIVE_LOCK = threading.Lock()
+ENGINE_LOCK = threading.RLock()
+REST_ENGINE = None
+LIVE_LOCK = threading.RLock()
 LIVE_QUOTES = {}
 LIVE_UPDATED_KST = None
 LIVE_QUOTE_META = {}
@@ -1708,20 +1721,34 @@ logging.getLogger("alpha500_integrated").addHandler(_progress_handler)
 
 
 def load_latest():
-    p = RESULT_DIR / "latest_alpha500.json"
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+    venue = str(market_session_now().get("venue") or "KRX").upper()
+    for p in (RESULT_DIR / f"latest_alpha500_{venue}.json", RESULT_DIR / "latest_alpha500.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if str(data.get("venue") or "").upper() == venue:
+                return data
+        except (OSError, ValueError, AttributeError):
+            continue
+    return None
 
 
 def get_engine():
     global ENGINE
-    if ENGINE is None:
-        ENGINE = Alpha500Integrated(MASTER)
-    return ENGINE
+    with ENGINE_LOCK:
+        if ENGINE is None:
+            ENGINE = Alpha500Integrated(MASTER)
+        return ENGINE
+
+
+def get_rest_history(venue):
+    # Separate REST overlay provider avoids changing the running scan's venue.
+    global REST_ENGINE
+    with ENGINE_LOCK:
+        if REST_ENGINE is None:
+            from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import FastHistory500
+            REST_ENGINE = FastHistory500(get_engine().ls, db_path=str(RESULT_DIR.parent / "alpha500_live_bars.sqlite3"))
+        REST_ENGINE.set_venue(venue, "N" if venue == "NXT" else "K")
+        return REST_ENGINE
 
 def _quote_pct(q):
     try:
@@ -1938,6 +1965,9 @@ def live_ws_loop():
             engine = get_engine()
             engine.ls._ensure_token()
             token = engine.ls.token
+            with LOCK:
+                STATE["ls_status"] = "CONNECTED"
+            log.info("LS CONNECTED token_ready=true")
             ws = websocket.create_connection(WS_URL, timeout=5, enable_multithread=True)
             ws.settimeout(2)
             channels = sorted(set(x[0] for x in subs))
@@ -1947,6 +1977,7 @@ def live_ws_loop():
                     "body": {"tr_cd": tr_cd, "tr_key": code},
                 }, ensure_ascii=False))
             signature = (venue, tuple(subs))
+            last_tick_monotonic = time.monotonic()
             _set_ws_state("CONNECTED", subscribed=len(subs), channels=channels, error=None)
             log.info("WS CONNECTED venue=%s channels=%s subscribed=%s", venue, channels, len(subs))
             while True:
@@ -1957,6 +1988,9 @@ def live_ws_loop():
                 subs2 = _ws_subscriptions(summary2, venue2) if bool(info2.get("scan_allowed")) else []
                 if (venue2, tuple(subs2)) != signature:
                     break
+                if time.monotonic() - last_tick_monotonic > WS_STALE_SECONDS:
+                    _set_ws_state("STALE", error="WS tick stale", rest_fallback=True)
+                    raise RuntimeError("WS tick stale; reconnect and REST fallback")
                 try:
                     raw = ws.recv()
                 except websocket.WebSocketTimeoutException:
@@ -1972,6 +2006,8 @@ def live_ws_loop():
                     payload = json.loads(raw)
                 except Exception:
                     continue
+                if market_session_now().get("venue") != venue:
+                    break
                 # 구독 승인/거절 응답도 로그에 남겨 CONNECTED와 실제 RECEIVING을 구분한다.
                 hdr = payload.get("header") if isinstance(payload, dict) and isinstance(payload.get("header"), dict) else {}
                 rsp_cd = str(hdr.get("rsp_cd") or "").strip()
@@ -1979,8 +2015,16 @@ def live_ws_loop():
                 if rsp_cd and rsp_cd not in {"00000", "0"}:
                     log.warning("WS subscription response rsp_cd=%s msg=%s", rsp_cd, rsp_msg[:160])
                 code, q, tr_cd = _extract_ws_quote(payload)
-                if code and q:
+                if code and q and (tr_cd, code) in subs:
+                    last_tick_monotonic = time.monotonic()
                     _set_live_quote(code, q, f"WS:{tr_cd or 'REAL'}", venue)
+                    with LOCK:
+                        STATE["ws_tick_count"] = int(STATE.get("ws_tick_count") or 0) + 1
+                        STATE["ws_last_tr"] = tr_cd or "REAL"
+                        STATE["ws_last_symbol"] = code
+                        tick_n = STATE["ws_tick_count"]
+                    if tick_n <= 3 or tick_n % 100 == 0:
+                        log.info("WS TICK count=%s tr=%s symbol=%s price=%s diff=%s", tick_n, tr_cd or "REAL", code, q.get("price"), q.get("diff"))
                     _set_ws_state("RECEIVING", last_message=True)
         except Exception as e:
             _set_ws_state("STALE", error=str(e)[:240])
@@ -2005,6 +2049,8 @@ def _apply_live_overlay(summary):
     sources = set()
     for key in ("top_final", "top_watch", "selection_history"):
         for r in out.get(key) or []:
+            if str(r.get("venue") or out.get("venue") or "").upper() != str(out.get("venue") or "").upper():
+                continue
             c = str(r.get("symbol", "")).zfill(6)
             q = qmap.get(c)
             if not q:
@@ -2045,18 +2091,16 @@ def live_quote_loop():
             if bool(info.get("scan_allowed")):
                 venue = str(info.get("venue") or "KRX").upper()
                 targets = _ws_target_map(summary, venue)
-                stale = [c for c in targets if not _quote_is_fresh(c)]
+                stale = [c for c in targets if not (_quote_is_fresh(c) and _quote_source(c).startswith("WS:"))]
                 if stale:
-                    # 딥스캔 중에는 REST 호출을 양보하되 WebSocket 수신은 계속된다.
-                    with LOCK:
-                        busy = bool(STATE.get("running"))
-                    if not busy:
-                        engine = get_engine()
-                        engine.fast_history.set_venue(venue, "N" if venue == "NXT" else "K")
-                        qmap = engine.fast_history.multi_quotes(stale)
+                    history = get_rest_history(venue)
+                    qmap = history.multi_quotes(stale)
+                    if market_session_now().get("venue") == venue:
                         for code, q in qmap.items():
-                            _set_live_quote(code, q, "REST:t8450" if venue == "NXT" else "REST:t8407", venue)
-                        fallback_used = bool(qmap)
+                            # A tick received while REST was in flight takes precedence.
+                            if not (_quote_is_fresh(code) and _quote_source(code).startswith("WS:")):
+                                _set_live_quote(code, q, "REST:t8450" if venue == "NXT" else "REST:t8407", venue)
+                                fallback_used = True
             _set_ws_state(STATE.get("ws_status", "WAITING"), rest_fallback=fallback_used)
         except Exception as e:
             logging.getLogger("alpha500_live").warning("REST fallback failed: %s", e)
@@ -2145,6 +2189,10 @@ def scan_loop():
 def state_copy():
     with LOCK:
         d = dict(STATE)
+    if d.get("ws_status") == "RECEIVING" and d.get("ws_last_message_kst"):
+        age = (now_kst() - datetime.fromisoformat(d["ws_last_message_kst"])).total_seconds()
+        if age > WS_STALE_SECONDS:
+            d["ws_status"] = "STALE"
     d["ls_configured"] = bool(os.getenv("LS_APP_KEY") and os.getenv("LS_APP_SECRET"))
     d["master"] = MASTER
     d["now_kst"] = now_kst_iso()
@@ -2205,9 +2253,9 @@ class Handler(BaseHTTPRequestHandler):
 <div class="card"><div id="progressText" class="v" style="font-size:15px">-</div><div class="progress"><div id="bar" class="bar"></div></div><div id="progressMsg" class="phase">-</div></div>
 
 <div class="section"><h2>판정 요약</h2><div id="summary" class="summary"></div></div>
-<div class="section"><h2>현재 후보 · 실시간 현재가/등락률/진입가</h2><div id="candidateNote" class="note"></div><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">종목</th><th>코드</th><th>현재가</th><th>등락률</th><th>진입가</th><th>통합점수</th><th>딥점수</th><th>등급</th><th class="left">메가섹터</th><th class="left">에너지군</th><th>에너지</th><th>상태</th></tr></thead><tbody id="candidates"></tbody></table></div></div>
+<div class="section"><h2>현재 후보 · 실시간 현재가/등락률/진입가</h2><div id="candidateNote" class="note"></div><div class="tablebox"><table><thead><tr><th>실시간순위</th><th class="left">종목</th><th>현재가</th><th>등락률</th><th>진입가</th><th>통합점수</th><th>딥점수</th><th>등급</th><th class="left">메가섹터</th><th class="left">에너지군</th><th>에너지</th><th>상태</th></tr></thead><tbody id="candidates"></tbody></table></div></div>
 <div class="section"><h2>섹터 에너지 변화 · 자금 이동도</h2><div class="note">Δ에너지와 순위 이동은 직전 판정 회차 대비입니다. 첫 회차는 NEW로 표시됩니다.</div><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">에너지 군집</th><th>상태</th><th>에너지</th><th>Δ에너지</th><th>순위이동</th><th>Breadth</th><th>평균등락</th><th>시장RS</th><th>거래가속</th><th>종목수</th></tr></thead><tbody id="sectors"></tbody></table></div></div>
-<div class="section"><h2>선정 히스토리 <span id="histCount" class="note"></span></h2><div class="note">최대 200건 보관 · 화면은 약 20행 높이로 고정 · 아래 영역에서 스크롤</div><div class="historybox"><table><thead><tr><th class="left">선정시각 KST</th><th>거래소</th><th>세션</th><th>횟수</th><th>구분</th><th class="left">종목</th><th>코드</th><th>현재가</th><th>현재등락률</th><th>진입가</th><th>딥점수</th><th>등급</th><th class="left">에너지군</th><th>에너지</th><th>상태</th></tr></thead><tbody id="history"></tbody></table></div></div>
+<div class="section"><h2>선정 히스토리 <span id="histCount" class="note"></span></h2><div class="note">최대 200건 보관 · 화면은 약 20행 높이로 고정 · 아래 영역에서 스크롤</div><div class="historybox"><table><thead><tr><th class="left">선정시각 KST</th><th>거래소</th><th>세션</th><th>횟수</th><th>구분</th><th class="left">종목</th><th>현재가</th><th>현재등락률</th><th>진입가</th><th>딥점수</th><th>등급</th><th class="left">에너지군</th><th>에너지</th><th>상태</th></tr></thead><tbody id="history"></tbody></table></div></div>
 <div class="foot">08:00 NXT PRE에서 당일 첫 판정을 시작합니다. KRX와 NXT의 가격·과거봉·섹터에너지 캐시는 서로 분리되며 통합(U) 시세는 사용하지 않습니다. 진입가는 판정 시점 신호 기준가입니다.</div>
 </div>
 <script>
@@ -2216,9 +2264,23 @@ const num=(v,d=0)=>{const n=Number(v);return Number.isFinite(n)?n.toLocaleString
 const pct=v=>{const n=Number(v);return Number.isFinite(n)?((n>0?'+':'')+n.toFixed(2)+'%'):'-'};
 const cls=v=>Number(v)>0?'pos':Number(v)<0?'neg':'';
 const box=(k,v)=>`<div class="sbox"><div class="k">${esc(k)}</div><div class="snum">${esc(v)}</div></div>`;
-function candidateRows(rows){if(!rows?.length)return '<tr><td colspan="13" class="empty left">현재 표시할 후보가 없습니다.</td></tr>';return rows.map((r,i)=>`<tr><td>${i+1}</td><td class="left"><b>${esc(r.name)}</b></td><td>${esc(r.symbol)}</td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.entry_price)}</td><td>${num(r.integrated_score,1)}</td><td>${num(r.deep_score,1)}</td><td><span class="badge">${esc(r.deep_grade)}</span></td><td class="left">${esc(r.MEGA_SECTOR)}</td><td class="left">${esc(r.ENERGY_CLUSTER)}</td><td>${num(r.cluster_energy,1)}</td><td>${esc(r.cluster_state)}</td></tr>`).join('')}
+function clamp(v,a,b){v=Number(v)||0;return Math.max(a,Math.min(b,v))}
+function liveRankScore(r){
+ const base=0.50*(Number(r.integrated_score)||0)+0.20*(Number(r.deep_score)||0)+0.15*(Number(r.cluster_energy)||0);
+ const cp=Number(r.current_price)||0, ep=Number(r.entry_price)||0, ch=Number(r.change_pct)||0;
+ const er=(cp>0&&ep>0)?((cp/ep-1)*100):0;
+ let dyn=50+5*clamp(er,-5,5)+2*clamp(ch,-5,5);
+ if(ch>5) dyn-=8*(ch-5);
+ if(er<-4) dyn-=8;
+ return base+0.15*dyn;
+}
+function candidateRows(rows){
+ if(!rows?.length)return '<tr><td colspan="12" class="empty left">현재 표시할 후보가 없습니다.</td></tr>';
+ const sorted=[...rows].sort((a,b)=>liveRankScore(b)-liveRankScore(a));
+ return sorted.map((r,i)=>`<tr><td>${i+1}</td><td class="left"><b>${esc(r.name)}</b></td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.entry_price)}</td><td>${num(r.integrated_score,1)}</td><td>${num(r.deep_score,1)}</td><td><span class="badge">${esc(r.deep_grade)}</span></td><td class="left">${esc(r.MEGA_SECTOR)}</td><td class="left">${esc(r.ENERGY_CLUSTER)}</td><td>${num(r.cluster_energy,1)}</td><td>${esc(r.cluster_state)}</td></tr>`).join('')
+}
 function sectorRows(rows){if(!rows?.length)return '<tr><td colspan="11" class="empty left">섹터 에너지 데이터 준비 중</td></tr>';return rows.slice(0,30).map(r=>{let mv=esc(r.movement);let mc=String(r.movement||'').startsWith('↑')?'up':String(r.movement||'').startsWith('↓')?'down':'';return `<tr><td>${num(r.rank)}</td><td class="left"><b>${esc(r.ENERGY_CLUSTER)}</b></td><td>${esc(r.cluster_state)}</td><td>${num(r.cluster_energy,1)}</td><td class="${cls(r.energy_delta)}">${r.energy_delta==null?'-':(Number(r.energy_delta)>0?'+':'')+num(r.energy_delta,1)}</td><td class="${mc}">${mv}</td><td>${pct(Number(r.cluster_breadth)*100)}</td><td class="${cls(r.cluster_avg_return)}">${pct(r.cluster_avg_return)}</td><td class="${cls(r.cluster_market_rs)}">${num(r.cluster_market_rs,2)}</td><td>${num(r.cluster_turnover_accel,2)}</td><td>${num(r.cluster_members)}</td></tr>`}).join('')}
-function historyRows(rows){if(!rows?.length)return '<tr><td colspan="15" class="empty left">아직 선정 히스토리가 없습니다.</td></tr>';return rows.slice(0,200).map(r=>`<tr><td class="left">${esc(r.selected_at_kst||'-')}</td><td>${esc(r.venue||'-')}</td><td>${esc(r.session||'-')}</td><td>${num(r.occurrence)}</td><td>${esc(r.selection_type)}</td><td class="left"><b>${esc(r.name)}</b></td><td>${esc(r.symbol)}</td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.entry_price)}</td><td>${num(r.deep_score,1)}</td><td>${esc(r.deep_grade)}</td><td class="left">${esc(r.ENERGY_CLUSTER)}</td><td>${num(r.cluster_energy,1)}</td><td>${esc(r.cluster_state)}</td></tr>`).join('')}
+function historyRows(rows){if(!rows?.length)return '<tr><td colspan="14" class="empty left">아직 선정 히스토리가 없습니다.</td></tr>';return rows.slice(0,200).map(r=>`<tr><td class="left">${esc(r.selected_at_kst||'-')}</td><td>${esc(r.venue||'-')}</td><td>${esc(r.session||'-')}</td><td>${num(r.occurrence)}</td><td>${esc(r.selection_type)}</td><td class="left"><b>${esc(r.name)}</b></td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.entry_price)}</td><td>${num(r.deep_score,1)}</td><td>${esc(r.deep_grade)}</td><td class="left">${esc(r.ENERGY_CLUSTER)}</td><td>${num(r.cluster_energy,1)}</td><td>${esc(r.cluster_state)}</td></tr>`).join('')}
 async function refresh(){
  try{
   const s=await fetch('/api/status?x='+Date.now(),{cache:'no-store'}).then(r=>r.json());
@@ -2226,8 +2288,8 @@ async function refresh(){
   const st=document.getElementById('status');st.textContent=s.status+(s.running?' · RUNNING':'');st.className='v '+(s.status==='ERROR'?'bad':s.status==='READY'?'ok':'warn');
   document.getElementById('venue').textContent=s.venue||s.expected_venue||'-';document.getElementById('session').textContent=s.session||s.expected_session||'-';
   document.getElementById('phase').textContent=s.phase||'-';
-  const ls=document.getElementById('ls');ls.textContent=s.ls_configured?'CONNECTED':'NOT CONFIGURED';ls.className='v '+(s.ls_configured?'ok':'bad');
-  const ws=document.getElementById('ws');ws.textContent=(s.ws_status||'WAITING')+(s.ws_subscribed?` · ${s.ws_subscribed}`:'')+(s.rest_fallback_active?' · REST F/B':'');ws.className='v '+((s.ws_status==='RECEIVING'||s.ws_status==='CONNECTED')?'ok':(s.ws_status==='STALE'?'bad':'warn'));document.getElementById('now').textContent=s.now_kst||'-';document.getElementById('finished').textContent=s.last_finished||'-';
+  const ls=document.getElementById('ls');ls.textContent=s.ls_status||(s.ls_configured?'CONFIGURED':'NOT CONFIGURED');ls.className='v '+(s.ls_status==='CONNECTED'?'ok':'warn');
+  const ws=document.getElementById('ws');ws.textContent=(s.ws_status||'WAITING')+` · SUB ${s.ws_subscribed||0} · TICK ${s.ws_tick_count||0}`+(s.ws_last_tr?` · ${s.ws_last_tr}`:'')+` · 마지막 수신 ${s.ws_last_message_kst||'-'}`+(s.rest_fallback_active?' · REST F/B':'');ws.className='v '+((s.ws_status==='RECEIVING')?'ok':(s.ws_status==='STALE'?'bad':'warn'));document.getElementById('now').textContent=s.now_kst||'-';document.getElementById('finished').textContent=s.last_finished||'-';
   document.getElementById('progressText').textContent=(s.progress_total?`${s.progress_current}/${s.progress_total} · ${s.progress_pct}%`:s.phase||'-');
   document.getElementById('bar').style.width=Math.max(0,Math.min(100,Number(s.progress_pct)||0))+'%';document.getElementById('progressMsg').textContent=s.last_error||s.progress_message||'-';
   document.getElementById('runBtn').disabled=!!s.running;
@@ -2237,7 +2299,7 @@ async function refresh(){
   const ur=r.universe_report||{};document.getElementById('summary').innerHTML=box('거래소',r.venue||'-')+box('세션',r.session||'-')+box('판정 유니버스',num(r.universe))+box('NXT 거래가능',num(ur.nxt_eligible_total))+box('시총필터 후',num(ur.cap_eligible_estimate))+box('섹터군집',num(r.clusters))+box('FINAL',num(r.final_count));
   const finalRows=r.top_final||[], watchRows=r.top_watch||[]; const show=finalRows.length?finalRows:watchRows;
   const liveTxt=r.live_updated_kst?` · 현재가 갱신 ${r.live_updated_kst} (${r.live_price_source||'LS'})`:'';
-  document.getElementById('candidateNote').textContent=(finalRows.length?`FINAL 적격 ${finalRows.length}개`:`FINAL 적격 없음 · WATCH 상위 ${watchRows.length}개를 관찰용으로 표시`)+liveTxt;
+  document.getElementById('candidateNote').textContent=(finalRows.length?`FINAL 적격 ${finalRows.length}개`:`FINAL 적격 없음 · WATCH 상위 ${watchRows.length}개를 실시간순위로 표시`)+liveTxt;
   document.getElementById('candidates').innerHTML=candidateRows(show);
   document.getElementById('sectors').innerHTML=sectorRows(r.sector_energy||r.top_clusters||[]);
   const h=r.selection_history||[];document.getElementById('histCount').textContent=`${h.length}/200`;document.getElementById('history').innerHTML=historyRows(h);
@@ -3505,56 +3567,54 @@ class HistoryStore:
     """종목별 OHLCV 캐시. 공급자/venue를 분리해 데이터 혼합을 방지한다."""
 
     def __init__(self, db_path: str):
-        self.path = Path(db_path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self.conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30.0)
-        self.conn.execute("PRAGMA busy_timeout=30000")
-        try:
+        with self._lock:
+            self.path = Path(db_path)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
             self.conn.execute("PRAGMA journal_mode=WAL")
-        except Exception:
-            pass
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS bars (
-                provider TEXT NOT NULL,
-                venue TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                open REAL,
-                high REAL,
-                low REAL,
-                close REAL,
-                volume REAL,
-                turnover REAL,
-                PRIMARY KEY(provider, venue, symbol, timestamp)
-            )
-        """)
-        self.conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_bars_symbol
-            ON bars(provider, venue, symbol, timestamp)
-        """)
-        self.conn.commit()
+            self.conn.execute("PRAGMA busy_timeout=30000")
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS bars (
+                    provider TEXT NOT NULL,
+                    venue TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL,
+                    volume REAL,
+                    turnover REAL,
+                    PRIMARY KEY(provider, venue, symbol, timestamp)
+                )
+            """)
+            self.conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_bars_symbol
+                ON bars(provider, venue, symbol, timestamp)
+            """)
+            self.conn.commit()
 
     def upsert(self, provider: str, venue: str, symbol: str, df: pd.DataFrame):
-        if df is None or df.empty:
-            return
-        x = df.copy()
-        for c in ["open", "high", "low", "close", "volume"]:
-            if c not in x.columns:
-                raise ValueError(f"cache upsert missing {c}")
-        if "turnover" not in x.columns:
-            x["turnover"] = np.nan
-
-        rows = []
-        for _, r in x.iterrows():
-            ts = pd.Timestamp(r["timestamp"]).strftime("%Y-%m-%d")
-            rows.append((
-                provider, venue, symbol, ts,
-                float(r["open"]), float(r["high"]), float(r["low"]),
-                float(r["close"]), float(r["volume"]),
-                None if pd.isna(r["turnover"]) else float(r["turnover"]),
-            ))
         with self._lock:
+            if df is None or df.empty:
+                return
+            x = df.copy()
+            for c in ["open", "high", "low", "close", "volume"]:
+                if c not in x.columns:
+                    raise ValueError(f"cache upsert missing {c}")
+            if "turnover" not in x.columns:
+                x["turnover"] = np.nan
+
+            rows = []
+            for _, r in x.iterrows():
+                ts = pd.Timestamp(r["timestamp"]).strftime("%Y-%m-%d")
+                rows.append((
+                    provider, venue, symbol, ts,
+                    float(r["open"]), float(r["high"]), float(r["low"]),
+                    float(r["close"]), float(r["volume"]),
+                    None if pd.isna(r["turnover"]) else float(r["turnover"]),
+                ))
             self.conn.executemany("""
                 INSERT INTO bars(provider, venue, symbol, timestamp, open, high, low, close, volume, turnover)
                 VALUES(?,?,?,?,?,?,?,?,?,?)
@@ -3565,18 +3625,18 @@ class HistoryStore:
             self.conn.commit()
 
     def read(self, provider: str, venue: str, symbol: str, limit: int = 240) -> pd.DataFrame:
-        q = """
-            SELECT timestamp, open, high, low, close, volume, turnover
-            FROM bars
-            WHERE provider=? AND venue=? AND symbol=?
-            ORDER BY timestamp DESC LIMIT ?
-        """
         with self._lock:
+            q = """
+                SELECT timestamp, open, high, low, close, volume, turnover
+                FROM bars
+                WHERE provider=? AND venue=? AND symbol=?
+                ORDER BY timestamp DESC LIMIT ?
+            """
             df = pd.read_sql_query(q, self.conn, params=(provider, venue, symbol, limit))
-        if df.empty:
-            return df
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        return df.sort_values("timestamp").reset_index(drop=True)
+            if df.empty:
+                return df
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            return df.sort_values("timestamp").reset_index(drop=True)
 
     def last_date(self, provider: str, venue: str, symbol: str) -> Optional[date]:
         with self._lock:
@@ -3585,9 +3645,9 @@ class HistoryStore:
                 WHERE provider=? AND venue=? AND symbol=?
             """, (provider, venue, symbol))
             row = cur.fetchone()
-        if not row or not row[0]:
-            return None
-        return pd.Timestamp(row[0]).date()
+            if not row or not row[0]:
+                return None
+            return pd.Timestamp(row[0]).date()
 
 
 class BrokerError(RuntimeError):
@@ -3614,6 +3674,7 @@ class KISProvider(BaseProvider):
         self.timeout = env_float("REQUEST_TIMEOUT", 12.0)
         self.rl = RateLimiter(env_float("KIS_MIN_INTERVAL", 0.08))
         self.s = requests.Session()
+        self._token_lock = threading.RLock()
         self.token: Optional[str] = None
         self.token_expire_monotonic = 0.0
 
@@ -3742,6 +3803,7 @@ class LSProvider(BaseProvider):
         self.timeout = env_float("REQUEST_TIMEOUT", 12.0)
         self.rl = RateLimiter(env_float("LS_MIN_INTERVAL", 1.05))
         self.s = requests.Session()
+        self._token_lock = threading.RLock()
         self.token: Optional[str] = None
         self.token_expire_monotonic = 0.0
 
@@ -3750,30 +3812,31 @@ class LSProvider(BaseProvider):
         return bool(self.app_key and self.app_secret)
 
     def _ensure_token(self):
-        if self.token and time.monotonic() < self.token_expire_monotonic - 60:
-            return
-        if not self.configured:
-            raise BrokerError("LS_APP_KEY/LS_APP_SECRET 미설정")
-        self.rl.wait()
-        r = self.s.post(
-            self.base + "/oauth2/token",
-            headers={"content-type": "application/x-www-form-urlencoded"},
-            data={
-                "grant_type": "client_credentials",
-                "appkey": self.app_key,
-                "appsecretkey": self.app_secret,
-                "scope": "oob",
-            },
-            timeout=self.timeout,
-        )
-        if r.status_code != 200:
-            raise BrokerError(f"LS token HTTP {r.status_code}: {r.text[:200]}")
-        j = r.json()
-        self.token = j.get("access_token")
-        if not self.token:
-            raise BrokerError(f"LS token missing: {j}")
-        expires = int(j.get("expires_in") or j.get("expire_in") or 86400)
-        self.token_expire_monotonic = time.monotonic() + max(600, expires)
+        with self._token_lock:
+            if self.token and time.monotonic() < self.token_expire_monotonic - 60:
+                return
+            if not self.configured:
+                raise BrokerError("LS_APP_KEY/LS_APP_SECRET 미설정")
+            self.rl.wait()
+            r = self.s.post(
+                self.base + "/oauth2/token",
+                headers={"content-type": "application/x-www-form-urlencoded"},
+                data={
+                    "grant_type": "client_credentials",
+                    "appkey": self.app_key,
+                    "appsecretkey": self.app_secret,
+                    "scope": "oob",
+                },
+                timeout=self.timeout,
+            )
+            if r.status_code != 200:
+                raise BrokerError(f"LS token HTTP {r.status_code}: {r.text[:200]}")
+            j = r.json()
+            self.token = j.get("access_token")
+            if not self.token:
+                raise BrokerError(f"LS token missing: {j}")
+            expires = int(j.get("expires_in") or j.get("expire_in") or 86400)
+            self.token_expire_monotonic = time.monotonic() + max(600, expires)
 
     def _headers(self, tr_cd: str, tr_cont: str = "N", tr_cont_key: str = "") -> Dict[str, str]:
         self._ensure_token()
