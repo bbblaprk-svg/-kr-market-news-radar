@@ -1322,13 +1322,23 @@ class Universe500Selector:
             )
         return out
 
-    def _fetch_cap_market(self, upcode: str, max_pages: int = 30) -> Dict[str, float]:
+    def _fetch_cap_market(self, upcode: str, max_pages: int = 60) -> Dict[str, float]:
+        """LS t1444 시총맵을 연속키가 끝날 때까지 수집한다.
+
+        한 페이지 안에 1,000억원 미만 종목이 섞였다는 이유로 조기 종료하면
+        뒤 페이지의 정상 종목이 누락되어 전체 유니버스가 붕괴할 수 있다.
+        """
         out: Dict[str, float] = {}
         idx = 0
         seen = set()
         for _ in range(max_pages):
             body = {"t1444InBlock": {"upcode": upcode, "idx": idx}}
-            j = self.ls._post_tr("/stock/high-item", "t1444", body).json()
+            try:
+                j = self.ls._post_tr("/stock/high-item", "t1444", body).json()
+            except Exception as e:
+                LOG.warning("t1444 cap page unavailable upcode=%s idx=%s collected=%s err=%s",
+                            upcode, idx, len(out), str(e)[:220])
+                break
             page = j.get("t1444OutBlock1") or []
             for z in page:
                 code = str(z.get("shcode", "")).strip().zfill(6)
@@ -1336,10 +1346,6 @@ class Universe500Selector:
                 if re.fullmatch(r"\d{6}", code) and cap > 0:
                     out[code] = cap
             nxt = int(fnum((j.get("t1444OutBlock") or {}).get("idx"), 0))
-            # 순위형이므로 페이지의 최저 시총이 1000억 아래로 내려가면 이후도 필요 없음.
-            page_caps = [fnum(x.get("total"), 0.0) for x in page if fnum(x.get("total"), 0.0) > 0]
-            if page_caps and min(page_caps) < self.min_cap_100m:
-                break
             if not page or nxt <= 0 or nxt == idx or nxt in seen:
                 break
             seen.add(nxt)
@@ -1347,21 +1353,28 @@ class Universe500Selector:
         return out
 
     def get_cap_map(self) -> Dict[str, float]:
-        if self._cap_cache is not None:
+        if self._cap_cache is not None and len(self._cap_cache) >= 500:
             return self._cap_cache
         today = date.today().strftime("%Y%m%d")
         p = self.data_dir / f"cap_map_{today}.json"
         if p.exists():
             try:
-                self._cap_cache = {k: float(v) for k, v in json.loads(p.read_text(encoding="utf-8")).items()}
-                return self._cap_cache
-            except Exception:
-                pass
-        cap = {}
+                cached = {k: float(v) for k, v in json.loads(p.read_text(encoding="utf-8")).items()}
+                if len(cached) >= 500:
+                    self._cap_cache = cached
+                    return self._cap_cache
+                LOG.warning("cap cache incomplete rows=%s; rebuilding", len(cached))
+            except Exception as e:
+                LOG.warning("cap cache read failed; rebuilding: %s", str(e)[:180])
+        cap: Dict[str, float] = {}
         for upcode in ("001", "301"):
             cap.update(self._fetch_cap_market(upcode))
-        p.write_text(json.dumps(cap, ensure_ascii=False), encoding="utf-8")
+        try:
+            p.write_text(json.dumps(cap, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            LOG.warning("cap cache write failed: %s", str(e)[:180])
         self._cap_cache = cap
+        LOG.info("cap map ready rows=%s min_cap_100m=%s", len(cap), self.min_cap_100m)
         return cap
 
     def update_liquidity_history(self, universe: Sequence[SymbolInfo]) -> pd.DataFrame:
@@ -1418,12 +1431,17 @@ class Universe500Selector:
             universe = list(universe_all)
 
         cap_map = self.get_cap_map()
-        if not cap_map:
-            raise RuntimeError("시가총액 검증 불가: 1000억원 필터를 통과시킬 수 없음")
-        universe = [x for x in universe if fnum(cap_map.get(x.code), 0) >= self.min_cap_100m]
+        # 시총맵 미수록 종목을 0원으로 처리하면 일부수집 시 500개가 39개처럼 붕괴한다.
+        # 실제 1,000억원 미만이 확인된 종목만 제외하고, 미수록은 검증대기로 유지한다.
+        cap_known = sum(1 for x in universe if cap_map.get(x.code) is not None)
+        cap_rejected = sum(1 for x in universe if cap_map.get(x.code) is not None and fnum(cap_map.get(x.code), 0) < self.min_cap_100m)
+        cap_unknown = sum(1 for x in universe if cap_map.get(x.code) is None)
+        universe = [x for x in universe if cap_map.get(x.code) is None or fnum(cap_map.get(x.code), 0) >= self.min_cap_100m]
         resolved, unresolved = self.resolve_master(master, universe)
         cap_eligible_count = len(universe)
         target_n = min(self.target, cap_eligible_count) if self.exchgubun == "N" else self.target
+        LOG.info("cap gate source=%s known=%s unknown=%s rejected=%s eligible=%s target=%s",
+                 cap_known + cap_unknown + cap_rejected, cap_known, cap_unknown, cap_rejected, cap_eligible_count, target_n)
         if cap_map:
             resolved["market_cap_100m"] = resolved["code"].map(cap_map)
             # 실제 cap map에 들어온 종목이 기준 미달이면 제거. cap map 미수록은 아직 검증대기.
@@ -1554,6 +1572,10 @@ class Universe500Selector:
             "nxt_eligible_total": nxt_total,
             "venue_source_total": len(universe),
             "cap_eligible_estimate": cap_eligible_count,
+            "cap_known": cap_known,
+            "cap_unknown": cap_unknown,
+            "cap_rejected": cap_rejected,
+            "cap_map_rows": len(cap_map),
             "exchgubun": self.exchgubun,
             "liquidity_anchor_target": self.anchor_n,
             "liquidity_anchor_in_selected": int((resolved["LIQUIDITY_ANCHOR"] == "Y").sum()),
@@ -1618,7 +1640,7 @@ from urllib.parse import urlparse
 
 from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import Alpha500Integrated, market_session_now
 
-ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_OPERATING"
+ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_1_CAPFIX"
 VERSION = ENGINE_VERSION
 PORT = int(os.getenv("PORT", "10000"))
 MASTER = os.getenv("UNIVERSE_MASTER", "섹터마스터_500종목_V3.csv")
