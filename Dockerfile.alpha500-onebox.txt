@@ -36,11 +36,24 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     LIVE_SECTOR_NXT=false \
     LIVE_SECTOR_REP_N=5 \
     SELECTION_HISTORY_MAX=200 \
+    CLOSE_BET_ENABLED=true \
+    CLOSE_BET_TOP_N=5 \
+    CLOSE_BET_POLL_SECONDS=10 \
+    CLOSE_BET_MAX_RETURN_PCT=7.0 \
+    CLOSE_BET_MIN_RETURN_PCT=-3.0 \
+    PRECLOSE_RESCAN_ENABLED=true \
+    PRECLOSE_RESCAN_TOP_N=60 \
+    NXT_EOD_HOLD_ENABLED=true \
+    NXT_EOD_HOLD_MINUTE=1195 \
     HISTORY_DISPLAY_ROWS=20 \
     RATIONAL_ENERGY_GROUPING=true \
     SHARED_UNIVERSE_HANDOFF=true \
     NXT_WS_SUB_MAX=20 \
-    NXT_WS_STALE_SECONDS=30 \
+    NXT_WS_SUBSCRIBE_INTERVAL_MS=350 \
+    NXT_WS_MAX_CONSECUTIVE_FAILURES=3 \
+    NXT_WS_CIRCUIT_BREAK_SECONDS=60 \
+    NXT_WS_RECONNECT_MAX_SECONDS=30 \
+    NXT_WS_STALE_SECONDS=45 \
     WS_SUBSCRIBE_INTERVAL_MS=180 \
     WS_SUBSCRIBE_BATCH=5 \
     WS_RECONNECT_BACKOFF_SECONDS=5 \
@@ -2080,7 +2093,7 @@ from urllib.parse import urlparse
 
 from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import Alpha500Integrated, market_session_now
 
-ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_11_NXT_HANDOFF_WS_STABLE"
+ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_14_STALE_EOD_PRECLOSE"
 VERSION = ENGINE_VERSION
 PORT = int(os.getenv("PORT", "10000"))
 MASTER = os.getenv("UNIVERSE_MASTER", "섹터마스터_500종목_V3.csv")
@@ -2125,6 +2138,13 @@ STATE = {
     "ws_tick_count": 0,
     "ws_last_tr": None,
     "ws_last_symbol": None,
+    "ws_last_tick_kst": None,
+    "ws_last_price": None,
+    "ws_last_key": None,
+    "ws_ack_count": 0,
+    "ws_reject_count": 0,
+    "ws_reconnect_count": 0,
+    "ws_transport_mode": "STARTING",
     "ls_status": "STARTING",
     "rest_fallback_active": False,
     "live_pool_count": 0,
@@ -2137,6 +2157,19 @@ STATE = {
     "live_sector_count": 0,
     "live_sector_source": "WAITING",
     "live_sector_error": None,
+    "close_bet_krx_at": None,
+    "close_bet_krx_count": 0,
+    "close_bet_nxt_at": None,
+    "close_bet_nxt_count": 0,
+    "close_bet_last_error": None,
+    "preclose_krx_at": None,
+    "preclose_krx_count": 0,
+    "preclose_nxt_at": None,
+    "preclose_nxt_count": 0,
+    "preclose_last_error": None,
+    "nxt_eod_hold_at": None,
+    "nxt_eod_hold_trade_date": None,
+    "nxt_eod_hold_status": "LOCAL_BEST_EFFORT",
 }
 LOCK = threading.RLock()
 ENGINE = None
@@ -2165,6 +2198,64 @@ LIVE_SECTOR_SNAPSHOT = {
 WS_URL = os.getenv("LS_WS_URL", "wss://openapi.ls-sec.co.kr:9443/websocket")
 WS_STALE_SECONDS = max(3, int(os.getenv("WS_STALE_SECONDS", "8")))
 REST_FALLBACK_SECONDS = max(3, int(os.getenv("REST_FALLBACK_SECONDS", "5")))
+NXT_WS_KEY_CACHE = {}
+NXT_WS_KEY_REVERSE = {}
+NXT_WS_KEY_LOCK = threading.RLock()
+PRECLOSE_LOCK = threading.Lock()
+PRECLOSE_SNAPSHOT = {"KRX": None, "NXT": None}
+NXT_EOD_HOLD = None
+
+
+def _resolve_nxt_ws_key(code):
+    """NXT NS3 구독에는 LS가 반환한 거래소별 종목코드(ex_shcode)를 사용한다."""
+    code = str(code or "").zfill(6)
+    with NXT_WS_KEY_LOCK:
+        cached = NXT_WS_KEY_CACHE.get(code)
+        if cached:
+            return cached
+
+    engine = get_engine()
+    ex_key = ""
+    try:
+        body = {"t8450InBlock": {"shcode": code, "exchgubun": "N"}}
+        j = engine.ls._post_tr("/stock/market-data", "t8450", body).json()
+        root = j.get("t8450OutBlock") or {}
+        ex_key = str(root.get("ex_shcode") or "").strip()
+    except Exception as e:
+        logging.getLogger("alpha500_ws").debug("NXT WS KEY t8450 %s: %s", code, str(e)[:120])
+
+    if not ex_key:
+        try:
+            now_hm = now_kst().strftime("%H%M%S")
+            body = {"t8454InBlock": {
+                "shcode": code, "cvolume": 0, "starttime": "", "endtime": now_hm,
+                "cts_time": "", "exchgubun": "N",
+            }}
+            j = engine.ls._post_tr("/stock/market-data", "t8454", body).json()
+            root = j.get("t8454OutBlock") or {}
+            rows = j.get("t8454OutBlock1") or []
+            ex_key = str(root.get("ex_shcode") or "").strip()
+            if not ex_key:
+                for row in rows[:5]:
+                    ex_key = str((row or {}).get("ex_shcode") or "").strip()
+                    if ex_key:
+                        break
+        except Exception as e:
+            logging.getLogger("alpha500_ws").debug("NXT WS KEY t8454 %s: %s", code, str(e)[:120])
+
+    if not ex_key:
+        raise RuntimeError(f"NXT ex_shcode unavailable for {code}")
+    with NXT_WS_KEY_LOCK:
+        NXT_WS_KEY_CACHE[code] = ex_key
+        NXT_WS_KEY_REVERSE[ex_key] = code
+    logging.getLogger("alpha500_ws").info("NXT WS KEY resolved symbol=%s key=%s", code, ex_key)
+    return ex_key
+
+
+def _subscription_tr_key(venue, code):
+    if str(venue or "").upper() == "NXT":
+        return _resolve_nxt_ws_key(code)
+    return str(code or "").zfill(6)
 
 
 def set_progress(phase: str, current: int = 0, total: int = 0, message: str = ""):
@@ -2217,8 +2308,8 @@ _progress_handler.setLevel(logging.INFO)
 logging.getLogger("alpha500_integrated").addHandler(_progress_handler)
 
 
-def load_latest():
-    venue = str(market_session_now().get("venue") or "KRX").upper()
+def load_latest_for_venue(venue):
+    venue = str(venue or "KRX").upper()
     for p in (RESULT_DIR / f"latest_alpha500_{venue}.json", RESULT_DIR / "latest_alpha500.json"):
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
@@ -2226,7 +2317,20 @@ def load_latest():
                 return data
         except (OSError, ValueError, AttributeError):
             continue
+    # NXT는 20:00 이후/익일 첫 정상 판정 전까지 마지막 EOD HOLD를 보조 원천으로 유지한다.
+    if venue == "NXT":
+        try:
+            data = _read_nxt_eod_hold()
+            if isinstance(data, dict) and str(data.get("venue") or "").upper() == "NXT":
+                return data.get("summary") if isinstance(data.get("summary"), dict) else data
+        except Exception:
+            pass
     return None
+
+
+def load_latest():
+    venue = str(market_session_now().get("venue") or "KRX").upper()
+    return load_latest_for_venue(venue)
 
 
 def get_engine():
@@ -2345,9 +2449,14 @@ def _extract_ws_quote(payload):
     if code.startswith("A") and len(code) == 7:
         code = code[1:]
     if not (code.isdigit() and len(code) == 6):
-        tr_key = str(header.get("tr_key") or "").strip()
+        tr_key = str(header.get("tr_key") or flat.get("ex_shcode") or "").strip()
         if tr_key.isdigit() and len(tr_key) == 6:
             code = tr_key
+        else:
+            with NXT_WS_KEY_LOCK:
+                mapped = NXT_WS_KEY_REVERSE.get(tr_key)
+            if mapped:
+                code = mapped
     if not (code.isdigit() and len(code) == 6):
         return None, None, tr_cd
     price = _first_value(flat, ["price", "cheprice", "curpr", "close", "last"])
@@ -2448,10 +2557,14 @@ def _set_ws_state(status, subscribed=None, channels=None, error=None, last_messa
 
 
 def live_ws_loop():
-    """LS WebSocket 1순위 실시간 시세. 세션/후보 변경 시 안전하게 재구독한다."""
+    """LS WebSocket 실시간 시세. NXT는 ex_shcode + 회로차단으로 Broken pipe 폭주를 방지한다."""
     log = logging.getLogger("alpha500_ws")
+    nxt_failures = 0
+    circuit_until = 0.0
     while True:
         ws = None
+        venue = "NXT"
+        received_this_session = False
         try:
             if os.getenv("LIVE_WS_ENABLED", "true").strip().lower() not in {"1", "true", "yes", "y", "on"}:
                 _set_ws_state("DISABLED", subscribed=0, channels=[], error=None)
@@ -2464,68 +2577,100 @@ def live_ws_loop():
                 time.sleep(2)
                 continue
             venue = str(info.get("venue") or "NXT").upper()
-            # 중요: 현재 세션의 판정 결과 파일이 아직 없어도 WS는 즉시 연결한다.
-            # 직전 후보 또는 LS master probe 종목을 현재 venue 채널로 구독하고,
-            # 판정이 끝나 대상이 바뀌면 아래 signature 비교로 자동 재구독한다.
+
+            if venue == "NXT" and time.monotonic() < circuit_until:
+                remain = max(1, int(circuit_until - time.monotonic()))
+                _set_ws_state("REST_FALLBACK", subscribed=0, channels=["NS3"],
+                              error=f"NXT WS circuit open {remain}s", rest_fallback=True)
+                time.sleep(min(5, remain))
+                continue
+
             subs = _ws_subscriptions(summary, venue)
             if not subs:
                 _set_ws_state("WAITING_TARGETS", subscribed=0, channels=[], error=None)
                 time.sleep(2)
                 continue
+
+            send_subs = []
+            if venue == "NXT":
+                for tr_cd, code in subs:
+                    try:
+                        tr_key = _subscription_tr_key(venue, code)
+                        send_subs.append((tr_cd, code, tr_key))
+                    except Exception as e:
+                        log.warning("NXT WS KEY skip symbol=%s error=%s", code, str(e)[:160])
+                if not send_subs:
+                    _set_ws_state("REST_FALLBACK", subscribed=0, channels=["NS3"],
+                                  error="NXT ex_shcode unavailable", rest_fallback=True)
+                    time.sleep(REST_FALLBACK_SECONDS)
+                    continue
+            else:
+                send_subs = [(tr_cd, code, str(code).zfill(6)) for tr_cd, code in subs]
+
             engine = get_engine()
             engine.ls._ensure_token()
             token = engine.ls.token
             with LOCK:
                 STATE["ls_status"] = "CONNECTED"
+                STATE["ws_transport_mode"] = "NXT_NS3_EX_SHCODE" if venue == "NXT" else "KRX_DIRECT_6DIGIT"
             log.info("LS CONNECTED token_ready=true")
+            _set_ws_state("CONNECTING", subscribed=0, channels=[], error=None, rest_fallback=(venue == "NXT"))
             ws = websocket.create_connection(WS_URL, timeout=5, enable_multithread=True)
             ws.settimeout(2)
-            channels = sorted(set(x[0] for x in subs))
-            sub_gap = max(0.02, int(os.getenv("WS_SUBSCRIBE_INTERVAL_MS", "180")) / 1000.0)
-            sub_batch = max(1, int(os.getenv("WS_SUBSCRIBE_BATCH", "5")))
-            for idx, (tr_cd, code) in enumerate(subs, 1):
+            channels = sorted(set(x[0] for x in send_subs))
+
+            sent = 0
+            gap = max(0.05, int(os.getenv(
+                "NXT_WS_SUBSCRIBE_INTERVAL_MS" if venue == "NXT" else "WS_SUBSCRIBE_INTERVAL_MS",
+                "350" if venue == "NXT" else "180"
+            )) / 1000.0)
+            for tr_cd, code, tr_key in send_subs:
                 ws.send(json.dumps({
                     "header": {"token": token, "tr_type": "3"},
-                    "body": {"tr_cd": tr_cd, "tr_key": code},
+                    "body": {"tr_cd": tr_cd, "tr_key": tr_key},
                 }, ensure_ascii=False))
-                # NXT는 다건 등록을 한 번에 밀어 넣지 않는다.
+                sent += 1
+                with LOCK:
+                    STATE["ws_last_key"] = tr_key
                 if venue == "NXT":
-                    time.sleep(sub_gap)
-                    if idx % sub_batch == 0:
-                        time.sleep(0.35)
+                    time.sleep(gap)
+
             signature = (venue, tuple(subs))
             last_tick_monotonic = time.monotonic()
-            _set_ws_state("CONNECTED", subscribed=len(subs), channels=channels, error=None)
-            log.info("WS CONNECTED venue=%s channels=%s subscribed=%s", venue, channels, len(subs))
+            last_ping_monotonic = 0.0
+            _set_ws_state("SUBSCRIBED", subscribed=sent, channels=channels, error=None,
+                          rest_fallback=(venue == "NXT"))
+            log.info("WS CONNECTED venue=%s channels=%s subscribed=%s key_mode=%s",
+                     venue, channels, sent, "EX_SHCODE" if venue == "NXT" else "6DIGIT")
+
             while True:
-                # 후보/세션이 바뀌면 재연결 후 신규 구독 집합으로 교체한다.
                 info2 = market_session_now()
                 summary2 = load_latest()
                 venue2 = str(info2.get("venue") or venue).upper()
                 subs2 = _ws_subscriptions(summary2, venue2) if bool(info2.get("scan_allowed")) else []
                 if (venue2, tuple(subs2)) != signature:
                     break
-                stale_limit = max(WS_STALE_SECONDS, int(os.getenv("NXT_WS_STALE_SECONDS", "30"))) if venue == "NXT" else WS_STALE_SECONDS
-                if time.monotonic() - last_tick_monotonic > stale_limit:
-                    _set_ws_state("STALE", error="WS tick stale", rest_fallback=True)
-                    if venue == "NXT":
-                        # NXT 저체결 구간은 무한 재접속하지 않고 연결은 유지, REST fallback을 병행한다.
-                        try:
-                            ws.ping()
-                            last_tick_monotonic = time.monotonic()
-                        except Exception:
-                            raise RuntimeError("NXT WebSocket ping failed; REST fallback")
-                    else:
-                        raise RuntimeError("WS tick stale; reconnect and REST fallback")
+
+                stale_limit = max(WS_STALE_SECONDS, int(os.getenv("NXT_WS_STALE_SECONDS", "45"))) if venue == "NXT" else WS_STALE_SECONDS
+                tick_age = time.monotonic() - last_tick_monotonic
+                if tick_age > stale_limit:
+                    _set_ws_state("STALE", error=f"WS tick stale {int(tick_age)}s", rest_fallback=True)
+                    # ping 성공만으로 실시간 구독 스트림이 정상이라고 보지 않는다.
+                    # 실제 Tick이 stale_limit 동안 없으면 소켓을 닫고 재연결/재구독한다.
+                    raise RuntimeError(f"WS tick stale {int(tick_age)}s; force reconnect")
+
                 try:
                     raw = ws.recv()
                 except websocket.WebSocketTimeoutException:
-                    # 연결은 살아 있으나 체결이 없는 종목일 수 있다. ping으로 세션 생존만 확인한다.
-                    try:
-                        ws.ping()
-                    except Exception:
-                        raise RuntimeError("LS WebSocket ping failed")
+                    now_m = time.monotonic()
+                    if now_m - last_ping_monotonic >= 10.0:
+                        try:
+                            ws.ping()
+                            last_ping_monotonic = now_m
+                        except Exception as e:
+                            raise RuntimeError(f"LS WebSocket ping failed: {e}")
                     continue
+
                 if raw in (None, ""):
                     raise RuntimeError("LS WebSocket closed")
                 try:
@@ -2534,29 +2679,59 @@ def live_ws_loop():
                     continue
                 if market_session_now().get("venue") != venue:
                     break
-                # 구독 승인/거절 응답도 로그에 남겨 CONNECTED와 실제 RECEIVING을 구분한다.
+
                 hdr = payload.get("header") if isinstance(payload, dict) and isinstance(payload.get("header"), dict) else {}
                 rsp_cd = str(hdr.get("rsp_cd") or "").strip()
                 rsp_msg = str(hdr.get("rsp_msg") or "").strip()
-                if rsp_cd and rsp_cd not in {"00000", "0"}:
-                    log.warning("WS subscription response rsp_cd=%s msg=%s", rsp_cd, rsp_msg[:160])
+                if rsp_cd:
+                    if rsp_cd in {"00000", "0"}:
+                        with LOCK:
+                            STATE["ws_ack_count"] = int(STATE.get("ws_ack_count") or 0) + 1
+                    else:
+                        with LOCK:
+                            STATE["ws_reject_count"] = int(STATE.get("ws_reject_count") or 0) + 1
+                        log.warning("WS subscription response rsp_cd=%s msg=%s", rsp_cd, rsp_msg[:160])
+
                 code, q, tr_cd = _extract_ws_quote(payload)
                 if code and q and (tr_cd, code) in subs:
+                    received_this_session = True
+                    nxt_failures = 0
                     last_tick_monotonic = time.monotonic()
                     _set_live_quote(code, q, f"WS:{tr_cd or 'REAL'}", venue)
                     with LOCK:
                         STATE["ws_tick_count"] = int(STATE.get("ws_tick_count") or 0) + 1
                         STATE["ws_last_tr"] = tr_cd or "REAL"
                         STATE["ws_last_symbol"] = code
+                        STATE["ws_last_tick_kst"] = now_kst_iso()
+                        STATE["ws_last_price"] = _quote_price(q)
                         tick_n = STATE["ws_tick_count"]
                     if tick_n <= 3 or tick_n % 100 == 0:
-                        log.info("WS TICK count=%s tr=%s symbol=%s price=%s diff=%s", tick_n, tr_cd or "REAL", code, q.get("price"), q.get("diff"))
-                    _set_ws_state("RECEIVING", last_message=True)
+                        log.info("WS TICK count=%s tr=%s symbol=%s price=%s diff=%s",
+                                 tick_n, tr_cd or "REAL", code, q.get("price"), q.get("diff"))
+                    _set_ws_state("RECEIVING", last_message=True, rest_fallback=False)
+
         except Exception as e:
+            with LOCK:
+                STATE["ws_reconnect_count"] = int(STATE.get("ws_reconnect_count") or 0) + 1
+            if venue == "NXT" and not received_this_session:
+                nxt_failures += 1
+            else:
+                nxt_failures = 0
             _set_ws_state("STALE", error=str(e)[:240], rest_fallback=True)
-            log.warning("WS reconnect: %s", e)
-            backoff = max(2, int(os.getenv("WS_RECONNECT_BACKOFF_SECONDS", "5")))
-            time.sleep(backoff)
+            log.warning("WS reconnect venue=%s failures=%s error=%s", venue, nxt_failures, e)
+
+            if venue == "NXT" and nxt_failures >= max(1, int(os.getenv("NXT_WS_MAX_CONSECUTIVE_FAILURES", "3"))):
+                pause = max(15, int(os.getenv("NXT_WS_CIRCUIT_BREAK_SECONDS", "60")))
+                circuit_until = time.monotonic() + pause
+                log.warning("NXT WS CIRCUIT OPEN failures=%s pause=%ss; REST fallback continues", nxt_failures, pause)
+                nxt_failures = 0
+                time.sleep(min(5, pause))
+            else:
+                base = max(2, int(os.getenv("WS_RECONNECT_BACKOFF_SECONDS", "5")))
+                max_b = max(base, int(os.getenv("NXT_WS_RECONNECT_MAX_SECONDS", "30")))
+                attempt = max(0, nxt_failures - 1) if venue == "NXT" else 0
+                backoff = min(max_b, base * (2 ** min(attempt, 3)))
+                time.sleep(backoff)
         finally:
             if ws is not None:
                 try:
@@ -3103,6 +3278,313 @@ def live_quote_loop():
             _set_ws_state(STATE.get("ws_status", "STALE"), rest_fallback=False)
         time.sleep(REST_FALLBACK_SECONDS)
 
+def _preclose_path(venue):
+    return RESULT_DIR / f"latest_preclose_{str(venue or 'KRX').upper()}.json"
+
+
+def _nxt_eod_hold_path():
+    return RESULT_DIR / "nxt_eod_hold.json"
+
+
+def _read_nxt_eod_hold():
+    global NXT_EOD_HOLD
+    if isinstance(NXT_EOD_HOLD, dict):
+        return NXT_EOD_HOLD
+    try:
+        z = json.loads(_nxt_eod_hold_path().read_text(encoding="utf-8"))
+        if isinstance(z, dict):
+            NXT_EOD_HOLD = z
+            return z
+    except Exception:
+        pass
+    return None
+
+
+def save_nxt_eod_hold():
+    """마지막 NXT 판정을 익일 첫 정상 NXT 판정 전까지 HOLD한다.
+
+    /data가 비영속인 Render Free 재시작까지는 보장할 수 없으므로 상태에 LOCAL_BEST_EFFORT를 명시한다.
+    """
+    global NXT_EOD_HOLD
+    summary = load_latest_for_venue("NXT")
+    if not isinstance(summary, dict):
+        raise RuntimeError("NXT EOD summary unavailable")
+    snap = {
+        "captured_at_kst": now_kst_iso(),
+        "trade_date": str(summary.get("timestamp_kst") or now_kst_iso())[:10],
+        "venue": "NXT",
+        "persistence": "LOCAL_BEST_EFFORT",
+        "summary": summary,
+        "close_bet_nxt": _read_close_bet("NXT"),
+    }
+    p = _nxt_eod_hold_path(); tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(snap, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    tmp.replace(p)
+    NXT_EOD_HOLD = snap
+    with LOCK:
+        STATE["nxt_eod_hold_at"] = snap["captured_at_kst"]
+        STATE["nxt_eod_hold_trade_date"] = snap["trade_date"]
+        STATE["nxt_eod_hold_status"] = snap["persistence"]
+    logging.getLogger("alpha500_close_bet").info(
+        "NXT EOD HOLD saved trade_date=%s source=%s", snap["trade_date"], summary.get("timestamp_kst")
+    )
+    return snap
+
+
+def _preclose_score_row(r, cluster_avg):
+    try: change = float(r.get("change_pct") or 0.0)
+    except Exception: change = 0.0
+    lo = float(os.getenv("CLOSE_BET_MIN_RETURN_PCT", "-3.0"))
+    hi = float(os.getenv("CLOSE_BET_MAX_RETURN_PCT", "7.0"))
+    if not (lo <= change <= hi):
+        return None
+    try: integ = float(r.get("integrated_score") or 0.0)
+    except Exception: integ = 0.0
+    try: energy = float(r.get("cluster_energy") or 0.0)
+    except Exception: energy = 0.0
+    try: base_mrs = float(r.get("market_rs") or 0.0)
+    except Exception: base_mrs = 0.0
+    cluster = str(r.get("ENERGY_CLUSTER") or "")
+    rel = change - float(cluster_avg.get(cluster, 0.0))
+    score = 0.50 * integ + 0.25 * energy + 8.0 * max(-2.0, min(2.0, rel)) + 4.0 * max(-2.0, min(2.0, base_mrs))
+    if change > 5.5:
+        score -= (change - 5.5) * 5.0
+    if bool(r.get("stage1_above_vwap", False)): score += 3.0
+    if bool(r.get("stage1_ema20_hold", False)): score += 2.0
+    return round(score, 2)
+
+
+def build_preclose_rescan(venue, trigger_label):
+    """15:20/19:20에 기존 500 sector_live_pool을 최신 가격으로 재조회해 신규 강자 누락을 줄인다."""
+    venue = str(venue or "KRX").upper()
+    if not PRECLOSE_LOCK.acquire(blocking=False):
+        return PRECLOSE_SNAPSHOT.get(venue)
+    try:
+        summary = load_latest_for_venue(venue)
+        if not isinstance(summary, dict):
+            raise RuntimeError(f"{venue} latest summary unavailable for preclose")
+        rows = [dict(x) for x in (summary.get("sector_live_pool") or []) if isinstance(x, dict)]
+        if not rows:
+            rows = _candidate_union(summary)
+        codes = [str(r.get("symbol", "")).zfill(6) for r in rows]
+        qmap = get_rest_history(venue).multi_quotes(codes) if codes else {}
+        refreshed = []
+        for r in rows:
+            code = str(r.get("symbol", "")).zfill(6)
+            q = qmap.get(code) or {}
+            px = _quote_price(q); pct = _quote_pct(q)
+            if px is not None: r["current_price"] = px
+            if pct is not None: r["change_pct"] = pct
+            r["close_bet_quote_source"] = "REST:t8450" if venue == "NXT" else "REST:t8407"
+            refreshed.append(r)
+        cluster_vals = {}
+        for r in refreshed:
+            c = str(r.get("ENERGY_CLUSTER") or "")
+            try: v = float(r.get("change_pct"))
+            except Exception: continue
+            cluster_vals.setdefault(c, []).append(v)
+        cluster_avg = {c: (sum(v)/len(v) if v else 0.0) for c,v in cluster_vals.items()}
+        scored = []
+        for r in refreshed:
+            sc = _preclose_score_row(r, cluster_avg)
+            if sc is None: continue
+            r["preclose_score"] = sc
+            r["selection_type"] = f"{venue}_PRECLOSE_RESCAN"
+            scored.append(r)
+        scored.sort(key=lambda x: float(x.get("preclose_score") or 0.0), reverse=True)
+        top_n = max(20, int(os.getenv("PRECLOSE_RESCAN_TOP_N", "60")))
+        snap = {
+            "captured_at_kst": now_kst_iso(), "venue": venue, "trigger": trigger_label,
+            "universe_checked": len(rows), "priced_count": len(qmap), "candidate_count": min(len(scored), top_n),
+            "data_status": "REST_REFRESH", "candidates": scored[:top_n],
+        }
+        p = _preclose_path(venue); tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(snap, ensure_ascii=False, indent=2, default=str), encoding="utf-8"); tmp.replace(p)
+        PRECLOSE_SNAPSHOT[venue] = snap
+        with LOCK:
+            STATE[f"preclose_{venue.lower()}_at"] = snap["captured_at_kst"]
+            STATE[f"preclose_{venue.lower()}_count"] = snap["candidate_count"]
+            STATE["preclose_last_error"] = None
+        logging.getLogger("alpha500_close_bet").info(
+            "PRECLOSE RESCAN venue=%s checked=%d priced=%d candidates=%d",
+            venue, len(rows), len(qmap), snap["candidate_count"]
+        )
+        return snap
+    finally:
+        PRECLOSE_LOCK.release()
+
+
+def _read_preclose(venue):
+    venue = str(venue or "KRX").upper()
+    z = PRECLOSE_SNAPSHOT.get(venue)
+    if isinstance(z, dict): return z
+    try:
+        z = json.loads(_preclose_path(venue).read_text(encoding="utf-8"))
+        if isinstance(z, dict):
+            PRECLOSE_SNAPSHOT[venue] = z
+            return z
+    except Exception:
+        pass
+    return None
+
+
+def _close_bet_path(venue, latest=True, ymd=None):
+    venue = str(venue or "KRX").upper()
+    if latest:
+        return RESULT_DIR / f"latest_close_bet_{venue}.json"
+    return RESULT_DIR / f"close_bet_{venue}_{ymd or now_kst().strftime('%Y%m%d')}.json"
+
+
+def _read_close_bet(venue):
+    try:
+        return json.loads(_close_bet_path(venue).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _candidate_union(summary):
+    if not isinstance(summary, dict):
+        return []
+    seen, rows = set(), []
+    for key in ("top_final", "live_watch10", "live_deep30", "top_watch", "live_pool"):
+        for r in summary.get(key) or []:
+            code = str(r.get("symbol", "")).zfill(6)
+            if not (code.isdigit() and len(code) == 6) or code in seen:
+                continue
+            seen.add(code); rows.append(dict(r))
+    return rows
+
+
+def _close_bet_refresh(rows, venue):
+    venue = str(venue or "KRX").upper()
+    rows = [dict(r) for r in rows[:40]]
+    codes = [str(r.get("symbol", "")).zfill(6) for r in rows]
+    rest_map = {}
+    try:
+        if codes:
+            rest_map = get_rest_history(venue).multi_quotes(codes)
+    except Exception as e:
+        logging.getLogger("alpha500_close_bet").warning("CLOSE BET REST refresh failed venue=%s: %s", venue, e)
+    with LIVE_LOCK:
+        live_map = dict(LIVE_QUOTES); live_meta = {k: dict(v) for k, v in LIVE_QUOTE_META.items()}
+    for r in rows:
+        code = str(r.get("symbol", "")).zfill(6); q = None; src = "SNAPSHOT"
+        m = live_meta.get(code) or {}
+        if str(m.get("venue") or "").upper() == venue and _quote_is_fresh(code, max_age=max(10, WS_STALE_SECONDS)) and str(m.get("source") or "").startswith("WS:"):
+            q = live_map.get(code); src = str(m.get("source") or "WS")
+        elif code in rest_map:
+            q = rest_map.get(code); src = "REST:t8450" if venue == "NXT" else "REST:t8407"
+        if isinstance(q, dict):
+            px = _quote_price(q); pct = _quote_pct(q)
+            if px is not None: r["current_price"] = px
+            if pct is not None: r["change_pct"] = pct
+        r["close_bet_quote_source"] = src
+    return rows
+
+
+def _close_bet_score(r, venue, krx_close_map=None):
+    try: change = float(r.get("change_pct") or 0.0)
+    except Exception: change = 0.0
+    if not (float(os.getenv("CLOSE_BET_MIN_RETURN_PCT", "-3.0")) <= change <= float(os.getenv("CLOSE_BET_MAX_RETURN_PCT", "7.0"))):
+        return None
+    state, asym = str(r.get("cluster_state") or ""), str(r.get("asym_rs_class") or "")
+    if state not in {"S2", "S3"} and asym not in {"SUPER", "STRONG"}: return None
+    stage = str(r.get("stage1_state") or "")
+    if stage and stage not in {"UP_START", "REVERSAL_ARMED", "DOWN_WEAKEN", "UP_TREND"}: return None
+    deep=float(r.get("deep_score") or 0.0); integ=float(r.get("integrated_score") or r.get("stage1_score") or 0.0)
+    energy=float(r.get("cluster_energy") or 0.0); mrs=float(r.get("market_rs_score") or 50.0); strength=float(r.get("trade_strength") or 100.0)
+    grade=str(r.get("deep_grade") or ""); grade_bonus={"S":8.0,"A":6.0,"B":3.5,"WATCH":0.0}.get(grade,-3.0)
+    score=0.38*deep+0.25*integ+0.17*energy+0.10*mrs+0.10*min(100.0,max(0.0,strength-60.0))+grade_bonus
+    if change>5.5: score-=(change-5.5)*4.0
+    if state=="S3": score+=3.0
+    if bool(r.get("deep_verified",False)): score+=2.0
+    premium=None
+    if str(venue).upper()=="NXT" and krx_close_map:
+        ref=krx_close_map.get(str(r.get("symbol","")).zfill(6))
+        try:
+            ref_px=float((ref or {}).get("current_price") or 0.0); cur_px=float(r.get("current_price") or 0.0)
+            if ref_px>0 and cur_px>0:
+                premium=(cur_px/ref_px-1.0)*100.0
+                if premium>2.0: score-=min(8.0,(premium-2.0)*2.5)
+        except Exception: premium=None
+    reasons=[]
+    if state in {"S2","S3"}: reasons.append(state)
+    if deep>=72: reasons.append(f"DEEP {deep:.1f}")
+    if integ>=60: reasons.append(f"통합 {integ:.1f}")
+    if strength>=120: reasons.append(f"체결강도 {strength:.0f}")
+    if asym in {"SUPER","STRONG"}: reasons.append(f"비대칭RS {asym}")
+    return round(score,2), premium, reasons
+
+
+def build_close_bet(venue, trigger_label):
+    venue=str(venue or "KRX").upper(); summary=load_latest_for_venue(venue)
+    if not isinstance(summary,dict): raise RuntimeError(f"{venue} latest summary unavailable")
+    base_rows=_candidate_union(summary)
+    pre=_read_preclose(venue) or {}
+    merged={str(r.get("symbol","")).zfill(6):dict(r) for r in base_rows if isinstance(r,dict)}
+    for r in pre.get("candidates") or []:
+        if not isinstance(r,dict): continue
+        code=str(r.get("symbol","")).zfill(6)
+        if code in merged:
+            x=dict(r); x.update({k:v for k,v in merged[code].items() if k not in x or x.get(k) in (None,"")}); merged[code]=x
+        else:
+            merged[code]=dict(r)
+    rows=_close_bet_refresh(list(merged.values()),venue)
+    krx_close=_read_close_bet("KRX") if venue=="NXT" else None
+    krx_close_map={str(x.get("symbol","")).zfill(6):x for x in ((krx_close or {}).get("candidates") or [])}
+    scored=[]
+    for r in rows:
+        z=_close_bet_score(r,venue,krx_close_map)
+        if z is None: continue
+        score,premium,reasons=z; o=dict(r); o["close_bet_score"]=score; o["nxt_vs_krx_close_pct"]=None if premium is None else round(premium,3); o["close_bet_reasons"]=reasons; o["selection_type"]=f"{venue}_CLOSE_BET"; scored.append(o)
+    scored.sort(key=lambda x:(float(x.get("close_bet_score") or 0.0),float(x.get("deep_score") or 0.0)),reverse=True)
+    candidates=scored[:max(1,int(os.getenv("CLOSE_BET_TOP_N","5")))]
+    sources=sorted({str(x.get("close_bet_quote_source") or "SNAPSHOT") for x in candidates})
+    data_status="WS_CONFIRMED" if candidates and all(x.startswith("WS:") for x in sources) else ("REST_FALLBACK" if any(x.startswith("REST:") for x in sources) else "SNAPSHOT")
+    snap={"captured_at_kst":now_kst_iso(),"trade_date":now_kst().strftime("%Y-%m-%d"),"venue":venue,"trigger":trigger_label,"source_summary_kst":summary.get("timestamp_kst"),"preclose_rescan_kst":(pre or {}).get("captured_at_kst"),"preclose_universe_checked":int((pre or {}).get("universe_checked") or 0),"candidate_count":len(candidates),"data_status":data_status,"quote_sources":sources,"no_force_fill":True,"candidates":candidates}
+    for p in (_close_bet_path(venue),_close_bet_path(venue,latest=False,ymd=now_kst().strftime("%Y%m%d"))):
+        tmp=p.with_suffix(p.suffix+".tmp"); tmp.write_text(json.dumps(snap,ensure_ascii=False,indent=2,default=str),encoding="utf-8"); tmp.replace(p)
+    with LOCK:
+        if venue=="KRX": STATE["close_bet_krx_at"]=snap["captured_at_kst"]; STATE["close_bet_krx_count"]=len(candidates)
+        else: STATE["close_bet_nxt_at"]=snap["captured_at_kst"]; STATE["close_bet_nxt_count"]=len(candidates)
+        STATE["close_bet_last_error"]=None
+    logging.getLogger("alpha500_close_bet").info("CLOSE BET venue=%s trigger=%s candidates=%d data_status=%s sources=%s",venue,trigger_label,len(candidates),data_status,sources)
+    return snap
+
+
+def close_bet_loop():
+    poll=max(5,int(os.getenv("CLOSE_BET_POLL_SECONDS","10")))
+    done={"PRECLOSE_KRX":None,"KRX":None,"PRECLOSE_NXT":None,"NXT":None,"EOD_NXT":None}
+    while True:
+        try:
+            if os.getenv("CLOSE_BET_ENABLED","true").strip().lower() not in {"1","true","yes","y","on"}: time.sleep(poll); continue
+            n=now_kst(); day=n.strftime("%Y-%m-%d"); hm=n.hour*60+n.minute
+            pre_enabled=os.getenv("PRECLOSE_RESCAN_ENABLED","true").strip().lower() in {"1","true","yes","y","on"}
+            if pre_enabled and 15*60+20<=hm<15*60+30 and done["PRECLOSE_KRX"]!=day:
+                build_preclose_rescan("KRX","15:20_KRX_PRECLOSE"); done["PRECLOSE_KRX"]=day
+            if 15*60+30<=hm<15*60+40 and done["KRX"]!=day:
+                build_close_bet("KRX","15:30_KRX_CLOSE"); done["KRX"]=day
+            if pre_enabled and 19*60+20<=hm<19*60+30 and done["PRECLOSE_NXT"]!=day:
+                build_preclose_rescan("NXT","19:20_NXT_PRECLOSE"); done["PRECLOSE_NXT"]=day
+            if 19*60+30<=hm<20*60 and done["NXT"]!=day:
+                build_close_bet("NXT","19:30_NXT_CLOSE_BET"); done["NXT"]=day
+            eod_enabled=os.getenv("NXT_EOD_HOLD_ENABLED","true").strip().lower() in {"1","true","yes","y","on"}
+            eod_min=int(os.getenv("NXT_EOD_HOLD_MINUTE","1195"))
+            if eod_enabled and eod_min<=hm<20*60 and done["EOD_NXT"]!=day:
+                save_nxt_eod_hold(); done["EOD_NXT"]=day
+        except Exception as e:
+            with LOCK:
+                STATE["close_bet_last_error"]=f"{type(e).__name__}: {str(e)[:220]}"
+                STATE["preclose_last_error"]=STATE["close_bet_last_error"]
+            logging.getLogger("alpha500_close_bet").warning("CLOSE BET/PRECLOSE loop failed: %s",e)
+        time.sleep(poll)
+
+
+def _attach_close_bet(result):
+    if not isinstance(result,dict): result={}
+    out=json.loads(json.dumps(result,ensure_ascii=False,default=str)); out["close_bet_krx"]=_read_close_bet("KRX"); out["close_bet_nxt"]=_read_close_bet("NXT"); return out
+
+
 def run_scan(session_info=None):
     info = dict(session_info or market_session_now())
     if not bool(info.get("scan_allowed")):
@@ -3191,7 +3673,12 @@ def state_copy():
         d = dict(STATE)
     if d.get("ws_status") == "RECEIVING" and d.get("ws_last_message_kst"):
         age = (now_kst() - datetime.fromisoformat(d["ws_last_message_kst"])).total_seconds()
-        if age > WS_STALE_SECONDS:
+        venue_for_stale = str(d.get("venue") or market_session_now().get("venue") or "KRX").upper()
+        stale_limit = (max(WS_STALE_SECONDS, int(os.getenv("NXT_WS_STALE_SECONDS", "45")))
+                       if venue_for_stale == "NXT" else WS_STALE_SECONDS)
+        d["ws_tick_age_seconds"] = round(age, 1)
+        d["ws_stale_limit_seconds"] = stale_limit
+        if age > stale_limit:
             d["ws_status"] = "STALE"
     d["ls_configured"] = bool(os.getenv("LS_APP_KEY") and os.getenv("LS_APP_SECRET"))
     d["master"] = MASTER
@@ -3199,6 +3686,12 @@ def state_copy():
     d["live_rebalance_seconds"] = int(os.getenv("LIVE_REBALANCE_SECONDS", "15"))
     d["live_pool_max"] = int(os.getenv("LIVE_POOL_MAX", "70"))
     d["live_sector_interval_seconds"] = int(os.getenv("LIVE_SECTOR_INTERVAL_SECONDS", "60"))
+    d["close_bet_enabled"] = os.getenv("CLOSE_BET_ENABLED", "true").strip().lower() in {"1","true","yes","y","on"}
+    d["close_bet_top_n"] = int(os.getenv("CLOSE_BET_TOP_N", "5"))
+    d["preclose_rescan_enabled"] = os.getenv("PRECLOSE_RESCAN_ENABLED", "true").strip().lower() in {"1","true","yes","y","on"}
+    d["nxt_eod_hold_enabled"] = os.getenv("NXT_EOD_HOLD_ENABLED", "true").strip().lower() in {"1","true","yes","y","on"}
+    d["nxt_eod_persistence"] = "LOCAL_BEST_EFFORT"
+    d["nxt_eod_persistence_warning"] = "Render ephemeral filesystem restart/spin-down may remove local HOLD unless persistent storage is configured"
     d["now_kst"] = now_kst_iso()
     live = market_session_now()
     d["expected_venue"] = live.get("venue")
@@ -3264,6 +3757,7 @@ class Handler(BaseHTTPRequestHandler):
 <div class="section"><h2>판정 요약</h2><div id="summary" class="summary"></div></div>
 <div class="section"><h2>현재 후보 · 실시간 현재가/등락률/진입가</h2><div id="candidateNote" class="note candidateNoteGrid"><div class="noteCell"><span class="noteLabel">후보상태</span><span id="candidateStatus" class="noteValue">-</span></div><div class="noteCell"><span class="noteLabel">현재가 갱신</span><span id="candidateLive" class="noteValue">-</span></div><div class="noteCell"><span class="noteLabel">실시간 재선정</span><span id="candidateRank" class="noteValue">-</span></div></div><div class="tablebox"><table id="candidateTable"><colgroup><col style="width:70px"><col style="width:130px"><col style="width:90px"><col style="width:80px"><col style="width:90px"><col style="width:80px"><col style="width:75px"><col style="width:70px"><col style="width:130px"><col style="width:150px"><col style="width:80px"><col style="width:90px"></colgroup><thead><tr><th>실시간순위</th><th class="left">종목</th><th>현재가</th><th>등락률</th><th>진입가</th><th>통합점수</th><th>딥점수</th><th>등급</th><th class="left">메가섹터</th><th class="left">에너지군</th><th>에너지</th><th>상태</th></tr></thead><tbody id="candidates"></tbody></table></div></div>
 <div class="section"><h2>섹터 에너지 변화 · 자금 이동도 <span id="sectorLiveStamp" class="sub"></span></h2><div class="note">KRX 장중 섹터에너지는 1분마다 500종목 현재가·등락률·거래대금을 반영합니다. 반도체는 전략군(하이닉스·스퀘어/삼성전자·삼성물산/기판/MLCC/전공정/후공정/부품소재/전력반도체/디자인하우스/유리기판 등)으로 재통합하고, 나머지도 과도한 소분류를 병합했습니다.</div><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">에너지 군집</th><th>상태</th><th>에너지</th><th>Δ에너지</th><th>순위이동</th><th>Breadth</th><th>평균등락</th><th>시장RS</th><th>거래가속</th><th>종목수</th></tr></thead><tbody id="sectors"></tbody></table></div></div>
+<div class="section"><h2>종가배팅 · 15:30 KRX / 19:30 NXT</h2><div class="note">강제충원 없음 · NXT WS 장애 시 REST_FALLBACK 명시 · NXT 프리미엄은 15:30 KRX 스냅샷 대비</div><h3>15:30 KRX CLOSE-BET <span id="krxCloseBetStamp" class="sub"></span></h3><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">종목</th><th>가격</th><th>등락률</th><th>점수</th><th>딥</th><th>에너지</th><th>체결강도</th><th>데이터</th><th class="left">근거</th></tr></thead><tbody id="krxCloseBet"></tbody></table></div><h3>19:30 NXT CLOSE-BET <span id="nxtCloseBetStamp" class="sub"></span></h3><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">종목</th><th>NXT가격</th><th>등락률</th><th>점수</th><th>딥</th><th>에너지</th><th>KRX대비</th><th>데이터</th><th class="left">근거</th></tr></thead><tbody id="nxtCloseBet"></tbody></table></div></div>
 <div class="section"><h2>신호 기록부 <span id="histCount" class="note"></span></h2><div class="historyMeta"><span><b>화면 20행 고정</b> · 최대 200건 내부 스크롤</span><span id="histPersist">브라우저백업 대기</span></div><div class="historybox"><table><thead><tr><th class="left">선정시각 KST</th><th>거래소</th><th>세션</th><th>횟수</th><th>구분</th><th class="left">종목</th><th>현재가</th><th>현재등락률</th><th>진입가</th><th>딥점수</th><th>등급</th><th class="left">에너지군</th><th>에너지</th><th>상태</th></tr></thead><tbody id="history"></tbody></table></div></div>
 <div class="foot">08:00 NXT PRE에서 당일 첫 판정을 시작합니다. KRX와 NXT의 가격·과거봉·섹터에너지 캐시는 서로 분리되며 통합(U) 시세는 사용하지 않습니다. 진입가는 판정 시점 신호 기준가입니다.</div>
 </div>
@@ -3301,6 +3795,7 @@ function sectorRows(rows){
   return main+sub;
  }).join('')
 }
+function closeBetRows(snap,isNxt){const rows=snap?.candidates||[];if(!rows.length)return '<tr><td colspan="10" class="empty left">적격 종가배팅 후보 없음</td></tr>';return rows.map((r,i)=>`<tr><td>${i+1}</td><td class="left"><b>${esc(r.name)}</b></td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.close_bet_score,1)}</td><td>${num(r.deep_score,1)}</td><td>${num(r.cluster_energy,1)}</td><td>${isNxt?(r.nxt_vs_krx_close_pct==null?'-':pct(r.nxt_vs_krx_close_pct)):num(r.trade_strength,0)}</td><td>${esc(r.close_bet_quote_source||snap.data_status||'-')}</td><td class="left">${esc((r.close_bet_reasons||[]).join(' · '))}</td></tr>`).join('')}
 function historyRows(rows){if(!rows?.length)return '<tr><td colspan="14" class="empty left">아직 선정 히스토리가 없습니다.</td></tr>';return rows.slice(0,200).map(r=>`<tr><td class="left">${esc(r.selected_at_kst||'-')}</td><td>${esc(r.venue||'-')}</td><td>${esc(r.session||'-')}</td><td>${num(r.occurrence)}</td><td>${esc(r.selection_type)}</td><td class="left"><b>${esc(r.name)}</b></td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.entry_price)}</td><td>${num(r.deep_score,1)}</td><td>${esc(r.deep_grade)}</td><td class="left">${esc(r.ENERGY_CLUSTER)}</td><td>${num(r.cluster_energy,1)}</td><td>${esc(r.cluster_state)}</td></tr>`).join('')}
 async function refresh(){
  try{
@@ -3328,6 +3823,7 @@ async function refresh(){
   document.getElementById('candidates').innerHTML=candidateRows(show);
   document.getElementById('sectors').innerHTML=sectorRows(r.sector_energy||r.top_clusters||[]);
   const sls=document.getElementById('sectorLiveStamp');if(sls)sls.textContent=r.live_sector_updated_kst?`· LIVE ${r.live_sector_updated_kst} · ${r.live_sector_source||''}`:'· 10분 스냅샷';
+  const kb=r.close_bet_krx||null,nb=r.close_bet_nxt||null;document.getElementById('krxCloseBet').innerHTML=closeBetRows(kb,false);document.getElementById('nxtCloseBet').innerHTML=closeBetRows(nb,true);document.getElementById('krxCloseBetStamp').textContent=kb?`· ${kb.captured_at_kst||'-'} · ${kb.data_status||'-'}`:'· 대기';document.getElementById('nxtCloseBetStamp').textContent=nb?`· ${nb.captured_at_kst||'-'} · ${nb.data_status||'-'}`:'· 대기';
   const serverH=(r.selection_history||[]).slice(0,200),h=mergeHistory(serverH,r.venue);document.getElementById('histCount').textContent=`저장 ${h.length}/200`;document.getElementById('history').innerHTML=historyRows(h);const hp=document.getElementById('histPersist');if(hp)hp.textContent=`브라우저백업 ${h.length}/200 · 서버 ${serverH.length}`;
  }catch(e){document.getElementById('candidateStatus').textContent='RESULT ERROR';document.getElementById('candidateLive').textContent=String(e);document.getElementById('candidateRank').textContent='-'}
 }
@@ -3355,7 +3851,8 @@ refresh();setInterval(refresh,3000);
             return self._json(200, state_copy())
         if path == "/api/results":
             latest = load_latest()
-            return self._json(200, _apply_live_overlay(latest) if latest is not None else {"status": "NO_RESULT_YET", **state_copy()})
+            payload = _apply_live_overlay(latest) if latest is not None else {"status": "NO_RESULT_YET", **state_copy()}
+            return self._json(200, _attach_close_bet(payload))
         if path == "/api/run":
             with LOCK: busy = STATE["running"]
             ok = False
@@ -3396,6 +3893,7 @@ def main():
     threading.Thread(target=live_quote_loop, daemon=True).start()
     threading.Thread(target=live_rank_loop, daemon=True).start()
     threading.Thread(target=live_sector_loop, daemon=True).start()
+    threading.Thread(target=close_bet_loop, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(json.dumps({"event": "server_listening", "version": VERSION, "port": PORT, "kst": now_kst_iso()}, ensure_ascii=False))
     server.serve_forever()
