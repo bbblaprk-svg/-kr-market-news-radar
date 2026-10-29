@@ -38,6 +38,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     SELECTION_HISTORY_MAX=200 \
     HISTORY_DISPLAY_ROWS=20 \
     RATIONAL_ENERGY_GROUPING=true \
+    SHARED_UNIVERSE_HANDOFF=true \
+    NXT_WS_SUB_MAX=20 \
+    NXT_WS_STALE_SECONDS=30 \
+    WS_SUBSCRIBE_INTERVAL_MS=180 \
+    WS_SUBSCRIBE_BATCH=5 \
+    WS_RECONNECT_BACKOFF_SECONDS=5 \
     SAVE_FULL_CSV=false \
     ALPHA500_DATA_DIR=/data \
     RESULT_DIR=/data/results
@@ -101,7 +107,7 @@ from 전체시장_2단계_딥스캔_V1_1 import (
     LSDeepProvider,
     TwoStageDeepScanner,
 )
-from 전체시장_알파하이킨아시_KIS_LS_스캐너_V1_0 import BrokerError, HistoryStore, SymbolInfo
+from 전체시장_알파하이킨아시_KIS_LS_스캐너_V1_0 import BrokerError, HistoryStore, SymbolInfo, is_probably_common_stock
 
 LOG = logging.getLogger("alpha500_integrated")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
@@ -380,6 +386,9 @@ class Alpha500Integrated(TwoStageDeepScanner):
         self.session_info = {"session": "KRX_REGULAR", "venue": "KRX", "exchgubun": "K", "scan_allowed": True}
         self.active_venue = "KRX"
         self.active_exchgubun = "K"
+        # 공통 500종목 목록은 세션 전환 시 인계하되, 가격/일봉/체결 캐시는 venue별로 분리한다.
+        self.shared_runtime_base: Optional[pd.DataFrame] = None
+        self.shared_runtime_source_venue: Optional[str] = None
 
     def set_market_session(self, info: Optional[Mapping[str, Any]] = None):
         info = dict(info or market_session_now())
@@ -1118,6 +1127,104 @@ class Alpha500Integrated(TwoStageDeepScanner):
         LOG.info("FINALIZE done final=%d watch=%d history=%d", len(top_final), len(top_watch), len(history))
         return final, summary
 
+    def _handoff_runtime_for_nxt(self) -> Tuple[Optional[pd.DataFrame], Dict[str, Any]]:
+        """KRX에서 선정한 공통 500 목록을 NXT로 인계한다.
+
+        종목/섹터/시총 등 정적 메타만 공유하고 NXT 가격·일봉·체결은 별도 조회한다.
+        NXT 거래불가 종목은 NXT 가능 보통주로만 보충한다.
+        """
+        if os.getenv("SHARED_UNIVERSE_HANDOFF", "true").strip().lower() not in {"1","true","yes","y","on"}:
+            return None, {}
+        base = self.shared_runtime_base.copy() if isinstance(self.shared_runtime_base, pd.DataFrame) and not self.shared_runtime_base.empty else None
+        source = self.shared_runtime_source_venue or "MEMORY"
+        if base is None:
+            krx_path = self.result_dir / "선정500_실행유니버스_KRX.csv"
+            if krx_path.exists():
+                try:
+                    base = pd.read_csv(krx_path, dtype={"code": str}).fillna("")
+                    source = "KRX_FILE"
+                except Exception:
+                    base = None
+        if base is None or base.empty:
+            return None, {}
+
+        all_items = self.selector.get_ls_universe()
+        nxt_items = [x for x in all_items if bool(getattr(x, "nxt", False)) and is_probably_common_stock(x)]
+        by_code = {str(x.code).zfill(6): x for x in nxt_items}
+        target = min(env_int("UNIVERSE_TARGET", 500), len(nxt_items))
+        if target <= 0:
+            return None, {}
+
+        base = base.copy()
+        base["code"] = base["code"].astype(str).str.zfill(6)
+        kept = base[base["code"].isin(by_code)].copy()
+        for idx, row in kept.iterrows():
+            item = by_code.get(str(row["code"]))
+            if item:
+                kept.at[idx, "name"] = item.name
+                kept.at[idx, "market"] = item.market
+                kept.at[idx, "nxt_eligible"] = True
+        kept = kept.drop_duplicates("code", keep="first").head(target)
+        existing = set(kept["code"].astype(str))
+
+        # 먼저 기존 500 마스터 안의 NXT 가능 종목으로 빈자리를 보충한다.
+        master = self.selector.load_master()
+        mapped, _ = self.selector.resolve_master(master, nxt_items)
+        cap_map = self.selector.get_cap_map()
+        fills = []
+        if mapped is not None and not mapped.empty:
+            mapped["code"] = mapped["code"].astype(str).str.zfill(6)
+            for _, r in mapped.iterrows():
+                code = str(r.get("code", "")).zfill(6)
+                if code in existing:
+                    continue
+                d = dict(r)
+                cap = cap_map.get(code)
+                d["market_cap_100m"] = cap
+                d["nxt_eligible"] = True
+                d["ENERGY_EXCLUDE"] = d.get("ENERGY_EXCLUDE", "N") or "N"
+                d["매수후보"] = "Y" if str(d.get("매수후보", "N")).upper() == "Y" and cap is not None and fnum(cap,0) >= self.selector.min_cap_100m else "N"
+                d["시총1000억필터"] = "PASS" if cap is not None and fnum(cap,0) >= self.selector.min_cap_100m else "검증대기"
+                fills.append(d); existing.add(code)
+                if len(kept) + len(fills) >= target:
+                    break
+
+        # 그래도 부족하면 NXT 종목마스터에서 보충하되 군집 미매핑 종목은 에너지 계산에서 제외한다.
+        if len(kept) + len(fills) < target:
+            for item in nxt_items:
+                code = str(item.code).zfill(6)
+                if code in existing:
+                    continue
+                cap = cap_map.get(code)
+                fills.append({
+                    "code": code, "name": item.name, "market": item.market, "종목명": item.name,
+                    "BUCKET_BASE": "NXT_HANDOFF_FILL", "MEGA_SECTOR": "미분류", "SECTOR": "미분류_보충",
+                    "MICRO_CLUSTER": "미분류_보충", "ENERGY_CLUSTER": "UNMAPPED_LIQUIDITY",
+                    "ENERGY_LEVEL": "EXCLUDE_UNTIL_MAPPED", "SECONDARY_TAG": "", "역할": "FOLLOWER",
+                    "에너지기본가중": "0.00", "매수후보": "N",
+                    "시총1000억필터": "PASS" if cap is not None and fnum(cap,0) >= self.selector.min_cap_100m else "검증대기",
+                    "활성상태": "ACTIVE", "ENERGY_EXCLUDE": "Y", "market_cap_100m": cap,
+                    "LIQUIDITY_ANCHOR": "N", "liquidity_score": 0.0, "liquidity_rank": 9999, "nxt_eligible": True,
+                })
+                existing.add(code)
+                if len(kept) + len(fills) >= target:
+                    break
+
+        if fills:
+            kept = pd.concat([kept, pd.DataFrame(fills)], ignore_index=True, sort=False)
+        kept = kept.drop_duplicates("code", keep="first").head(target).reset_index(drop=True)
+        if len(kept) != target:
+            return None, {}
+        kept["runtime_rank"] = range(1, len(kept)+1)
+        report = {
+            "handoff_used": True, "handoff_source": source, "handoff_kept": int(min(len(base), len(kept))),
+            "handoff_filled": int(max(0, len(kept) - len(base[base['code'].isin(by_code)]))),
+            "nxt_eligible_total": len(nxt_items), "cap_eligible_estimate": len(nxt_items),
+            "liquidity_anchor_in_selected": int((kept.get("LIQUIDITY_ANCHOR", pd.Series([],dtype=str)).astype(str) == "Y").sum()),
+        }
+        LOG.info("UNIVERSE HANDOFF source=%s kept=%d filled=%d target=%d venue=NXT", source, target-report["handoff_filled"], report["handoff_filled"], target)
+        return kept, report
+
     def bootstrap_history(self, runtime: pd.DataFrame):
         _, _, errors = self.fast_history.get_all(runtime, bootstrap_missing=True)
         return errors
@@ -1127,10 +1234,23 @@ class Alpha500Integrated(TwoStageDeepScanner):
         if not bool(info.get("scan_allowed", True)):
             raise RuntimeError(f"session not open: {info.get('session')}")
         runtime_path = str(self.result_dir / f"선정500_실행유니버스_{self.active_venue}.csv")
-        runtime, ureport = self.selector.select(runtime_path, live=True)
+        runtime = None; ureport = {}
+        if self.active_venue == "NXT":
+            runtime, ureport = self._handoff_runtime_for_nxt()
+        if runtime is None or runtime.empty:
+            runtime, ureport = self.selector.select(runtime_path, live=True)
+        else:
+            try:
+                runtime.to_csv(runtime_path, index=False, encoding="utf-8-sig")
+            except Exception:
+                pass
         self.last_universe_report = dict(ureport or {})
         if self.active_venue == "NXT" and "nxt_eligible" in runtime.columns:
             runtime = runtime[runtime["nxt_eligible"].map(lambda v: v is True or str(v).strip().lower() in {"1","true","y","yes"})].copy().reset_index(drop=True)
+        # KRX 정규장 결과를 당일 공통 500의 기준으로 보관한다. NXT는 이 목록을 이어받는다.
+        if self.active_venue == "KRX" and len(runtime) > 0:
+            self.shared_runtime_base = runtime.copy()
+            self.shared_runtime_source_venue = "KRX"
         LOG.info("runtime universe selected=%d anchors=%d venue=%s session=%s nxt_total=%s cap_eligible=%s",
                  len(runtime), ureport.get("liquidity_anchor_in_selected", 0), self.active_venue, info.get("session"),
                  ureport.get("nxt_eligible_total"), ureport.get("cap_eligible_estimate"))
@@ -1960,7 +2080,7 @@ from urllib.parse import urlparse
 
 from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import Alpha500Integrated, market_session_now
 
-ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_10_RATIONAL_SECTOR_GROUPS"
+ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_11_NXT_HANDOFF_WS_STABLE"
 VERSION = ENGINE_VERSION
 PORT = int(os.getenv("PORT", "10000"))
 MASTER = os.getenv("UNIVERSE_MASTER", "섹터마스터_500종목_V3.csv")
@@ -2060,6 +2180,15 @@ class EngineProgressHandler(logging.Handler):
     def emit(self, record):
         try:
             msg = record.getMessage()
+            m = re.search(r"UNIVERSE HANDOFF source=(\S+) kept=(\d+) filled=(\d+) target=(\d+) venue=(\S+)", msg)
+            if m:
+                src,kept,filled,total,venue = m.groups(); set_progress("UNIVERSE", int(total), int(total), f"{venue} 공통500 인계 · 유지 {kept} · 보충 {filled}"); return
+            m = re.search(r"runtime universe selected=(\d+).*venue=(\S+).*session=(\S+)", msg)
+            if m:
+                n,venue,session=m.groups(); set_progress("UNIVERSE", int(n), int(n), f"{session} · {venue} 유니버스 {n}개 완료"); return
+            m = re.search(r"NXT QUOTES (\d+)/(\d+)", msg)
+            if m:
+                a,b=map(int,m.groups()); set_progress("NXT_QUOTES", a, b, f"NXT 현재가 조회 {a}/{b}"); return
             m = re.search(r"history bootstrap/refresh required=(\d+)", msg)
             if m:
                 n = int(m.group(1)); set_progress("HISTORY", 0, n, f"과거봉 구축 0/{n}"); return
@@ -2257,8 +2386,17 @@ def _ws_target_map(summary, venue):
 def _ws_subscriptions(summary, venue):
     targets = _ws_target_map(summary, venue)
     subs = []
+    nxt_eligible = None
+    if venue == "NXT":
+        try:
+            nxt_eligible = {str(x.code).zfill(6) for x in get_engine().selector.get_ls_universe() if bool(getattr(x, "nxt", False))}
+        except Exception:
+            nxt_eligible = set()
     for code, market in targets.items():
         if venue == "NXT":
+            # 직전 KRX 후보라도 NXT 거래가능 종목만 NS3에 등록한다.
+            if nxt_eligible is not None and code not in nxt_eligible:
+                continue
             subs.append(("NS3", code))
         else:
             m = str(market or "").upper()
@@ -2277,6 +2415,10 @@ def _ws_subscriptions(summary, venue):
                         subs.append(("S3_", code))
                 except Exception:
                     continue
+    if venue == "NXT":
+        subs = subs[:max(1, int(os.getenv("NXT_WS_SUB_MAX", "20")))]
+    else:
+        subs = subs[:max(1, int(os.getenv("LIVE_QUOTE_MAX", "80")))]
     return subs
 
 
@@ -2339,11 +2481,18 @@ def live_ws_loop():
             ws = websocket.create_connection(WS_URL, timeout=5, enable_multithread=True)
             ws.settimeout(2)
             channels = sorted(set(x[0] for x in subs))
-            for tr_cd, code in subs:
+            sub_gap = max(0.02, int(os.getenv("WS_SUBSCRIBE_INTERVAL_MS", "180")) / 1000.0)
+            sub_batch = max(1, int(os.getenv("WS_SUBSCRIBE_BATCH", "5")))
+            for idx, (tr_cd, code) in enumerate(subs, 1):
                 ws.send(json.dumps({
                     "header": {"token": token, "tr_type": "3"},
                     "body": {"tr_cd": tr_cd, "tr_key": code},
                 }, ensure_ascii=False))
+                # NXT는 다건 등록을 한 번에 밀어 넣지 않는다.
+                if venue == "NXT":
+                    time.sleep(sub_gap)
+                    if idx % sub_batch == 0:
+                        time.sleep(0.35)
             signature = (venue, tuple(subs))
             last_tick_monotonic = time.monotonic()
             _set_ws_state("CONNECTED", subscribed=len(subs), channels=channels, error=None)
@@ -2356,9 +2505,18 @@ def live_ws_loop():
                 subs2 = _ws_subscriptions(summary2, venue2) if bool(info2.get("scan_allowed")) else []
                 if (venue2, tuple(subs2)) != signature:
                     break
-                if time.monotonic() - last_tick_monotonic > WS_STALE_SECONDS:
+                stale_limit = max(WS_STALE_SECONDS, int(os.getenv("NXT_WS_STALE_SECONDS", "30"))) if venue == "NXT" else WS_STALE_SECONDS
+                if time.monotonic() - last_tick_monotonic > stale_limit:
                     _set_ws_state("STALE", error="WS tick stale", rest_fallback=True)
-                    raise RuntimeError("WS tick stale; reconnect and REST fallback")
+                    if venue == "NXT":
+                        # NXT 저체결 구간은 무한 재접속하지 않고 연결은 유지, REST fallback을 병행한다.
+                        try:
+                            ws.ping()
+                            last_tick_monotonic = time.monotonic()
+                        except Exception:
+                            raise RuntimeError("NXT WebSocket ping failed; REST fallback")
+                    else:
+                        raise RuntimeError("WS tick stale; reconnect and REST fallback")
                 try:
                     raw = ws.recv()
                 except websocket.WebSocketTimeoutException:
@@ -2395,9 +2553,10 @@ def live_ws_loop():
                         log.info("WS TICK count=%s tr=%s symbol=%s price=%s diff=%s", tick_n, tr_cd or "REAL", code, q.get("price"), q.get("diff"))
                     _set_ws_state("RECEIVING", last_message=True)
         except Exception as e:
-            _set_ws_state("STALE", error=str(e)[:240])
+            _set_ws_state("STALE", error=str(e)[:240], rest_fallback=True)
             log.warning("WS reconnect: %s", e)
-            time.sleep(2)
+            backoff = max(2, int(os.getenv("WS_RECONNECT_BACKOFF_SECONDS", "5")))
+            time.sleep(backoff)
         finally:
             if ws is not None:
                 try:
@@ -3158,7 +3317,7 @@ async function refresh(){
  }catch(e){document.getElementById('progressMsg').textContent='STATUS ERROR: '+e}
  try{
   const r=await fetch('/api/results?x='+Date.now(),{cache:'no-store'}).then(r=>r.json());
-  const ur=r.universe_report||{};document.getElementById('summary').innerHTML=box('거래소',r.venue||'-')+box('세션',r.session||'-')+box('판정 유니버스',num(r.universe))+box('NXT 거래가능',num(ur.nxt_eligible_total))+box('시총필터 후',num(ur.cap_eligible_estimate))+box('섹터군집',num(r.clusters))+box('FINAL',num(r.final_count));
+  const ur=r.universe_report||{};const handoff=ur.handoff_used?`${ur.handoff_source||'KRX'} · 유지 ${num(ur.handoff_kept)} · 보충 ${num(ur.handoff_filled)}`:'-';document.getElementById('summary').innerHTML=box('거래소',r.venue||'-')+box('세션',r.session||'-')+box('판정 유니버스',num(r.universe))+box('공통500 인계',handoff)+box('NXT 거래가능',num(ur.nxt_eligible_total))+box('시총필터 후',num(ur.cap_eligible_estimate))+box('섹터군집',num(r.clusters))+box('FINAL',num(r.final_count));
   const finalRows=r.top_final||[], liveWatch=r.live_watch10||[], watchRows=r.top_watch||[];
   const show=liveWatch.length?liveWatch:(finalRows.length?finalRows:watchRows);
   const statusTxt=liveWatch.length?`LIVE WATCH ${liveWatch.length} · FINAL ${finalRows.length}`:(finalRows.length?`FINAL ${finalRows.length}`:`FINAL 없음 · WATCH ${watchRows.length}`);
