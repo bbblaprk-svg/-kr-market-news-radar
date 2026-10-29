@@ -657,6 +657,18 @@ class Alpha500Integrated(TwoStageDeepScanner):
             stage1["stage1_state"].isin(["UP_START", "REVERSAL_ARMED", "DOWN_WEAKEN", "UP_TREND"])
         ].copy()
         valid = valid[pd.to_numeric(valid["stage1_score_raw"], errors="coerce") >= self.stage1_min_score]
+        # DATA TRUTH GATE: 시장센서 500개와 실제 매수후보를 분리한다.
+        # 시총 미확인, 군집 미매핑, 원본 매수제외 종목은 Stage2/Deep으로 보내지 않는다.
+        if "매수후보" in valid.columns:
+            valid = valid[valid["매수후보"].astype(str).str.upper().eq("Y")]
+        if "ENERGY_EXCLUDE" in valid.columns:
+            valid = valid[valid["ENERGY_EXCLUDE"].astype(str).str.upper().ne("Y")]
+        min_cap = env_float("PULSE_MIN_MARKET_CAP_100M", 1000.0)
+        if "market_cap_100m" in valid.columns:
+            cap = pd.to_numeric(valid["market_cap_100m"], errors="coerce")
+            valid = valid[cap.ge(min_cap)]
+        else:
+            valid = valid.iloc[0:0].copy()
         if valid.empty:
             return valid
 
@@ -986,6 +998,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import math
 import os
 import re
@@ -1007,6 +1020,8 @@ from 전체시장_알파하이킨아시_KIS_LS_스캐너_V1_0 import (
     SymbolInfo,
     is_probably_common_stock,
 )
+
+LOG = logging.getLogger("alpha500_universe")
 
 
 def env_int(name: str, default: int) -> int:
@@ -1357,16 +1372,19 @@ class Universe500Selector:
             return self._cap_cache
         today = date.today().strftime("%Y%m%d")
         p = self.data_dir / f"cap_map_{today}.json"
+        cached: Dict[str, float] = {}
         if p.exists():
             try:
                 cached = {k: float(v) for k, v in json.loads(p.read_text(encoding="utf-8")).items()}
                 if len(cached) >= 500:
                     self._cap_cache = cached
                     return self._cap_cache
-                LOG.warning("cap cache incomplete rows=%s; rebuilding", len(cached))
+                LOG.warning("cap cache incomplete rows=%s; merging fresh pages", len(cached))
             except Exception as e:
                 LOG.warning("cap cache read failed; rebuilding: %s", str(e)[:180])
-        cap: Dict[str, float] = {}
+                cached = {}
+        # 일부 페이지가 유량제어로 실패해도 이미 확보한 시총맵을 버리지 않고 누적한다.
+        cap: Dict[str, float] = dict(cached)
         for upcode in ("001", "301"):
             cap.update(self._fetch_cap_market(upcode))
         try:
@@ -1432,7 +1450,8 @@ class Universe500Selector:
 
         cap_map = self.get_cap_map()
         # 시총맵 미수록 종목을 0원으로 처리하면 일부수집 시 500개가 39개처럼 붕괴한다.
-        # 실제 1,000억원 미만이 확인된 종목만 제외하고, 미수록은 검증대기로 유지한다.
+        # 시장센서 유니버스에는 미수록을 검증대기로 유지하되, 매수후보 단계에서는 차단한다.
+        cap_source_count = len(universe)
         cap_known = sum(1 for x in universe if cap_map.get(x.code) is not None)
         cap_rejected = sum(1 for x in universe if cap_map.get(x.code) is not None and fnum(cap_map.get(x.code), 0) < self.min_cap_100m)
         cap_unknown = sum(1 for x in universe if cap_map.get(x.code) is None)
@@ -1441,15 +1460,23 @@ class Universe500Selector:
         cap_eligible_count = len(universe)
         target_n = min(self.target, cap_eligible_count) if self.exchgubun == "N" else self.target
         LOG.info("cap gate source=%s known=%s unknown=%s rejected=%s eligible=%s target=%s",
-                 cap_known + cap_unknown + cap_rejected, cap_known, cap_unknown, cap_rejected, cap_eligible_count, target_n)
+                 cap_source_count, cap_known, cap_unknown, cap_rejected, cap_eligible_count, target_n)
         if cap_map:
             resolved["market_cap_100m"] = resolved["code"].map(cap_map)
-            # 실제 cap map에 들어온 종목이 기준 미달이면 제거. cap map 미수록은 아직 검증대기.
+            # 실제 cap map에 들어온 종목이 기준 미달이면 제거. cap map 미수록은 시장센서로만 유지.
             resolved = resolved[
                 resolved["market_cap_100m"].isna() | (resolved["market_cap_100m"] >= self.min_cap_100m)
             ].copy()
         else:
             resolved["market_cap_100m"] = pd.NA
+        # 시총 확인 전에는 원본 마스터가 Y여도 매수후보로 승격시키지 않는다.
+        if "매수후보" in resolved.columns:
+            original_buy = resolved["매수후보"].astype(str).str.upper().eq("Y")
+            cap_confirmed = pd.to_numeric(resolved["market_cap_100m"], errors="coerce").ge(self.min_cap_100m)
+            resolved["매수후보"] = (original_buy & cap_confirmed).map({True: "Y", False: "N"})
+        resolved["시총1000억필터"] = pd.to_numeric(resolved["market_cap_100m"], errors="coerce").map(
+            lambda v: "PASS" if pd.notna(v) and float(v) >= self.min_cap_100m else "검증대기"
+        )
 
         rolling = self.update_liquidity_history(universe)
         anchors = rolling.head(self.anchor_n).copy() if not rolling.empty else pd.DataFrame()
@@ -1482,7 +1509,7 @@ class Universe500Selector:
                 "SECONDARY_TAG": "",
                 "역할": "LIQUIDITY_ANCHOR",
                 "에너지기본가중": "0.00",
-                "매수후보": "Y",
+                "매수후보": "Y" if fnum(a.get("market_cap_100m"), 0) >= self.min_cap_100m else "N",
                 "시총1000억필터": "PASS_BY_T1463" if fnum(a.get("market_cap_100m"), 0) >= self.min_cap_100m else "검증대기",
                 "활성상태": "ACTIVE",
                 "테마세부": "",
@@ -1533,7 +1560,8 @@ class Universe500Selector:
                     "SECTOR": "미분류_보충", "MICRO_CLUSTER": "미분류_보충",
                     "ENERGY_CLUSTER": "UNMAPPED_LIQUIDITY", "ENERGY_LEVEL": "EXCLUDE_UNTIL_MAPPED",
                     "SECONDARY_TAG": "", "역할": "FOLLOWER", "에너지기본가중": "0.00",
-                    "매수후보": "Y", "시총1000억필터": "PASS" if cap else "검증대기",
+                    "매수후보": "Y" if cap is not None and cap >= self.min_cap_100m else "N",
+                    "시총1000억필터": "PASS" if cap is not None and cap >= self.min_cap_100m else "검증대기",
                     "활성상태": "ACTIVE", "테마세부": "", "운용메모": "500 유지용 동적 보충",
                     "출처URL": "LS:t9945/t1444", "code": code, "name": item.name, "market": item.market,
                     "ENERGY_EXCLUDE": "Y", "market_cap_100m": cap, "LIQUIDITY_ANCHOR": "N",
@@ -1640,7 +1668,7 @@ from urllib.parse import urlparse
 
 from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import Alpha500Integrated, market_session_now
 
-ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_1_CAPFIX"
+ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_3_VERIFIED"
 VERSION = ENGINE_VERSION
 PORT = int(os.getenv("PORT", "10000"))
 MASTER = os.getenv("UNIVERSE_MASTER", "섹터마스터_500종목_V3.csv")
