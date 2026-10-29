@@ -25,6 +25,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     LIVE_QUOTE_SECONDS=3 \
     LIVE_QUOTE_MAX=80 \
     LIVE_POOL_MAX=70 \
+    LIVE_POOL_MIN_STAGE1_SCORE=28 \
     LIVE_REBALANCE_SECONDS=15 \
     LIVE_DEEP_N=30 \
     LIVE_WATCH_N=10 \
@@ -702,6 +703,43 @@ class Alpha500Integrated(TwoStageDeepScanner):
             chosen = pd.concat([chosen, rest.head(self.stage2_n - len(chosen))], ignore_index=True)
         return chosen.head(self.stage2_n).reset_index(drop=True)
 
+    def select_live_pool(self, stage1: pd.DataFrame, stage2: pd.DataFrame) -> pd.DataFrame:
+        """실시간 경쟁용 관찰 풀. STRICT 매수게이트는 유지하고 NEAR만 병렬로 확장한다."""
+        if stage1 is None or stage1.empty:
+            return stage1.iloc[0:0].copy() if stage1 is not None else pd.DataFrame()
+        live_n = max(10, min(env_int("LIVE_POOL_MAX", 70), self.stage2_n))
+        min_score = env_float("LIVE_POOL_MIN_STAGE1_SCORE", 28.0)
+        x = stage1[
+            stage1["stage1_state"].isin(["UP_START", "REVERSAL_ARMED", "DOWN_WEAKEN", "UP_TREND"])
+        ].copy()
+        if "매수후보" in x.columns:
+            x = x[x["매수후보"].astype(str).str.upper().eq("Y")]
+        if "ENERGY_EXCLUDE" in x.columns:
+            x = x[x["ENERGY_EXCLUDE"].astype(str).str.upper().ne("Y")]
+        min_cap = env_float("PULSE_MIN_MARKET_CAP_100M", 1000.0)
+        if "market_cap_100m" not in x.columns:
+            return x.iloc[0:0].copy()
+        cap = pd.to_numeric(x["market_cap_100m"], errors="coerce")
+        x = x[cap.ge(min_cap)].copy()
+        raw = pd.to_numeric(x.get("stage1_score_raw"), errors="coerce")
+        x = x[raw.ge(min_score)].copy()
+        if x.empty:
+            return x
+
+        strict_codes = set()
+        if stage2 is not None and not stage2.empty:
+            strict_codes = set(stage2["symbol"].astype(str).str.zfill(6))
+        x["live_pool_class"] = x["symbol"].astype(str).str.zfill(6).map(
+            lambda c: "STRICT" if c in strict_codes else "NEAR"
+        )
+        x["live_watch_eligible"] = True
+        x["_strict"] = x["live_pool_class"].eq("STRICT").astype(int)
+        x = x.sort_values(
+            ["_strict", "integrated_score", "market_rs_score", "cluster_energy"],
+            ascending=[False, False, False, False], na_position="last"
+        ).drop(columns="_strict")
+        return x.drop_duplicates("symbol", keep="first").head(live_n).reset_index(drop=True)
+
     def select_deep30(self, stage2: pd.DataFrame) -> pd.DataFrame:
         if stage2.empty:
             return stage2
@@ -847,6 +885,9 @@ class Alpha500Integrated(TwoStageDeepScanner):
                     "foreign_net": fnum(r.get("foreign_net"), 0.0),
                     "institution_net": fnum(r.get("institution_net"), 0.0),
                     "program_net": fnum(r.get("program_net"), 0.0),
+                    "market_cap_100m": fnum(r.get("market_cap_100m"), 0.0),
+                    "live_pool_class": str(r.get("live_pool_class", "")),
+                    "live_watch_eligible": bool(r.get("live_watch_eligible", True)),
                 })
             return out
 
@@ -886,14 +927,10 @@ class Alpha500Integrated(TwoStageDeepScanner):
                     "market_cap_100m": fnum(r.get("market_cap_100m"), 0.0),
                 })
 
-        # LIVE POOL: Stage2 최대 70개를 저장해 10분 풀스캔 사이에도 WS로 계속 경쟁시킨다.
+        # LIVE POOL: 엄격 Stage2와 분리된 STRICT+NEAR 관찰 풀.
+        live_pool_df = self.select_live_pool(stage1, stage2)
         live_pool_n = max(10, min(self.stage2_n, env_int("LIVE_POOL_MAX", 70)))
-        live_pool = stock_rows(
-            stage2.sort_values(["integrated_score", "market_rs_score", "cluster_energy"], ascending=False)
-            if stage2 is not None and not stage2.empty else stage2,
-            "LIVE_POOL",
-            live_pool_n,
-        )
+        live_pool = stock_rows(live_pool_df, "LIVE_POOL", live_pool_n)
         deep_base_rows = stock_rows(deep, "DEEP_BASE", self.deep_n)
         deep_base = {str(r.get("symbol", "")).zfill(6): r for r in deep_base_rows}
         for r in live_pool:
@@ -963,6 +1000,8 @@ class Alpha500Integrated(TwoStageDeepScanner):
             "top_watch": top_watch,
             "sector_live_pool": sector_live_pool,
             "live_pool": live_pool,
+            "live_pool_strict_count": sum(1 for r in live_pool if r.get("live_pool_class") == "STRICT"),
+            "live_pool_near_count": sum(1 for r in live_pool if r.get("live_pool_class") == "NEAR"),
             "live_deep30": initial_live_deep,
             "live_watch10": initial_live_watch,
             "live_rebalanced_kst": stamp_kst,
@@ -1581,6 +1620,22 @@ class Universe500Selector:
             universe = list(universe_all)
 
         cap_map = self.get_cap_map()
+        # t1463 유동성 랭킹에서 이미 받는 시가총액(total)을 cap-map에 합쳐 검증범위를 넓힌다.
+        liquidity_snapshot = self.fetch_liquidity_snapshot(universe)
+        cap_added = 0
+        for a in liquidity_snapshot:
+            if a.market_cap_100m is not None and a.market_cap_100m > 0:
+                if cap_map.get(a.code) is None:
+                    cap_added += 1
+                cap_map[a.code] = float(a.market_cap_100m)
+        if cap_added:
+            self._cap_cache = dict(cap_map)
+            try:
+                cap_path = self.data_dir / f"cap_map_{date.today().strftime('%Y%m%d')}.json"
+                cap_path.write_text(json.dumps(cap_map, ensure_ascii=False), encoding="utf-8")
+            except Exception as e:
+                LOG.warning("cap map enrichment cache write failed: %s", str(e)[:180])
+        LOG.info("cap map enriched rows=%d added_from_t1463=%d", len(cap_map), cap_added)
         # 시총맵 미수록 종목을 0원으로 처리하면 일부수집 시 500개가 39개처럼 붕괴한다.
         # 시장센서 유니버스에는 미수록을 검증대기로 유지하되, 매수후보 단계에서는 차단한다.
         cap_source_count = len(universe)
@@ -1610,7 +1665,8 @@ class Universe500Selector:
             lambda v: "PASS" if pd.notna(v) and float(v) >= self.min_cap_100m else "검증대기"
         )
 
-        rolling = self.update_liquidity_history(universe)
+        self.history.upsert(date.today().isoformat(), liquidity_snapshot)
+        rolling = self.history.rolling(self.liq_window)
         anchors = rolling.head(self.anchor_n).copy() if not rolling.empty else pd.DataFrame()
         anchor_codes = set(anchors["code"].astype(str)) if not anchors.empty else set()
         anchor_meta = anchors.set_index("code").to_dict("index") if not anchors.empty else {}
@@ -1800,7 +1856,7 @@ from urllib.parse import urlparse
 
 from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import Alpha500Integrated, market_session_now
 
-ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_7_LIVESECTOR60_REP5"
+ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_8_LIVEPOOL70_DYNAMIC"
 VERSION = ENGINE_VERSION
 PORT = int(os.getenv("PORT", "10000"))
 MASTER = os.getenv("UNIVERSE_MASTER", "섹터마스터_500종목_V3.csv")
@@ -2510,7 +2566,8 @@ def live_rank_loop():
                 rows.sort(key=lambda r: float(r.get("live_score") or 0.0), reverse=True)
                 live_deep = rows[:deep_n]
 
-            watch_source = [r for r in live_deep if r.get("deep_verified")] if require_deep else list(live_deep)
+            eligible_live = [r for r in live_deep if r.get("live_watch_eligible", True)]
+            watch_source = [r for r in eligible_live if r.get("deep_verified")] if require_deep else eligible_live
             live_watch = []
             for r in watch_source[:watch_n]:
                 z = dict(r)
@@ -2999,7 +3056,8 @@ async function refresh(){
   const show=liveWatch.length?liveWatch:(finalRows.length?finalRows:watchRows);
   const statusTxt=liveWatch.length?`LIVE WATCH ${liveWatch.length} · FINAL ${finalRows.length}`:(finalRows.length?`FINAL ${finalRows.length}`:`FINAL 없음 · WATCH ${watchRows.length}`);
   const liveTxt=r.live_updated_kst?`${r.live_updated_kst} · ${r.live_price_source||'LS'}`:'수신 대기';
-  const rankTxt=r.live_rebalanced_kst?`POOL ${r.live_pool_count||((r.live_pool||[]).length)} → DEEP ${r.live_deep_count||((r.live_deep30||[]).length)} → WATCH ${r.live_watch_count||liveWatch.length} · ${r.live_rebalanced_kst}`:'재선정 대기';
+  const poolN=r.live_pool_count||((r.live_pool||[]).length), strictN=r.live_pool_strict_count||0, nearN=r.live_pool_near_count||0;
+  const rankTxt=r.live_rebalanced_kst?`POOL ${poolN} (STRICT ${strictN} · NEAR ${nearN}) → DEEP ${r.live_deep_count||((r.live_deep30||[]).length)} → WATCH ${r.live_watch_count||liveWatch.length} · ${r.live_rebalanced_kst}`:'재선정 대기';
   document.getElementById('candidateStatus').textContent=statusTxt;document.getElementById('candidateLive').textContent=liveTxt;document.getElementById('candidateRank').textContent=rankTxt;
   document.getElementById('candidates').innerHTML=candidateRows(show);
   document.getElementById('sectors').innerHTML=sectorRows(r.sector_energy||r.top_clusters||[]);
