@@ -36,6 +36,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     LIVE_SECTOR_NXT=false \
     LIVE_SECTOR_REP_N=5 \
     SELECTION_HISTORY_MAX=200 \
+    HISTORY_DISPLAY_ROWS=20 \
+    RATIONAL_ENERGY_GROUPING=true \
     SAVE_FULL_CSV=false \
     ALPHA500_DATA_DIR=/data \
     RESULT_DIR=/data/results
@@ -565,9 +567,104 @@ class Alpha500Integrated(TwoStageDeepScanner):
         base = x.iloc[-21:-1].mean() if len(x) >= 21 else x.iloc[:-1].mean()
         return float(x.iloc[-1] / base) if base and base > 0 else float("nan")
 
+    @staticmethod
+    def rational_energy_group(name: Any, mega: Any, sector: Any, micro: Any = "", original: Any = "") -> str:
+        """투자자 관점 에너지군. 전략 종목군을 우선하고 지나친 소분류를 병합한다."""
+        name = str(name or "").strip()
+        mega = str(mega or "").strip()
+        sector = str(sector or "").strip()
+        micro = str(micro or "").strip()
+        original = str(original or "").strip()
+
+        # 1) 사용자가 지정한 전략 앵커군: 종목명 우선
+        if name in {"SK하이닉스", "SK스퀘어"}:
+            return "SK하이닉스·SK스퀘어"
+        if name in {"삼성전자", "삼성물산"}:
+            return "삼성전자·삼성물산"
+        if name == "삼성전기":
+            return "반도체_MLCC"
+
+        # 2) 반도체: 공정/테마 기준으로 과도한 세분화를 9개 실전군으로 축약
+        if mega == "반도체":
+            if sector == "반도체_PCB_FCBGA_기판":
+                return "반도체_기판"
+            if sector == "반도체_유리기판_TGV":
+                return "반도체_유리기판"
+            if sector == "반도체_전력반도체_SiC_GaN":
+                return "반도체_전력반도체"
+            if sector == "반도체_팹리스_AI_IP_디자인하우스":
+                return "반도체_디자인하우스"
+            if sector in {
+                "반도체_HBM_TSV_첨단패키징장비",
+                "반도체_OSAT_패키징",
+                "반도체_테스트_프로브_소켓",
+            }:
+                return "반도체_후공정장비"
+            if sector in {
+                "반도체_식각_플라즈마_애싱",
+                "반도체_증착_ALD_CVD_열처리",
+                "반도체_세정_습식_케미컬공급",
+                "반도체_CMP_평탄화_연마",
+                "반도체_검사_계측_웨이퍼핸들링",
+                "반도체_진공_칠러_스크러버_팹인프라",
+            }:
+                return "반도체_전공정장비"
+            if sector in {
+                "반도체_노광_EUV_마스크_PR",
+                "반도체_특수가스_전구체_케미컬",
+                "반도체_쿼츠_SiC_세라믹_소모부품",
+            }:
+                return "반도체_부품소재"
+            if sector == "반도체_IDM_메모리_파운드리":
+                return "반도체_파운드리_IDM"
+            return "반도체_기타"
+
+        # 3) 나머지 시장: 상관성이 높은 소분류만 합치고 성격이 다른 테마는 유지
+        merge = {
+            "AI·로봇": "AI·로봇",
+            "로봇": "AI·로봇",
+            "2차전지 셀·소재": "2차전지_셀·소재",
+            "2차전지": "2차전지_셀·소재",
+            "2차전지 장비·리사이클": "2차전지_장비·리사이클",
+            "의료기기·의료AI": "의료기기·의료AI",
+            "의료기기": "의료기기·의료AI",
+            "인터넷플랫폼": "플랫폼·IT·통신",
+            "IT서비스": "플랫폼·IT·통신",
+            "통신": "플랫폼·IT·통신",
+            "지주": "지주·밸류업",
+            "지주·밸류업": "지주·밸류업",
+            "신재생": "신재생·유틸리티",
+            "유틸리티": "신재생·유틸리티",
+            "게임": "콘텐츠·게임",
+            "엔터·콘텐츠": "콘텐츠·게임",
+            "자동차": "자동차·EV부품",
+            "EV부품": "자동차·EV부품",
+            "전력기기": "전력인프라_기기·전선",
+            "전선": "전력인프라_기기·전선",
+            "건설": "건설·산업재",
+            "산업재": "건설·산업재",
+        }
+        if mega in merge:
+            return merge[mega]
+
+        # 충분한 표본을 가진 메가섹터는 그대로 에너지군으로 사용
+        return mega or sector or original or "기타"
+
     def calculate_cluster_energy(self, stage1: pd.DataFrame, data_cache: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame]:
         x = stage1.copy()
         x["turnover_accel"] = x["symbol"].map(lambda s: self.turnover_accel(data_cache.get(str(s))))
+        if "ENERGY_CLUSTER" in x.columns:
+            x["ENERGY_DETAIL"] = x["ENERGY_CLUSTER"].astype(str)
+        else:
+            x["ENERGY_DETAIL"] = ""
+        names = x.get("name", pd.Series("", index=x.index)).astype(str)
+        mega = x.get("MEGA_SECTOR", pd.Series("", index=x.index)).astype(str)
+        sectors = x.get("SECTOR", pd.Series("", index=x.index)).astype(str)
+        micros = x.get("MICRO_CLUSTER", pd.Series("", index=x.index)).astype(str)
+        x["ENERGY_CLUSTER"] = [
+            self.rational_energy_group(names.loc[i], mega.loc[i], sectors.loc[i], micros.loc[i], x.loc[i, "ENERGY_DETAIL"])
+            for i in x.index
+        ]
         valid = x[
             (x.get("ENERGY_EXCLUDE", "N").astype(str) != "Y") &
             (x["stage1_state"] != "ERROR") &
@@ -607,7 +704,11 @@ class Alpha500Integrated(TwoStageDeepScanner):
                 + 20 * breadth
                 + 20 * norm(turn, 0.70, 1.80)
             )
-            energy = clip100(0.65 * rotation + 0.35 * power)
+            raw_energy = clip100(0.65 * rotation + 0.35 * power)
+            min_members = max(1, env_int("ENERGY_MIN_MEMBERS", 3))
+            sample_reliability = min(1.0, len(g) / float(min_members))
+            # 1~2종목 전략군도 표시하되 과대평가를 막기 위해 중립 50점으로 수축한다.
+            energy = clip100(50.0 + (raw_energy - 50.0) * sample_reliability)
             if mean_mrs < -1.0 and breadth < 0.30:
                 state = "S5"
             elif energy >= 82 and (avg_ret >= 4.5 or turn >= 2.20):
@@ -632,6 +733,7 @@ class Alpha500Integrated(TwoStageDeepScanner):
                 "cluster_rotation": round(rotation, 2),
                 "cluster_energy": round(energy, 2),
                 "cluster_state": state,
+                "sample_reliability": round(sample_reliability, 3),
                 "cap_coverage": round(cap_coverage, 3),
             })
         cdf = pd.DataFrame(rows)
@@ -865,6 +967,7 @@ class Alpha500Integrated(TwoStageDeepScanner):
                     "entry_price": px,
                     "MEGA_SECTOR": str(r.get("MEGA_SECTOR", "")),
                     "ENERGY_CLUSTER": str(r.get("ENERGY_CLUSTER", "")),
+                    "ENERGY_DETAIL": str(r.get("ENERGY_DETAIL", r.get("MICRO_CLUSTER", ""))),
                     "cluster_state": str(r.get("cluster_state", "")),
                     "cluster_energy": round(fnum(r.get("cluster_energy"), 0.0), 2),
                     "cluster_breadth": round(fnum(r.get("cluster_breadth"), 0.0), 4),
@@ -915,6 +1018,7 @@ class Alpha500Integrated(TwoStageDeepScanner):
                     "market": str(r.get("market", "")),
                     "venue": self.active_venue,
                     "ENERGY_CLUSTER": cluster,
+                    "ENERGY_DETAIL": str(r.get("ENERGY_DETAIL", r.get("MICRO_CLUSTER", ""))),
                     "MEGA_SECTOR": str(r.get("MEGA_SECTOR", "")),
                     "current_price": fnum(r.get("stage1_close"), 0.0),
                     "change_pct": round(fnum(r.get("current_return_pct"), 0.0), 4),
@@ -1856,7 +1960,7 @@ from urllib.parse import urlparse
 
 from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import Alpha500Integrated, market_session_now
 
-ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_8_LIVEPOOL70_DYNAMIC"
+ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_10_RATIONAL_SECTOR_GROUPS"
 VERSION = ENGINE_VERSION
 PORT = int(os.getenv("PORT", "10000"))
 MASTER = os.getenv("UNIVERSE_MASTER", "섹터마스터_500종목_V3.csv")
@@ -2978,8 +3082,8 @@ class Handler(BaseHTTPRequestHandler):
 <title>ALPHA500 LS Cluster Radar</title>
 <style>
 :root{color-scheme:dark;--bg:#07111f;--card:#0e1b2d;--line:#20324a;--txt:#eef5ff;--muted:#92a9c5;--ok:#36d399;--warn:#fbbf24;--bad:#fb7185;--accent:#60a5fa;--cyan:#67e8f9}
-*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#07111f,#091525);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1400px;margin:auto;padding:16px}.top{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}.title{font-size:22px;font-weight:850}.sub{color:var(--muted);font-size:12px;margin-top:4px}.grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:9px;margin:14px 0}.card{background:rgba(14,27,45,.94);border:1px solid var(--line);border-radius:14px;padding:12px}.k{color:var(--muted);font-size:11px}.v{font-size:17px;font-weight:850;margin-top:6px;word-break:break-word}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.cyan{color:var(--cyan)}button{background:var(--accent);border:0;border-radius:10px;padding:10px 14px;font-weight:850;color:#06111f}.progress{height:10px;background:#14233a;border-radius:999px;overflow:hidden;margin-top:8px}.bar{height:100%;width:0;background:linear-gradient(90deg,#60a5fa,#36d399);transition:width .3s}.phase{font-size:13px;color:var(--muted);margin-top:7px}.section{margin-top:16px}.section h2{font-size:17px;margin:0 0 8px}.note{font-size:12px;color:var(--muted);margin:6px 0}.tablebox{border:1px solid var(--line);border-radius:12px;overflow:auto;background:#07101d}.historybox{max-height:650px;overflow:auto;border:1px solid var(--line);border-radius:12px;background:#07101d}table{width:100%;border-collapse:collapse;min-width:1000px;font-size:12px}th{position:sticky;top:0;background:#122139;color:#b9cbe1;z-index:2;text-align:right;padding:9px 8px;border-bottom:1px solid var(--line);white-space:nowrap}td{text-align:right;padding:9px 8px;border-bottom:1px solid #13233a;white-space:nowrap}th.left,td.left{text-align:left}tr:hover td{background:#0c1b2e}.pos{color:#fb7185}.neg{color:#60a5fa}.up{color:#36d399;font-weight:800}.down{color:#fb7185;font-weight:800}.badge{padding:3px 7px;border-radius:999px;background:#162843}.empty{padding:18px;color:var(--muted)}.sectorMain td{border-bottom:0}.sectorReps td{padding:2px 8px 6px;border-bottom:1px solid #13233a;background:#081421}.sectorRepList{display:flex;gap:10px;align-items:center;overflow:hidden;white-space:nowrap;font-size:8px;line-height:1.15;color:#7f98b8;font-variant-numeric:tabular-nums}.sectorRepItem{display:inline-flex;gap:3px;align-items:center;min-width:0}.sectorRepName{color:#a9bdd5;font-weight:700}.sectorRepPrice{color:#7891b0}.summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.sbox{background:#0b1727;border:1px solid var(--line);border-radius:10px;padding:10px}.snum{font-weight:850;font-size:18px}.foot{color:var(--muted);font-size:11px;margin-top:14px}.stickytime{font-variant-numeric:tabular-nums}.livecard{grid-column:span 3;min-width:0}.livecols,.candidateNoteGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;min-width:0}.livecols{margin-top:6px;min-height:42px}.livecell,.noteCell{min-width:0;border:1px solid #1a2b43;background:#0a1727;border-radius:8px;padding:6px 8px;overflow:hidden}.liveLabel,.noteLabel{display:block;color:var(--muted);font-size:10px;margin-bottom:2px}.liveValue,.noteValue{display:block;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.candidateNoteGrid{min-height:48px;margin:6px 0}.candidateNoteGrid .noteValue{font-size:11px;color:#cbd8e8}#candidateTable{table-layout:fixed;min-width:1135px}#candidateTable td{overflow:hidden;text-overflow:ellipsis}#candidateTable th:nth-child(1){width:70px}#candidateTable th:nth-child(2){width:130px}#candidateTable th:nth-child(3){width:90px}#candidateTable th:nth-child(4){width:80px}#candidateTable th:nth-child(5){width:90px}#candidateTable th:nth-child(6){width:80px}#candidateTable th:nth-child(7){width:75px}#candidateTable th:nth-child(8){width:70px}#candidateTable th:nth-child(9){width:130px}#candidateTable th:nth-child(10){width:150px}#candidateTable th:nth-child(11){width:80px}#candidateTable th:nth-child(12){width:90px}
-@media(max-width:900px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.livecard{grid-column:1/-1}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.v{font-size:15px}.wrap{padding:12px}.historybox{max-height:620px}}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#07111f,#091525);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1400px;margin:auto;padding:16px}.top{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}.title{font-size:22px;font-weight:850}.sub{color:var(--muted);font-size:12px;margin-top:4px}.grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:9px;margin:14px 0}.card{background:rgba(14,27,45,.94);border:1px solid var(--line);border-radius:14px;padding:12px}.k{color:var(--muted);font-size:11px}.v{font-size:17px;font-weight:850;margin-top:6px;word-break:break-word}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.cyan{color:var(--cyan)}button{background:var(--accent);border:0;border-radius:10px;padding:10px 14px;font-weight:850;color:#06111f}.progress{height:10px;background:#14233a;border-radius:999px;overflow:hidden;margin-top:8px}.bar{height:100%;width:0;background:linear-gradient(90deg,#60a5fa,#36d399);transition:width .3s}.phase{font-size:13px;color:var(--muted);margin-top:7px}.section{margin-top:16px}.section h2{font-size:17px;margin:0 0 8px}.note{font-size:12px;color:var(--muted);margin:6px 0}.tablebox{border:1px solid var(--line);border-radius:12px;overflow:auto;background:#07101d}.historybox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}table{width:100%;border-collapse:collapse;min-width:1000px;font-size:12px}th{position:sticky;top:0;background:#122139;color:#b9cbe1;z-index:2;text-align:right;padding:9px 8px;border-bottom:1px solid var(--line);white-space:nowrap}td{text-align:right;padding:9px 8px;border-bottom:1px solid #13233a;white-space:nowrap}th.left,td.left{text-align:left}tr:hover td{background:#0c1b2e}.pos{color:#fb7185}.neg{color:#60a5fa}.up{color:#36d399;font-weight:800}.down{color:#fb7185;font-weight:800}.badge{padding:3px 7px;border-radius:999px;background:#162843}.empty{padding:18px;color:var(--muted)}.sectorMain td{border-bottom:0}.sectorReps td{padding:2px 8px 6px;border-bottom:1px solid #13233a;background:#081421}.sectorRepList{display:flex;gap:10px;align-items:center;overflow:hidden;white-space:nowrap;font-size:8px;line-height:1.15;color:#7f98b8;font-variant-numeric:tabular-nums}.sectorRepItem{display:inline-flex;gap:3px;align-items:center;min-width:0}.sectorRepName{color:#a9bdd5;font-weight:700}.sectorRepPrice{color:#7891b0}.summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.sbox{background:#0b1727;border:1px solid var(--line);border-radius:10px;padding:10px}.snum{font-weight:850;font-size:18px}.foot{color:var(--muted);font-size:11px;margin-top:14px}.stickytime{font-variant-numeric:tabular-nums}.livecard{grid-column:span 3;min-width:0}.livecols,.candidateNoteGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;min-width:0}.livecols{margin-top:6px;min-height:42px}.livecell,.noteCell{min-width:0;border:1px solid #1a2b43;background:#0a1727;border-radius:8px;padding:6px 8px;overflow:hidden}.liveLabel,.noteLabel{display:block;color:var(--muted);font-size:10px;margin-bottom:2px}.liveValue,.noteValue{display:block;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.counterCard .v{font-variant-numeric:tabular-nums;font-size:20px}.historyMeta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin:6px 0}.historyMeta b{color:#cbd8e8}.candidateNoteGrid{min-height:48px;margin:6px 0}.candidateNoteGrid .noteValue{font-size:11px;color:#cbd8e8}#candidateTable{table-layout:fixed;min-width:1135px}#candidateTable td{overflow:hidden;text-overflow:ellipsis}#candidateTable th:nth-child(1){width:70px}#candidateTable th:nth-child(2){width:130px}#candidateTable th:nth-child(3){width:90px}#candidateTable th:nth-child(4){width:80px}#candidateTable th:nth-child(5){width:90px}#candidateTable th:nth-child(6){width:80px}#candidateTable th:nth-child(7){width:75px}#candidateTable th:nth-child(8){width:70px}#candidateTable th:nth-child(9){width:130px}#candidateTable th:nth-child(10){width:150px}#candidateTable th:nth-child(11){width:80px}#candidateTable th:nth-child(12){width:90px}
+@media(max-width:900px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.livecard{grid-column:1/-1}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.v{font-size:15px}.wrap{padding:12px}.historybox{height:620px;max-height:620px}}
 </style></head>
 <body><div class="wrap">
 <div class="top"><div><div class="title">ALPHA500 · LS 군집에너지 레이더</div><div class="sub">NXT 08:00 선행 → KRX 09:00 본판정 → NXT 15:40 장후 · 거래소별 캐시 완전분리 · 한국시간 KST</div></div><button id="runBtn" onclick="runScan()">현재 세션 판정</button></div>
@@ -2990,6 +3094,8 @@ class Handler(BaseHTTPRequestHandler):
  <div class="card"><div class="k">시장 세션</div><div id="session" class="v cyan">-</div></div>
  <div class="card"><div class="k">진행 단계</div><div id="phase" class="v cyan">-</div></div>
  <div class="card"><div class="k">LS</div><div id="ls" class="v">-</div></div>
+ <div class="card counterCard"><div class="k">WS 구독수</div><div id="wsSubCount" class="v cyan">0</div></div>
+ <div class="card counterCard"><div class="k">TICK 누적</div><div id="wsTickCount" class="v cyan">0</div></div>
  <div class="card livecard"><div class="k">실시간 데이터</div><div id="ws" class="livecols"><div class="livecell"><span class="liveLabel">상태</span><span id="wsState" class="liveValue">-</span></div><div class="livecell"><span class="liveLabel">구독 · 체결</span><span id="wsFlow" class="liveValue">-</span></div><div class="livecell"><span class="liveLabel">마지막 수신</span><span id="wsLast" class="liveValue">-</span></div></div></div>
  <div class="card"><div class="k">한국시간 KST</div><div id="now" class="v stickytime">-</div></div>
  <div class="card"><div class="k">마지막 완료 KST</div><div id="finished" class="v stickytime">-</div></div>
@@ -2998,8 +3104,8 @@ class Handler(BaseHTTPRequestHandler):
 
 <div class="section"><h2>판정 요약</h2><div id="summary" class="summary"></div></div>
 <div class="section"><h2>현재 후보 · 실시간 현재가/등락률/진입가</h2><div id="candidateNote" class="note candidateNoteGrid"><div class="noteCell"><span class="noteLabel">후보상태</span><span id="candidateStatus" class="noteValue">-</span></div><div class="noteCell"><span class="noteLabel">현재가 갱신</span><span id="candidateLive" class="noteValue">-</span></div><div class="noteCell"><span class="noteLabel">실시간 재선정</span><span id="candidateRank" class="noteValue">-</span></div></div><div class="tablebox"><table id="candidateTable"><colgroup><col style="width:70px"><col style="width:130px"><col style="width:90px"><col style="width:80px"><col style="width:90px"><col style="width:80px"><col style="width:75px"><col style="width:70px"><col style="width:130px"><col style="width:150px"><col style="width:80px"><col style="width:90px"></colgroup><thead><tr><th>실시간순위</th><th class="left">종목</th><th>현재가</th><th>등락률</th><th>진입가</th><th>통합점수</th><th>딥점수</th><th>등급</th><th class="left">메가섹터</th><th class="left">에너지군</th><th>에너지</th><th>상태</th></tr></thead><tbody id="candidates"></tbody></table></div></div>
-<div class="section"><h2>섹터 에너지 변화 · 자금 이동도 <span id="sectorLiveStamp" class="sub"></span></h2><div class="note">KRX 장중 섹터에너지는 1분마다 500종목 현재가·등락률·거래대금을 다시 반영합니다. Δ에너지와 순위 이동은 직전 LIVE 회차 대비입니다.</div><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">에너지 군집</th><th>상태</th><th>에너지</th><th>Δ에너지</th><th>순위이동</th><th>Breadth</th><th>평균등락</th><th>시장RS</th><th>거래가속</th><th>종목수</th></tr></thead><tbody id="sectors"></tbody></table></div></div>
-<div class="section"><h2>선정 히스토리 <span id="histCount" class="note"></span></h2><div class="note">최대 200건 보관 · 화면은 약 20행 높이로 고정 · 아래 영역에서 스크롤</div><div class="historybox"><table><thead><tr><th class="left">선정시각 KST</th><th>거래소</th><th>세션</th><th>횟수</th><th>구분</th><th class="left">종목</th><th>현재가</th><th>현재등락률</th><th>진입가</th><th>딥점수</th><th>등급</th><th class="left">에너지군</th><th>에너지</th><th>상태</th></tr></thead><tbody id="history"></tbody></table></div></div>
+<div class="section"><h2>섹터 에너지 변화 · 자금 이동도 <span id="sectorLiveStamp" class="sub"></span></h2><div class="note">KRX 장중 섹터에너지는 1분마다 500종목 현재가·등락률·거래대금을 반영합니다. 반도체는 전략군(하이닉스·스퀘어/삼성전자·삼성물산/기판/MLCC/전공정/후공정/부품소재/전력반도체/디자인하우스/유리기판 등)으로 재통합하고, 나머지도 과도한 소분류를 병합했습니다.</div><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">에너지 군집</th><th>상태</th><th>에너지</th><th>Δ에너지</th><th>순위이동</th><th>Breadth</th><th>평균등락</th><th>시장RS</th><th>거래가속</th><th>종목수</th></tr></thead><tbody id="sectors"></tbody></table></div></div>
+<div class="section"><h2>신호 기록부 <span id="histCount" class="note"></span></h2><div class="historyMeta"><span><b>화면 20행 고정</b> · 최대 200건 내부 스크롤</span><span id="histPersist">브라우저백업 대기</span></div><div class="historybox"><table><thead><tr><th class="left">선정시각 KST</th><th>거래소</th><th>세션</th><th>횟수</th><th>구분</th><th class="left">종목</th><th>현재가</th><th>현재등락률</th><th>진입가</th><th>딥점수</th><th>등급</th><th class="left">에너지군</th><th>에너지</th><th>상태</th></tr></thead><tbody id="history"></tbody></table></div></div>
 <div class="foot">08:00 NXT PRE에서 당일 첫 판정을 시작합니다. KRX와 NXT의 가격·과거봉·섹터에너지 캐시는 서로 분리되며 통합(U) 시세는 사용하지 않습니다. 진입가는 판정 시점 신호 기준가입니다.</div>
 </div>
 <script>
@@ -3008,6 +3114,7 @@ const num=(v,d=0)=>{const n=Number(v);return Number.isFinite(n)?n.toLocaleString
 const pct=v=>{const n=Number(v);return Number.isFinite(n)?((n>0?'+':'')+n.toFixed(2)+'%'):'-'};
 const cls=v=>Number(v)>0?'pos':Number(v)<0?'neg':'';
 const box=(k,v)=>`<div class="sbox"><div class="k">${esc(k)}</div><div class="snum">${esc(v)}</div></div>`;
+function mergeHistory(serverRows,venue){const key='ALPHA500_HISTORY_'+String(venue||'KRX').toUpperCase();let local=[];try{local=JSON.parse(localStorage.getItem(key)||'[]');if(!Array.isArray(local))local=[]}catch(e){local=[]}const m=new Map();[...(serverRows||[]),...local].forEach(r=>{const k=[r.selected_at_kst||'',r.symbol||'',r.selection_type||'',r.entry_price||''].join('|');if(!m.has(k))m.set(k,r)});const out=[...m.values()].sort((a,b)=>String(b.selected_at_kst||'').localeCompare(String(a.selected_at_kst||''))).slice(0,200);try{localStorage.setItem(key,JSON.stringify(out))}catch(e){}return out;}
 function clamp(v,a,b){v=Number(v)||0;return Math.max(a,Math.min(b,v))}
 function liveRankScore(r){
  const srv=Number(r.live_score);
@@ -3044,7 +3151,7 @@ async function refresh(){
   document.getElementById('venue').textContent=s.venue||s.expected_venue||'-';document.getElementById('session').textContent=s.session||s.expected_session||'-';
   document.getElementById('phase').textContent=s.phase||'-';
   const ls=document.getElementById('ls');ls.textContent=s.ls_status||(s.ls_configured?'CONFIGURED':'NOT CONFIGURED');ls.className='v '+(s.ls_status==='CONNECTED'?'ok':'warn');
-  const wsState=document.getElementById('wsState'),wsFlow=document.getElementById('wsFlow'),wsLast=document.getElementById('wsLast');const wstat=s.ws_status||'WAITING';wsState.textContent=wstat+(s.rest_fallback_active?' · REST F/B':'');wsState.className='liveValue '+(wstat==='RECEIVING'?'ok':(wstat==='STALE'?'bad':'warn'));wsFlow.textContent=`SUB ${s.ws_subscribed||0} · TICK ${s.ws_tick_count||0}`+(s.ws_last_tr?` · ${s.ws_last_tr}`:'');wsLast.textContent=s.ws_last_message_kst||'-';document.getElementById('now').textContent=s.now_kst||'-';document.getElementById('finished').textContent=s.last_finished||'-';
+  const wsState=document.getElementById('wsState'),wsFlow=document.getElementById('wsFlow'),wsLast=document.getElementById('wsLast');const wstat=s.ws_status||'WAITING';const subN=Number(s.ws_subscribed||0),tickN=Number(s.ws_tick_count||0);wsState.textContent=wstat+(s.rest_fallback_active?' · REST F/B':'');wsState.className='liveValue '+(wstat==='RECEIVING'?'ok':(wstat==='STALE'?'bad':'warn'));wsFlow.textContent=`SUB ${subN} · TICK ${tickN.toLocaleString('ko-KR')}`+(s.ws_last_tr?` · ${s.ws_last_tr}`:'');wsLast.textContent=s.ws_last_message_kst||'-';document.getElementById('wsSubCount').textContent=subN.toLocaleString('ko-KR');document.getElementById('wsTickCount').textContent=tickN.toLocaleString('ko-KR');document.getElementById('now').textContent=s.now_kst||'-';document.getElementById('finished').textContent=s.last_finished||'-';
   document.getElementById('progressText').textContent=(s.progress_total?`${s.progress_current}/${s.progress_total} · ${s.progress_pct}%`:s.phase||'-');
   document.getElementById('bar').style.width=Math.max(0,Math.min(100,Number(s.progress_pct)||0))+'%';document.getElementById('progressMsg').textContent=s.last_error||s.progress_message||'-';
   document.getElementById('runBtn').disabled=!!s.running;
@@ -3062,7 +3169,7 @@ async function refresh(){
   document.getElementById('candidates').innerHTML=candidateRows(show);
   document.getElementById('sectors').innerHTML=sectorRows(r.sector_energy||r.top_clusters||[]);
   const sls=document.getElementById('sectorLiveStamp');if(sls)sls.textContent=r.live_sector_updated_kst?`· LIVE ${r.live_sector_updated_kst} · ${r.live_sector_source||''}`:'· 10분 스냅샷';
-  const h=r.selection_history||[];document.getElementById('histCount').textContent=`${h.length}/200`;document.getElementById('history').innerHTML=historyRows(h);
+  const serverH=(r.selection_history||[]).slice(0,200),h=mergeHistory(serverH,r.venue);document.getElementById('histCount').textContent=`저장 ${h.length}/200`;document.getElementById('history').innerHTML=historyRows(h);const hp=document.getElementById('histPersist');if(hp)hp.textContent=`브라우저백업 ${h.length}/200 · 서버 ${serverH.length}`;
  }catch(e){document.getElementById('candidateStatus').textContent='RESULT ERROR';document.getElementById('candidateLive').textContent=String(e);document.getElementById('candidateRank').textContent='-'}
 }
 async function runScan(){try{const z=await fetch('/api/run',{method:'POST',cache:'no-store'});if(z.status===409)alert('이미 판정이 실행 중입니다.');refresh()}catch(e){alert(e)}}
