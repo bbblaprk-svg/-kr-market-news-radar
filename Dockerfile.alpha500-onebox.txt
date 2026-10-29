@@ -17,7 +17,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     FINAL_TOP_N=10 \
     ENERGY_MIN_MEMBERS=3 \
     AUTO_SCAN=true \
-    SCAN_INTERVAL_SECONDS=3600 \
+    SCAN_INTERVAL_SECONDS=600 \
+    HISTORY_REFRESH_GAP_DAYS=4 \
+    LS_TR_RETRIES=3 \
+    LS_TR_BACKOFF_SECONDS=1.2 \
+    LS_TR_MAX_BACKOFF_SECONDS=8.0 \
     LIVE_QUOTE_SECONDS=3 \
     LIVE_QUOTE_MAX=30 \
     SELECTION_HISTORY_MAX=200 \
@@ -1099,17 +1103,61 @@ class AdaptiveLSProvider(LSProvider):
         self._tr_last[tr_cd] = time.monotonic()
 
     def _post_tr(self, path: str, tr_cd: str, body: dict) -> requests.Response:
+        """LS REST read-only 호출.
+
+        10분 재스캔 운용에서 일시적인 LS 유량제한(IGW00201), 429/5xx,
+        네트워크 순간 오류가 전체 스캔을 즉시 중단시키지 않도록 TR별 간격을
+        유지한 채 제한된 횟수만 지수 백오프로 재시도한다.
+        """
+        retries = max(0, env_int("LS_TR_RETRIES", 3))
+        base_backoff = max(0.2, env_float("LS_TR_BACKOFF_SECONDS", 1.2))
+        max_backoff = max(base_backoff, env_float("LS_TR_MAX_BACKOFF_SECONDS", 8.0))
+        last_error = None
         with self._request_lock:
-            self._wait_tr(tr_cd)
-            r = self.s.post(
-                self.base + path,
-                headers=self._headers(tr_cd),
-                json=body,
-                timeout=self.timeout,
-            )
-            if r.status_code != 200:
-                raise BrokerError(f"LS {tr_cd} HTTP {r.status_code}: {r.text[:240]}")
-            return r
+            for attempt in range(retries + 1):
+                self._wait_tr(tr_cd)
+                try:
+                    r = self.s.post(
+                        self.base + path,
+                        headers=self._headers(tr_cd),
+                        json=body,
+                        timeout=self.timeout,
+                    )
+                except requests.RequestException as e:
+                    last_error = f"network:{type(e).__name__}:{e}"
+                    if attempt >= retries:
+                        raise BrokerError(f"LS {tr_cd} request failed after {attempt + 1} attempts: {e}") from e
+                    delay = min(max_backoff, base_backoff * (2 ** attempt))
+                    LOG.warning("LS TR retry tr=%s attempt=%s/%s delay=%.1fs reason=%s",
+                                tr_cd, attempt + 1, retries, delay, last_error[:160])
+                    time.sleep(delay)
+                    continue
+
+                if r.status_code == 200:
+                    return r
+
+                msg = r.text[:240]
+                last_error = f"HTTP {r.status_code}: {msg}"
+                rate_limited = (
+                    r.status_code == 429
+                    or "IGW00201" in msg
+                    or "호출 거래건수를 초과" in msg
+                )
+                transient = rate_limited or r.status_code >= 500
+                if transient and attempt < retries:
+                    retry_after = 0.0
+                    try:
+                        retry_after = float(r.headers.get("Retry-After") or 0)
+                    except Exception:
+                        retry_after = 0.0
+                    delay = min(max_backoff, max(retry_after, base_backoff * (2 ** attempt)))
+                    LOG.warning("LS TR retry tr=%s attempt=%s/%s delay=%.1fs status=%s msg=%s",
+                                tr_cd, attempt + 1, retries, delay, r.status_code, msg[:160])
+                    time.sleep(delay)
+                    continue
+                raise BrokerError(f"LS {tr_cd} HTTP {r.status_code}: {msg}")
+
+        raise BrokerError(f"LS {tr_cd} failed: {last_error or 'unknown'}")
 
 
 @dataclass
@@ -1668,7 +1716,7 @@ from urllib.parse import urlparse
 
 from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import Alpha500Integrated, market_session_now
 
-ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_3_VERIFIED"
+ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_4_10MIN_SAFE"
 VERSION = ENGINE_VERSION
 PORT = int(os.getenv("PORT", "10000"))
 MASTER = os.getenv("UNIVERSE_MASTER", "섹터마스터_500종목_V3.csv")
@@ -2212,8 +2260,12 @@ def run_scan(session_info=None):
 
 def scan_loop():
     initial = int(os.getenv("INITIAL_SCAN_DELAY_SECONDS", "3"))
-    interval = int(os.getenv("SCAN_INTERVAL_SECONDS", "3600"))
+    interval = int(os.getenv("SCAN_INTERVAL_SECONDS", "600"))
     poll = int(os.getenv("SESSION_POLL_SECONDS", "15"))
+    logging.getLogger("alpha500_scheduler").info(
+        "scheduler interval=%ss poll=%ss non_overlap=true history_gap_days=%s",
+        interval, poll, os.getenv("HISTORY_REFRESH_GAP_DAYS", "4")
+    )
     time.sleep(max(0, initial))
     last_session = None
     last_run = 0.0
@@ -2252,6 +2304,9 @@ def state_copy():
     total = int(d.get("progress_total") or 0)
     cur = int(d.get("progress_current") or 0)
     d["progress_pct"] = round(cur / total * 100, 1) if total > 0 else 0.0
+    d["scan_interval_seconds"] = int(os.getenv("SCAN_INTERVAL_SECONDS", "600"))
+    d["history_refresh_gap_days"] = int(os.getenv("HISTORY_REFRESH_GAP_DAYS", "4"))
+    d["ls_tr_retries"] = int(os.getenv("LS_TR_RETRIES", "3"))
     return d
 
 
