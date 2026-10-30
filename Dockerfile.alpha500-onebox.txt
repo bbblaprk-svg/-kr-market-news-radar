@@ -2686,7 +2686,7 @@ from urllib.parse import urlparse
 from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import Alpha500Integrated, market_session_now
 from 거래량가속_완만상승_LS브리지_V2 import LSVolumeDirectionBridge
 
-ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_20_LAZY_HISTORY"
+ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_21_DASHBOARD_SIGNAL_FIX"
 VERSION = ENGINE_VERSION
 PORT = int(os.getenv("PORT", "10000"))
 MASTER = os.getenv("UNIVERSE_MASTER", "섹터마스터_500종목_V3.csv")
@@ -3543,6 +3543,115 @@ def live_ws_loop():
             # Backoff occurs after closing, so old/new sockets never overlap.
 
 
+def _enrich_volume_direction_and_sector_reps(out, qmap, meta):
+    """대시보드 표시용 보강.
+
+    - 가격/거래량 독립 신호에 종목명·현재가·등락률·섹터를 붙인다.
+    - sector_energy에 representatives가 비어 있어도 동일 venue의 sector_live_pool에서 즉시 계산한다.
+    - KRX/NXT 데이터는 절대 교차 사용하지 않는다.
+    """
+    venue = str(out.get("venue") or "").upper()
+    pool = [dict(x) for x in (out.get("sector_live_pool") or []) if isinstance(x, dict)]
+    # 같은 venue만 사용. venue가 누락된 오래된 행도 현재 summary venue로 생성된 행으로 간주한다.
+    pool = [x for x in pool if str(x.get("venue") or venue).upper() == venue]
+
+    by_code = {}
+    groups = {}
+    for x in pool:
+        code = str(x.get("symbol") or "").zfill(6)
+        if not (code.isdigit() and len(code) == 6):
+            continue
+        q = qmap.get(code) or {}
+        m = meta.get(code) or {}
+        if m and str(m.get("venue") or venue).upper() != venue:
+            q = {}
+        px = _quote_price(q)
+        ch = _quote_pct(q)
+        row = dict(x)
+        if px is not None:
+            row["current_price"] = px
+        if ch is not None:
+            row["change_pct"] = ch
+        by_code[code] = row
+        cluster = str(row.get("ENERGY_CLUSTER") or "")
+        if cluster:
+            groups.setdefault(cluster, []).append(row)
+
+    def rep_score(x):
+        try: ch = float(x.get("change_pct") or 0.0)
+        except Exception: ch = 0.0
+        try: rs = float(x.get("market_rs") or 0.0)
+        except Exception: rs = 0.0
+        try: ta = float(x.get("turnover_accel_live") or x.get("turnover_accel") or 1.0)
+        except Exception: ta = 1.0
+        try: base = float(x.get("integrated_score") or 0.0)
+        except Exception: base = 0.0
+        return 7.0 * ch + 9.0 * rs + 8.0 * min(3.0, max(0.0, ta)) + 0.15 * base
+
+    sector_rows = out.get("sector_energy") or out.get("top_clusters") or []
+    rep_ready = 0
+    for r in sector_rows:
+        if not isinstance(r, dict):
+            continue
+        cluster = str(r.get("ENERGY_CLUSTER") or "")
+        reps = r.get("representatives") if isinstance(r.get("representatives"), list) else []
+        normalized = []
+        # 기존 representatives가 있으면 실시간 qmap으로 가격만 보강.
+        for z in reps[:5]:
+            if not isinstance(z, dict):
+                continue
+            code = str(z.get("symbol") or "").zfill(6)
+            base = by_code.get(code, {})
+            q = qmap.get(code) or {}
+            px = _quote_price(q)
+            ch = _quote_pct(q)
+            normalized.append({
+                "symbol": code,
+                "name": str(z.get("name") or base.get("name") or code),
+                "current_price": px if px is not None else z.get("current_price", base.get("current_price", 0)),
+                "change_pct": ch if ch is not None else z.get("change_pct", base.get("change_pct", 0)),
+            })
+        # 스냅샷에 reps가 없으면 동일 venue sector_live_pool에서 즉시 계산.
+        if not normalized and cluster:
+            for x in sorted(groups.get(cluster, []), key=rep_score, reverse=True)[:5]:
+                normalized.append({
+                    "symbol": str(x.get("symbol") or "").zfill(6),
+                    "name": str(x.get("name") or x.get("symbol") or ""),
+                    "current_price": x.get("current_price", 0),
+                    "change_pct": x.get("change_pct", 0),
+                })
+            if normalized:
+                r["representative_source"] = "SECTOR_POOL_FALLBACK"
+        elif normalized:
+            r["representative_source"] = r.get("representative_source") or "LIVE_SECTOR"
+        r["representatives"] = normalized
+        if normalized:
+            rep_ready += 1
+
+    # volume-direction 신호에 사람이 읽을 메타데이터를 붙인다.
+    vd_rows = out.get("volume_direction_top") or []
+    for r in vd_rows:
+        if not isinstance(r, dict):
+            continue
+        code = str(r.get("symbol") or "").zfill(6)
+        base = by_code.get(code, {})
+        q = qmap.get(code) or {}
+        m = meta.get(code) or {}
+        if m and str(m.get("venue") or venue).upper() != venue:
+            q = {}
+        px = _quote_price(q)
+        ch = _quote_pct(q)
+        r["name"] = str(base.get("name") or r.get("name") or code)
+        r["current_price"] = px if px is not None else base.get("current_price", 0)
+        r["change_pct"] = ch if ch is not None else base.get("change_pct", 0)
+        r["ENERGY_CLUSTER"] = str(base.get("ENERGY_CLUSTER") or "")
+        r["MEGA_SECTOR"] = str(base.get("MEGA_SECTOR") or "")
+
+    out["sector_representatives_ready"] = rep_ready
+    out["sector_representatives_total"] = len(sector_rows)
+    return out
+
+
 def _apply_live_overlay(summary):
     if not isinstance(summary, dict):
         return summary
@@ -3605,6 +3714,23 @@ def _apply_live_overlay(summary):
     except Exception as e:
         out["volume_direction"] = {"enabled": bool(VOLUME_DIRECTION_ENABLED), "top": [], "last_error": f"{type(e).__name__}: {str(e)[:180]}"}
         out["volume_direction_top"] = []
+
+    # 표시용 대표종목/가격·거래량 신호 메타 보강. 동일 venue 데이터만 사용한다.
+    out = _enrich_volume_direction_and_sector_reps(out, qmap, meta)
+    if same_sector_venue and ss.get("sector_energy"):
+        out["sector_display_venue"] = str(out.get("venue") or "").upper()
+        out["sector_display_source"] = ss.get("source") or "LIVE"
+        out["sector_display_updated_kst"] = ss.get("updated_kst") or out.get("timestamp_kst")
+        out["sector_display_note"] = f"{out['sector_display_venue']} 실시간 섹터에너지 · {out['sector_display_source']} · KRX/NXT 분리"
+    else:
+        _sv = str(out.get("venue") or "").upper()
+        out["sector_display_venue"] = _sv
+        out["sector_display_source"] = "SCAN_SNAPSHOT"
+        out["sector_display_updated_kst"] = out.get("timestamp_kst")
+        if _sv == "NXT":
+            out["sector_display_note"] = "NXT 스냅샷 · NXT 500종목 실시간 섹터 재계산은 기본 OFF · KRX 데이터와 혼합하지 않음"
+        else:
+            out["sector_display_note"] = "KRX 판정 스냅샷 · 다음 LIVE 500 갱신 전까지 보존 · NXT 데이터와 혼합하지 않음"
 
     with LOCK:
         out["ws_status"] = STATE.get("ws_status")
@@ -4656,7 +4782,7 @@ class Handler(BaseHTTPRequestHandler):
 <title>ALPHA500 LS Cluster Radar</title>
 <style>
 :root{color-scheme:dark;--bg:#07111f;--card:#0e1b2d;--line:#20324a;--txt:#eef5ff;--muted:#92a9c5;--ok:#36d399;--warn:#fbbf24;--bad:#fb7185;--accent:#60a5fa;--cyan:#67e8f9}
-*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#07111f,#091525);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1400px;margin:auto;padding:16px}.top{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}.title{font-size:22px;font-weight:850}.sub{color:var(--muted);font-size:12px;margin-top:4px}.grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:9px;margin:14px 0}.card{background:rgba(14,27,45,.94);border:1px solid var(--line);border-radius:14px;padding:12px}.k{color:var(--muted);font-size:11px}.v{font-size:17px;font-weight:850;margin-top:6px;word-break:break-word}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.cyan{color:var(--cyan)}button{background:var(--accent);border:0;border-radius:10px;padding:10px 14px;font-weight:850;color:#06111f}.progress{height:10px;background:#14233a;border-radius:999px;overflow:hidden;margin-top:8px}.bar{height:100%;width:0;background:linear-gradient(90deg,#60a5fa,#36d399);transition:width .3s}.phase{font-size:13px;color:var(--muted);margin-top:7px}.section{margin-top:16px}.section h2{font-size:17px;margin:0 0 8px}.note{font-size:12px;color:var(--muted);margin:6px 0}.tablebox{border:1px solid var(--line);border-radius:12px;overflow:auto;background:#07101d}.historybox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}table{width:100%;border-collapse:collapse;min-width:1000px;font-size:12px}th{position:sticky;top:0;background:#122139;color:#b9cbe1;z-index:2;text-align:right;padding:9px 8px;border-bottom:1px solid var(--line);white-space:nowrap}td{text-align:right;padding:9px 8px;border-bottom:1px solid #13233a;white-space:nowrap}th.left,td.left{text-align:left}tr:hover td{background:#0c1b2e}.pos{color:#fb7185}.neg{color:#60a5fa}.up{color:#36d399;font-weight:800}.down{color:#fb7185;font-weight:800}.badge{padding:3px 7px;border-radius:999px;background:#162843}.empty{padding:18px;color:var(--muted)}.sectorMain td{border-bottom:0}.sectorReps td{padding:2px 8px 6px;border-bottom:1px solid #13233a;background:#081421}.sectorRepList{display:flex;gap:10px;align-items:center;overflow:hidden;white-space:nowrap;font-size:8px;line-height:1.15;color:#7f98b8;font-variant-numeric:tabular-nums}.sectorRepItem{display:inline-flex;gap:3px;align-items:center;min-width:0}.sectorRepName{color:#a9bdd5;font-weight:700}.sectorRepPrice{color:#7891b0}.summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.sbox{background:#0b1727;border:1px solid var(--line);border-radius:10px;padding:10px}.snum{font-weight:850;font-size:18px}.foot{color:var(--muted);font-size:11px;margin-top:14px}.stickytime{font-variant-numeric:tabular-nums}.livecard{grid-column:span 3;min-width:0}.livecols,.candidateNoteGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;min-width:0}.livecols{margin-top:6px;min-height:42px}.livecell,.noteCell{min-width:0;border:1px solid #1a2b43;background:#0a1727;border-radius:8px;padding:6px 8px;overflow:hidden}.liveLabel,.noteLabel{display:block;color:var(--muted);font-size:10px;margin-bottom:2px}.liveValue,.noteValue{display:block;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.counterCard .v{font-variant-numeric:tabular-nums;font-size:20px}.historyMeta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin:6px 0}.historyMeta b{color:#cbd8e8}.candidateNoteGrid{min-height:48px;margin:6px 0}.candidateNoteGrid .noteValue{font-size:11px;color:#cbd8e8}#candidateTable{table-layout:fixed;min-width:1135px}#candidateTable td{overflow:hidden;text-overflow:ellipsis}#candidateTable th:nth-child(1){width:70px}#candidateTable th:nth-child(2){width:130px}#candidateTable th:nth-child(3){width:90px}#candidateTable th:nth-child(4){width:80px}#candidateTable th:nth-child(5){width:90px}#candidateTable th:nth-child(6){width:80px}#candidateTable th:nth-child(7){width:75px}#candidateTable th:nth-child(8){width:70px}#candidateTable th:nth-child(9){width:130px}#candidateTable th:nth-child(10){width:150px}#candidateTable th:nth-child(11){width:80px}#candidateTable th:nth-child(12){width:90px}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#07111f,#091525);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1400px;margin:auto;padding:16px}.top{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}.title{font-size:22px;font-weight:850}.sub{color:var(--muted);font-size:12px;margin-top:4px}.grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:9px;margin:14px 0}.card{background:rgba(14,27,45,.94);border:1px solid var(--line);border-radius:14px;padding:12px}.k{color:var(--muted);font-size:11px}.v{font-size:17px;font-weight:850;margin-top:6px;word-break:break-word}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.cyan{color:var(--cyan)}button{background:var(--accent);border:0;border-radius:10px;padding:10px 14px;font-weight:850;color:#06111f}.progress{height:10px;background:#14233a;border-radius:999px;overflow:hidden;margin-top:8px}.bar{height:100%;width:0;background:linear-gradient(90deg,#60a5fa,#36d399);transition:width .3s}.phase{font-size:13px;color:var(--muted);margin-top:7px}.section{margin-top:16px}.section h2{font-size:17px;margin:0 0 8px}.note{font-size:12px;color:var(--muted);margin:6px 0}.tablebox{border:1px solid var(--line);border-radius:12px;overflow:auto;background:#07101d}.historybox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}table{width:100%;border-collapse:collapse;min-width:1000px;font-size:12px}th{position:sticky;top:0;background:#122139;color:#b9cbe1;z-index:2;text-align:right;padding:9px 8px;border-bottom:1px solid var(--line);white-space:nowrap}td{text-align:right;padding:9px 8px;border-bottom:1px solid #13233a;white-space:nowrap}th.left,td.left{text-align:left}tr:hover td{background:#0c1b2e}.pos{color:#fb7185}.neg{color:#60a5fa}.up{color:#36d399;font-weight:800}.down{color:#fb7185;font-weight:800}.badge{padding:3px 7px;border-radius:999px;background:#162843}.empty{padding:18px;color:var(--muted)}.sectorMain td{border-bottom:0}.sectorReps td{padding:2px 8px 6px;border-bottom:1px solid #13233a;background:#081421}.sectorRepList{display:flex;gap:10px;align-items:center;overflow:hidden;white-space:nowrap;font-size:8px;line-height:1.15;color:#7f98b8;font-variant-numeric:tabular-nums}.sectorRepItem{display:inline-flex;gap:3px;align-items:center;min-width:0}.sectorRepName{color:#a9bdd5;font-weight:700}.sectorRepPrice{color:#7891b0}.summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.sbox{background:#0b1727;border:1px solid var(--line);border-radius:10px;padding:10px}.snum{font-weight:850;font-size:18px}.foot{color:var(--muted);font-size:11px;margin-top:14px}.stickytime{font-variant-numeric:tabular-nums}.livecard{grid-column:span 3;min-width:0}.livecols,.candidateNoteGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;min-width:0}.livecols{margin-top:6px;min-height:42px}.livecell,.noteCell{min-width:0;border:1px solid #1a2b43;background:#0a1727;border-radius:8px;padding:6px 8px;overflow:hidden}.liveLabel,.noteLabel{display:block;color:var(--muted);font-size:10px;margin-bottom:2px}.liveValue,.noteValue{display:block;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.counterCard .v{font-variant-numeric:tabular-nums;font-size:20px}.historyMeta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin:6px 0}.historyMeta b{color:#cbd8e8}.candidateNoteGrid{min-height:48px;margin:6px 0}.candidateNoteGrid .noteValue{font-size:11px;color:#cbd8e8}#candidateTable{table-layout:fixed;min-width:1135px}#candidateTable td{overflow:hidden;text-overflow:ellipsis}#candidateTable th:nth-child(1){width:70px}#candidateTable th:nth-child(2){width:130px}#candidateTable th:nth-child(3){width:90px}#candidateTable th:nth-child(4){width:80px}#candidateTable th:nth-child(5){width:90px}#candidateTable th:nth-child(6){width:80px}#candidateTable th:nth-child(7){width:75px}#candidateTable th:nth-child(8){width:70px}#candidateTable th:nth-child(9){width:130px}#candidateTable th:nth-child(10){width:150px}#candidateTable th:nth-child(11){width:80px}#candidateTable th:nth-child(12){width:90px}.vdMeta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin:6px 0}.vdState{display:inline-block;padding:3px 7px;border-radius:999px;background:#162843;font-weight:800}.vdHot{color:#36d399}.vdWarm{color:#67e8f9}.vdPause{color:#fbbf24}.vdBad{color:#fb7185}#vdTable{min-width:1180px}.sectorSourceStrong{color:#cbd8e8;font-weight:700}
 @media(max-width:900px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.livecard{grid-column:1/-1}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.v{font-size:15px}.wrap{padding:12px}.historybox{height:620px;max-height:620px}}
 </style></head>
 <body><div class="wrap">
@@ -4678,7 +4804,8 @@ class Handler(BaseHTTPRequestHandler):
 
 <div class="section"><h2>판정 요약</h2><div id="summary" class="summary"></div></div>
 <div class="section"><h2>현재 후보 · 실시간 현재가/등락률/진입가</h2><div id="candidateNote" class="note candidateNoteGrid"><div class="noteCell"><span class="noteLabel">후보상태</span><span id="candidateStatus" class="noteValue">-</span></div><div class="noteCell"><span class="noteLabel">현재가 갱신</span><span id="candidateLive" class="noteValue">-</span></div><div class="noteCell"><span class="noteLabel">실시간 재선정</span><span id="candidateRank" class="noteValue">-</span></div></div><div class="tablebox"><table id="candidateTable"><colgroup><col style="width:70px"><col style="width:130px"><col style="width:90px"><col style="width:80px"><col style="width:90px"><col style="width:80px"><col style="width:75px"><col style="width:70px"><col style="width:130px"><col style="width:150px"><col style="width:80px"><col style="width:90px"></colgroup><thead><tr><th>실시간순위</th><th class="left">종목</th><th>현재가</th><th>등락률</th><th>진입가</th><th>통합점수</th><th>딥점수</th><th>등급</th><th class="left">메가섹터</th><th class="left">에너지군</th><th>에너지</th><th>상태</th></tr></thead><tbody id="candidates"></tbody></table></div></div>
-<div class="section"><h2>섹터 에너지 변화 · 자금 이동도 <span id="sectorLiveStamp" class="sub"></span></h2><div class="note">KRX 장중 섹터에너지는 1분마다 500종목 현재가·등락률·거래대금을 반영합니다. 반도체는 전략군(하이닉스·스퀘어/삼성전자·삼성물산/기판/MLCC/전공정/후공정/부품소재/전력반도체/디자인하우스/유리기판 등)으로 재통합하고, 나머지도 과도한 소분류를 병합했습니다.</div><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">에너지 군집</th><th>상태</th><th>에너지</th><th>Δ에너지</th><th>순위이동</th><th>Breadth</th><th>평균등락</th><th>시장RS</th><th>거래가속</th><th>종목수</th></tr></thead><tbody id="sectors"></tbody></table></div></div>
+<div class="section"><h2>가격·거래량 독립 레이더 <span id="vdStamp" class="sub"></span></h2><div class="note">외국인·기관·뉴스·섹터점수 없이 LS 가격·거래량만 사용합니다. STEADY_REACCEL &gt; RE_ACCEL &gt; STEADY_UP &gt; ACCEL 순으로 표시합니다.</div><div class="vdMeta"><div class="noteCell"><span class="noteLabel">추적</span><span id="vdTracked" class="noteValue">0</span></div><div class="noteCell"><span class="noteLabel">활성</span><span id="vdActive" class="noteValue">0</span></div><div class="noteCell"><span class="noteLabel">진입후보</span><span id="vdEntry" class="noteValue">0</span></div><div class="noteCell"><span class="noteLabel">상태</span><span id="vdStatus" class="noteValue">대기</span></div></div><div class="tablebox"><table id="vdTable"><thead><tr><th>순위</th><th>상태</th><th class="left">종목</th><th>현재가</th><th>등락률</th><th>점수</th><th>VOLx</th><th>IVOLx</th><th>거래가속</th><th>가격속도</th><th>완만상승</th><th>30분기울기</th><th>1분봉수</th><th>진입</th><th class="left">에너지군</th></tr></thead><tbody id="volumeDirection"></tbody></table></div></div>
+<div class="section"><h2>섹터 에너지 변화 · 자금 이동도 <span id="sectorLiveStamp" class="sub"></span></h2><div id="sectorSourceNote" class="note"><span class="sectorSourceStrong">데이터원천 확인 중</span> · KRX/NXT는 절대 혼합하지 않습니다.</div><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">에너지 군집</th><th>상태</th><th>에너지</th><th>Δ에너지</th><th>순위이동</th><th>Breadth</th><th>평균등락</th><th>시장RS</th><th>거래가속</th><th>종목수</th></tr></thead><tbody id="sectors"></tbody></table></div></div>
 <div class="section"><h2>종가배팅 · 15:30 KRX / 19:30 NXT</h2><div class="note">강제충원 없음 · NXT WS 장애 시 REST_FALLBACK 명시 · NXT 프리미엄은 15:30 KRX 스냅샷 대비</div><h3>15:30 KRX CLOSE-BET <span id="krxCloseBetStamp" class="sub"></span></h3><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">종목</th><th>가격</th><th>등락률</th><th>점수</th><th>딥</th><th>에너지</th><th>체결강도</th><th>데이터</th><th class="left">근거</th></tr></thead><tbody id="krxCloseBet"></tbody></table></div><h3>19:30 NXT CLOSE-BET <span id="nxtCloseBetStamp" class="sub"></span></h3><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">종목</th><th>NXT가격</th><th>등락률</th><th>점수</th><th>딥</th><th>에너지</th><th>KRX대비</th><th>데이터</th><th class="left">근거</th></tr></thead><tbody id="nxtCloseBet"></tbody></table></div></div>
 <div class="section"><h2>신호 기록부 <span id="histCount" class="note"></span></h2><div class="historyMeta"><span><b>화면 20행 고정</b> · 최대 200건 내부 스크롤</span><span id="histPersist">브라우저백업 대기</span></div><div class="historybox"><table><thead><tr><th class="left">선정시각 KST</th><th>거래소</th><th>세션</th><th>횟수</th><th>구분</th><th class="left">종목</th><th>현재가</th><th>현재등락률</th><th>진입가</th><th>딥점수</th><th>등급</th><th class="left">에너지군</th><th>에너지</th><th>상태</th></tr></thead><tbody id="history"></tbody></table></div></div>
 <div class="foot">08:00 NXT PRE에서 당일 첫 판정을 시작합니다. KRX와 NXT의 가격·과거봉·섹터에너지 캐시는 서로 분리되며 통합(U) 시세는 사용하지 않습니다. 진입가는 판정 시점 신호 기준가입니다.</div>
@@ -4707,13 +4834,18 @@ function candidateRows(rows){
  const sorted=[...rows].sort((a,b)=>liveRankScore(b)-liveRankScore(a));
  return sorted.map((r,i)=>`<tr><td>${i+1}</td><td class="left"><b>${esc(r.name)}</b></td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.entry_price)}</td><td>${num(r.integrated_score,1)}</td><td>${num(r.deep_score,1)}</td><td><span class="badge">${esc(r.deep_grade)}</span></td><td class="left">${esc(r.MEGA_SECTOR)}</td><td class="left">${esc(r.ENERGY_CLUSTER)}</td><td>${num(r.cluster_energy,1)}</td><td>${esc(r.cluster_state)}</td></tr>`).join('')
 }
+function vdStateClass(s){s=String(s||'');if(s==='STEADY_REACCEL'||s==='RE_ACCEL')return 'vdHot';if(s==='STEADY_UP'||s==='ACCEL')return 'vdWarm';if(s==='PAUSE')return 'vdPause';if(s==='DECAY'||s==='REJECT')return 'vdBad';return ''}
+function volumeDirectionRows(rows){
+ if(!rows?.length)return '<tr><td colspan="15" class="empty left">아직 활성 가격·거래량 신호가 없습니다. 1분봉 누적 후 자동 표시됩니다.</td></tr>';
+ return rows.map((r,i)=>`<tr><td>${i+1}</td><td><span class="vdState ${vdStateClass(r.combined_state)}">${esc(r.combined_state)}</span></td><td class="left"><b>${esc(r.name||r.symbol)}</b><span class="sub"> ${esc(r.symbol||'')}</span></td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.score,1)}</td><td>${num(r.volume_ratio,2)}</td><td>${num(r.instant_volume_ratio,2)}</td><td>${num(r.volume_acceleration,2)}</td><td class="${cls(r.price_velocity_pct)}">${pct(r.price_velocity_pct)}</td><td>${num(r.steady_score,1)}</td><td class="${cls(r.steady_slope_pct_per_30m)}">${pct(r.steady_slope_pct_per_30m)}</td><td>${num(r.bars)}</td><td>${r.entry_candidate?'●':'-'}</td><td class="left">${esc(r.ENERGY_CLUSTER||'-')}</td></tr>`).join('')
+}
 function sectorRows(rows){
  if(!rows?.length)return '<tr><td colspan="11" class="empty left">섹터 에너지 데이터 준비 중</td></tr>';
  return rows.slice(0,30).map(r=>{
   let mv=esc(r.movement),mc=String(r.movement||'').startsWith('↑')?'up':String(r.movement||'').startsWith('↓')?'down':'';
   const reps=(r.representatives||[]).slice(0,5).map(x=>`<span class="sectorRepItem"><span class="sectorRepName">${esc(x.name)}</span><span class="sectorRepPrice">${num(x.current_price)}</span><span class="${cls(x.change_pct)}">${pct(x.change_pct)}</span></span>`).join('');
   const main=`<tr class="sectorMain"><td>${num(r.rank)}</td><td class="left"><b>${esc(r.ENERGY_CLUSTER)}</b></td><td>${esc(r.cluster_state)}</td><td>${num(r.cluster_energy,1)}</td><td class="${cls(r.energy_delta)}">${r.energy_delta==null?'-':(Number(r.energy_delta)>0?'+':'')+num(r.energy_delta,1)}</td><td class="${mc}">${mv}</td><td>${pct(Number(r.cluster_breadth)*100)}</td><td class="${cls(r.cluster_avg_return)}">${pct(r.cluster_avg_return)}</td><td class="${cls(r.cluster_market_rs)}">${num(r.cluster_market_rs,2)}</td><td>${num(r.cluster_turnover_accel,2)}</td><td>${num(r.cluster_members)}</td></tr>`;
-  const sub=`<tr class="sectorReps"><td></td><td colspan="10" class="left"><div class="sectorRepList">${reps||'<span>대표종목 계산 중</span>'}</div></td></tr>`;
+  const sub=`<tr class="sectorReps"><td></td><td colspan="10" class="left"><div class="sectorRepList">${reps||'<span>대표종목 데이터 없음</span>'}</div></td></tr>`;
   return main+sub;
  }).join('')
 }
@@ -4743,8 +4875,14 @@ async function refresh(){
   const rankTxt=r.live_rebalanced_kst?`POOL ${poolN} (STRICT ${strictN} · NEAR ${nearN}) → DEEP ${r.live_deep_count||((r.live_deep30||[]).length)} → WATCH ${r.live_watch_count||liveWatch.length} · ${r.live_rebalanced_kst}`:'재선정 대기';
   document.getElementById('candidateStatus').textContent=statusTxt;document.getElementById('candidateLive').textContent=liveTxt;document.getElementById('candidateRank').textContent=rankTxt;
   document.getElementById('candidates').innerHTML=candidateRows(show);
+  const vd=r.volume_direction||{};const vdRows=r.volume_direction_top||vd.top||[];
+  document.getElementById('volumeDirection').innerHTML=volumeDirectionRows(vdRows);
+  document.getElementById('vdTracked').textContent=num(vd.tracked||0);document.getElementById('vdActive').textContent=num(vd.active||0);document.getElementById('vdEntry').textContent=num(vd.entry_candidates||0);
+  const vdStatus=document.getElementById('vdStatus');vdStatus.textContent=vd.last_error?('ERROR · '+vd.last_error):(vdRows.length?'신호 수신 중':'1분봉 누적/신호 대기');vdStatus.className='noteValue '+(vd.last_error?'bad':(vdRows.length?'ok':'warn'));
+  document.getElementById('vdStamp').textContent=`· ${esc(vd.venue||r.venue||'-')} · ${vd.price_volume_only?'PRICE+VOLUME ONLY':'-'}`;
   document.getElementById('sectors').innerHTML=sectorRows(r.sector_energy||r.top_clusters||[]);
-  const sls=document.getElementById('sectorLiveStamp');if(sls)sls.textContent=r.live_sector_updated_kst?`· LIVE ${r.live_sector_updated_kst} · ${r.live_sector_source||''}`:'· 10분 스냅샷';
+  const sls=document.getElementById('sectorLiveStamp');if(sls)sls.textContent=`· ${r.sector_display_venue||r.venue||'-'} · ${r.sector_display_source||r.live_sector_source||'SNAPSHOT'}${r.sector_display_updated_kst?' · '+r.sector_display_updated_kst:''}`;
+  const ssn=document.getElementById('sectorSourceNote');if(ssn)ssn.textContent=r.sector_display_note||'KRX/NXT 데이터 분리';
   const kb=r.close_bet_krx||null,nb=r.close_bet_nxt||null;document.getElementById('krxCloseBet').innerHTML=closeBetRows(kb,false);document.getElementById('nxtCloseBet').innerHTML=closeBetRows(nb,true);document.getElementById('krxCloseBetStamp').textContent=kb?`· ${kb.captured_at_kst||'-'} · ${kb.data_status||'-'}`:'· 대기';document.getElementById('nxtCloseBetStamp').textContent=nb?`· ${nb.captured_at_kst||'-'} · ${nb.data_status||'-'}`:'· 대기';
   const serverH=(r.selection_history||[]).slice(0,200),h=mergeHistory(serverH,r.venue);document.getElementById('histCount').textContent=`저장 ${h.length}/200`;document.getElementById('history').innerHTML=historyRows(h);const hp=document.getElementById('histPersist');if(hp)hp.textContent=`브라우저백업 ${h.length}/200 · 서버 ${serverH.length}`;
  }catch(e){document.getElementById('candidateStatus').textContent='RESULT ERROR';document.getElementById('candidateLive').textContent=String(e);document.getElementById('candidateRank').textContent='-'}
