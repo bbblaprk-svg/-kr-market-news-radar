@@ -54,6 +54,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     NXT_WS_CIRCUIT_BREAK_SECONDS=60 \
     NXT_WS_RECONNECT_MAX_SECONDS=30 \
     NXT_WS_STALE_SECONDS=45 \
+    WS_ACK_TIMEOUT_SECONDS=6 \
     WS_SUBSCRIBE_INTERVAL_MS=180 \
     WS_SUBSCRIBE_BATCH=5 \
     WS_RECONNECT_BACKOFF_SECONDS=5 \
@@ -2093,7 +2094,7 @@ from urllib.parse import urlparse
 
 from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import Alpha500Integrated, market_session_now
 
-ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_15_V198_WS_ROUTE_RESTORED"
+ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_17_WS_KEY_ACK_FIX"
 VERSION = ENGINE_VERSION
 PORT = int(os.getenv("PORT", "10000"))
 MASTER = os.getenv("UNIVERSE_MASTER", "섹터마스터_500종목_V3.csv")
@@ -2145,6 +2146,10 @@ STATE = {
     "ws_reject_count": 0,
     "ws_reconnect_count": 0,
     "ws_transport_mode": "STARTING",
+    "ws_sent_count": 0, "ws_session_ack_count": 0, "ws_session_tick_count": 0,
+    "ws_pending": None, "ws_venue": None, "ws_endpoint": None,
+    "ws_last_rsp_cd": None, "ws_last_rsp_msg": None,
+    "ws_close_code": None, "ws_close_reason": None, "ws_last_source_time": None,
     "ls_status": "STARTING",
     "rest_fallback_active": False,
     "live_pool_count": 0,
@@ -2204,58 +2209,6 @@ NXT_WS_KEY_LOCK = threading.RLock()
 PRECLOSE_LOCK = threading.Lock()
 PRECLOSE_SNAPSHOT = {"KRX": None, "NXT": None}
 NXT_EOD_HOLD = None
-
-
-def _resolve_nxt_ws_key(code):
-    """NXT NS3 구독에는 LS가 반환한 거래소별 종목코드(ex_shcode)를 사용한다."""
-    code = str(code or "").zfill(6)
-    with NXT_WS_KEY_LOCK:
-        cached = NXT_WS_KEY_CACHE.get(code)
-        if cached:
-            return cached
-
-    engine = get_engine()
-    ex_key = ""
-    try:
-        body = {"t8450InBlock": {"shcode": code, "exchgubun": "N"}}
-        j = engine.ls._post_tr("/stock/market-data", "t8450", body).json()
-        root = j.get("t8450OutBlock") or {}
-        ex_key = str(root.get("ex_shcode") or "").strip()
-    except Exception as e:
-        logging.getLogger("alpha500_ws").debug("NXT WS KEY t8450 %s: %s", code, str(e)[:120])
-
-    if not ex_key:
-        try:
-            now_hm = now_kst().strftime("%H%M%S")
-            body = {"t8454InBlock": {
-                "shcode": code, "cvolume": 0, "starttime": "", "endtime": now_hm,
-                "cts_time": "", "exchgubun": "N",
-            }}
-            j = engine.ls._post_tr("/stock/market-data", "t8454", body).json()
-            root = j.get("t8454OutBlock") or {}
-            rows = j.get("t8454OutBlock1") or []
-            ex_key = str(root.get("ex_shcode") or "").strip()
-            if not ex_key:
-                for row in rows[:5]:
-                    ex_key = str((row or {}).get("ex_shcode") or "").strip()
-                    if ex_key:
-                        break
-        except Exception as e:
-            logging.getLogger("alpha500_ws").debug("NXT WS KEY t8454 %s: %s", code, str(e)[:120])
-
-    if not ex_key:
-        raise RuntimeError(f"NXT ex_shcode unavailable for {code}")
-    with NXT_WS_KEY_LOCK:
-        NXT_WS_KEY_CACHE[code] = ex_key
-        NXT_WS_KEY_REVERSE[ex_key] = code
-    logging.getLogger("alpha500_ws").info("NXT WS KEY resolved symbol=%s key=%s", code, ex_key)
-    return ex_key
-
-
-def _subscription_tr_key(venue, code):
-    if str(venue or "").upper() == "NXT":
-        return _resolve_nxt_ws_key(code)
-    return str(code or "").zfill(6)
 
 
 def set_progress(phase: str, current: int = 0, total: int = 0, message: str = ""):
@@ -2437,37 +2390,66 @@ def _first_value(d, keys, default=None):
     return default
 
 
+def _normalize_ws_symbol(value):
+    value = str(value or '').strip()
+    if re.fullmatch(r'[AN]\d{6}', value):
+        return value[1:]
+    return value if re.fullmatch(r'\d{6}', value) else None
+
+
+def _subscription_tr_key(venue, code):
+    """LS NS3: N + 6 digits + 3 spaces; S3_/K3_: 6 digits.
+
+    Source: LS official /guide/api NS3 request example N010950<3 spaces>.
+    Keep trailing spaces on the wire. Do not fetch t8450/t8454 to construct it.
+    """
+    code = _normalize_ws_symbol(code)
+    if not code:
+        raise ValueError('WS requires a six-digit stock symbol')
+    return ('N' + code).ljust(10) if str(venue).upper() == 'NXT' else code
+
+
 def _extract_ws_quote(payload):
-    """S3_/K3_/NS3 실시간 체결 메시지를 공통 quote 형식으로 정규화한다."""
     if not isinstance(payload, dict):
         return None, None, None
-    header = payload.get("header") if isinstance(payload.get("header"), dict) else {}
-    body = payload.get("body") if isinstance(payload.get("body"), dict) else payload
+    header = payload.get('header') if isinstance(payload.get('header'), dict) else {}
+    body = payload.get('body') if isinstance(payload.get('body'), dict) else {}
     flat = _flatten_dict(body)
-    tr_cd = str(header.get("tr_cd") or flat.get("tr_cd") or "").strip()
-    code = str(_first_value(flat, ["shcode", "expcode", "symbol", "code", "isu_no"], "")).strip()
-    if code.startswith("A") and len(code) == 7:
-        code = code[1:]
-    if not (code.isdigit() and len(code) == 6):
-        tr_key = str(header.get("tr_key") or flat.get("ex_shcode") or "").strip()
-        if tr_key.isdigit() and len(tr_key) == 6:
-            code = tr_key
-        else:
-            with NXT_WS_KEY_LOCK:
-                mapped = NXT_WS_KEY_REVERSE.get(tr_key)
-            if mapped:
-                code = mapped
-    if not (code.isdigit() and len(code) == 6):
+    tr_cd = str(header.get('tr_cd') or flat.get('tr_cd') or '').strip()
+    expected = {'NS3': 'NXT', 'S3_': 'KRX', 'K3_': 'KRX'}.get(tr_cd)
+    if not expected:
         return None, None, tr_cd
-    price = _first_value(flat, ["price", "cheprice", "curpr", "close", "last"])
-    diff = _first_value(flat, ["drate", "diff", "change_rate", "rate", "chg_rate"])
-    change = _first_value(flat, ["change", "chg", "change_price"])
-    volume = _first_value(flat, ["volume", "cvolume", "accvolume", "cum_volume"])
-    value = _first_value(flat, ["value", "accvalue", "cum_value"])
-    q = {"price": price, "diff": diff, "change": change, "volume": volume, "value": value}
+    explicit_venue = str(flat.get('exchname') or '').strip().upper()
+    if explicit_venue and explicit_venue != expected:
+        return None, None, tr_cd
+    code = None
+    for candidate in [flat.get(k) for k in ('shcode', 'ex_shcode', 'expcode', 'symbol', 'code')] + [header.get('tr_key')]:
+        # N-prefixed instruments are valid only in NS3; never relabel them KRX.
+        raw = str(candidate or '').strip()
+        if raw.startswith('N') and expected != 'NXT':
+            return None, None, tr_cd
+        normalized = _normalize_ws_symbol(raw)
+        if normalized:
+            if code and normalized != code:
+                return None, None, tr_cd
+            code = normalized
+    if not code:
+        return None, None, tr_cd
+    q = {
+        'price': _first_value(flat, ['price', 'cheprice', 'curpr', 'close', 'last']),
+        'diff': _first_value(flat, ['drate', 'diff', 'change_rate', 'rate', 'chg_rate']),
+        'change': _first_value(flat, ['change', 'chg', 'change_price']),
+        'volume': _first_value(flat, ['volume', 'accvolume', 'cum_volume']),
+        'value': _first_value(flat, ['value', 'accvalue', 'cum_value']),
+        'cvolume': flat.get('cvolume'), 'sign': flat.get('sign'),
+        'chetime': flat.get('chetime'), 'exchname': expected,
+        'trade_strength': flat.get('cpower'), 'w_avrg': flat.get('w_avrg'),
+    }
     if _quote_price(q) is None:
         return None, None, tr_cd
     return code, q, tr_cd
+
+
 
 
 def _ws_target_map(summary, venue):
@@ -2501,6 +2483,8 @@ def _ws_subscriptions(summary, venue):
             nxt_eligible = {str(x.code).zfill(6) for x in get_engine().selector.get_ls_universe() if bool(getattr(x, "nxt", False))}
         except Exception:
             nxt_eligible = set()
+    if venue == "NXT" and nxt_eligible and not (set(targets) & nxt_eligible):
+        targets = {x.code: str(x.market).upper() for x in get_engine().selector.get_ls_universe() if x.code in nxt_eligible}
     for code, market in targets.items():
         if venue == "NXT":
             # 직전 KRX 후보라도 NXT 거래가능 종목만 NS3에 등록한다.
@@ -2531,7 +2515,10 @@ def _ws_subscriptions(summary, venue):
     return subs
 
 
-def _set_ws_state(status, subscribed=None, channels=None, error=None, last_message=False, rest_fallback=None):
+_WS_ERROR_UNCHANGED = object()
+
+
+def _set_ws_state(status, subscribed=None, channels=None, error=_WS_ERROR_UNCHANGED, last_message=False, rest_fallback=None):
     changed = False
     snapshot = None
     with LOCK:
@@ -2541,7 +2528,8 @@ def _set_ws_state(status, subscribed=None, channels=None, error=None, last_messa
             STATE["ws_subscribed"] = int(subscribed)
         if channels is not None:
             STATE["ws_channels"] = list(channels)
-        STATE["ws_error"] = error
+        if error is not _WS_ERROR_UNCHANGED:
+            STATE["ws_error"] = error
         if last_message:
             STATE["ws_last_message_kst"] = now_kst_iso()
         if rest_fallback is not None:
@@ -2556,192 +2544,280 @@ def _set_ws_state(status, subscribed=None, channels=None, error=None, last_messa
         )
 
 
-def live_ws_loop():
-    """LS WebSocket 실시간 시세. NXT는 ex_shcode + 회로차단으로 Broken pipe 폭주를 방지한다."""
-    log = logging.getLogger("alpha500_ws")
-    nxt_failures = 0
-    circuit_until = 0.0
-    while True:
-        ws = None
-        venue = "NXT"
-        received_this_session = False
+class WSSubscriptionError(RuntimeError):
+    pass
+
+
+def _ws_url_candidates():
+    # Official TR metadata says /websocket/stock; the official current sample
+    # says /websocket. Try the other documented route only when no ACK/tick has
+    # been received, always closing the previous connection first.
+    primary = WS_URL.rstrip('/')
+    candidates = [primary]
+    parsed = urlparse(primary)
+    if parsed.hostname == 'openapi.ls-sec.co.kr' and parsed.path in {'/websocket', '/websocket/stock'}:
+        base = primary[:primary.index('/websocket')]
+        candidates.append(base + ('/websocket/stock' if parsed.path == '/websocket' else '/websocket'))
+    return candidates
+
+
+class LSQuoteStream:
+    """One socket, one pending command, ACK-confirmed subscriptions, real ticks.
+
+    Sending is never counted as subscription success. A tick may confirm its own
+    pending key when the server omits ACK. Ticks continue to be consumed while
+    subsequent symbols are being registered.
+    """
+    def __init__(self, ws, token, venue):
+        self.ws, self.token, self.venue = ws, token, venue
+        self.requested, self.confirmed = {}, set()
+        self.pending = None
+        self.pending_type = None
+        self.command_acked = False
+        self.sent, self.acks, self.ticks = 0, 0, 0
+        self.last_tick = None
+        self.last_send = 0.0
+        self.started = time.monotonic()
+        self.ack_timeout = max(1.0, float(os.getenv('WS_ACK_TIMEOUT_SECONDS', '6')))
+        self.gap = max(0.1, float(os.getenv(
+            'NXT_WS_SUBSCRIBE_INTERVAL_MS' if venue == 'NXT' else 'WS_SUBSCRIBE_INTERVAL_MS',
+            '350' if venue == 'NXT' else '180')) / 1000)
+
+    def publish(self, error=None):
+        with LOCK:
+            STATE['ws_sent_count'] = self.sent
+            STATE['ws_session_ack_count'] = self.acks
+            STATE['ws_session_tick_count'] = self.ticks
+            STATE['ws_pending'] = {'tr_cd': self.pending[0], 'symbol': self.pending[1]} if self.pending else None
+        _set_ws_state('RECEIVING' if self.last_tick is not None else
+                      ('SUBSCRIBED' if self.confirmed else 'CONNECTED'),
+                      subscribed=len(self.confirmed),
+                      channels=sorted({s[0] for s in self.confirmed}),
+                      error=error, rest_fallback=self.last_tick is None)
+
+    def send(self, item, tr_type):
+        tr_cd, code = item
+        key = _subscription_tr_key(self.venue, code)
+        delay = self.gap - (time.monotonic() - self.last_send)
+        if delay > 0:
+            time.sleep(delay)
+        self.ws.send(json.dumps({'header': {'token': self.token, 'tr_type': tr_type},
+                                 'body': {'tr_cd': tr_cd, 'tr_key': key}}, ensure_ascii=False))
+        self.last_send = time.monotonic()
+        with LOCK:
+            STATE['ws_last_key'] = key
+        logging.getLogger('alpha500_ws').info(
+            'WS COMMAND venue=%s type=%s tr=%s symbol=%s key=%r key_len=%s',
+            self.venue, tr_type, tr_cd, code, key, len(key))
+        return key
+
+    def receive(self):
+        # recv_data exposes close code/reason that recv() turns into an empty str.
+        opcode, raw = self.ws.recv_data(control_frame=True)
+        if opcode == websocket.ABNF.OPCODE_CLOSE:
+            import struct
+            code = struct.unpack('!H', raw[:2])[0] if len(raw) >= 2 else None
+            reason = raw[2:].decode('utf-8', errors='replace') if len(raw) >= 2 else ''
+            reason = reason.replace(self.token, '[REDACTED]') if self.token else reason
+            with LOCK:
+                STATE['ws_close_code'], STATE['ws_close_reason'] = code, reason[:160]
+            raise WSSubscriptionError(f'WS server close code={code} reason={reason[:160]}')
+        if opcode in (websocket.ABNF.OPCODE_PING, websocket.ABNF.OPCODE_PONG):
+            return False
+        if raw in (None, '', b''):
+            raise WSSubscriptionError('WS connection closed without a frame')
         try:
-            if os.getenv("LIVE_WS_ENABLED", "true").strip().lower() not in {"1", "true", "yes", "y", "on"}:
-                _set_ws_state("DISABLED", subscribed=0, channels=[], error=None)
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            return False
+        return self.handle(payload)
+
+    def handle(self, payload):
+        if not isinstance(payload, dict):
+            return False
+        hdr = payload.get('header') if isinstance(payload.get('header'), dict) else {}
+        rsp = str(hdr.get('rsp_cd', payload.get('rsp_cd', ''))).strip()
+        msg = str(hdr.get('rsp_msg', payload.get('rsp_msg', ''))).strip()
+        msg = msg.replace(self.token, '[REDACTED]') if self.token else msg
+        if rsp:
+            with LOCK:
+                STATE['ws_last_rsp_cd'], STATE['ws_last_rsp_msg'] = rsp, msg[:160]
+            if rsp not in {'00000', '0'}:
+                with LOCK:
+                    STATE['ws_reject_count'] = int(STATE.get('ws_reject_count') or 0) + 1
+                raise WSSubscriptionError(f'WS rejected venue={self.venue} rsp_cd={rsp} msg={msg[:160]}')
+            tr_cd = str(hdr.get('tr_cd') or '').strip()
+            body = payload.get('body') if isinstance(payload.get('body'), dict) else {}
+            raw_key = hdr.get('tr_key') or body.get('tr_key')
+            code = _normalize_ws_symbol(raw_key)
+            ack_item = (tr_cd, code) if tr_cd and code else self.pending
+            # An unrelated ACK (including an unsubscribe reply) cannot approve
+            # the next pending symbol. Empty-key ACKs correlate only serially.
+            response_type = str(hdr.get('tr_type') or '')
+            matches_pending = (self.pending is not None and ack_item == self.pending
+                               and (not tr_cd or tr_cd == self.pending[0])
+                               and (not code or code == self.pending[1])
+                               and (not response_type or response_type == self.pending_type))
+            if matches_pending:
+                self.command_acked = True
+            if matches_pending and self.pending_type == '3' and ack_item in self.requested:
+                if ack_item not in self.confirmed:
+                    self.confirmed.add(ack_item)
+                    self.acks += 1
+                    with LOCK:
+                        STATE['ws_ack_count'] = int(STATE.get('ws_ack_count') or 0) + 1
+            logging.getLogger('alpha500_ws').info('WS ACK venue=%s tr=%s symbol=%s rsp_cd=%s msg=%s',
+                                                   self.venue, tr_cd, code or '', rsp, msg[:160])
+        code, q, tr_cd = _extract_ws_quote(payload)
+        if (tr_cd, code) in self.requested and q:
+            self.confirmed.add((tr_cd, code))
+            self.ticks += 1
+            self.last_tick = time.monotonic()
+            _set_live_quote(code, q, f'WS:{tr_cd}', self.venue)
+            with LOCK:
+                STATE['ws_tick_count'] = int(STATE.get('ws_tick_count') or 0) + 1
+                STATE['ws_last_tr'], STATE['ws_last_symbol'] = tr_cd, code
+                STATE['ws_last_tick_kst'], STATE['ws_last_price'] = now_kst_iso(), _quote_price(q)
+                STATE['ws_last_source_time'] = q.get('chetime')
+                STATE['ws_last_message_kst'] = now_kst_iso()
+            if self.ticks <= 3 or self.ticks % 100 == 0:
+                logging.getLogger('alpha500_ws').info('WS TICK venue=%s count=%s tr=%s symbol=%s price=%s source_time=%s',
+                    self.venue, self.ticks, tr_cd, code, q['price'], q.get('chetime'))
+            self.publish()
+            return True
+        self.publish()
+        return False
+
+    def sync(self, subscriptions):
+        desired = set(subscriptions)
+        for item in sorted(set(self.requested) - desired):
+            self.pending, self.pending_type = item, '4'
+            self.command_acked = False
+            self.send(item, '4')
+            deadline = time.monotonic() + self.ack_timeout
+            while not self.command_acked:
+                if time.monotonic() >= deadline:
+                    raise WSSubscriptionError(f'WS unsubscribe ACK timeout venue={self.venue} symbol={item[1]}')
+                try:
+                    self.receive()
+                except websocket.WebSocketTimeoutException:
+                    continue
+            self.requested.pop(item, None)
+            self.confirmed.discard(item)
+            self.pending = self.pending_type = None
+        # Preserve priority for initial subscriptions, without reconnecting for
+        # rank reordering. Both venues register every target after the probe.
+        for item in subscriptions:
+            if item in self.requested:
+                continue
+            if market_session_now().get('venue') != self.venue or not market_session_now().get('scan_allowed'):
+                return
+            self.pending = item
+            self.pending_type, self.command_acked = '3', False
+            self.requested[item] = self.send(item, '3')
+            self.sent += 1
+            self.publish()
+            deadline = time.monotonic() + self.ack_timeout
+            while item not in self.confirmed:
+                if time.monotonic() >= deadline:
+                    raise WSSubscriptionError(f'WS ACK timeout venue={self.venue} tr={item[0]} symbol={item[1]}')
+                try:
+                    self.receive()
+                except websocket.WebSocketTimeoutException:
+                    continue
+            self.pending = None
+            self.pending_type = None
+            self.publish()
+
+
+def live_ws_loop():
+    """Read-only LS quote stream; venue switch closes before opening next socket."""
+    log = logging.getLogger('alpha500_ws')
+    failures, circuit_until, route_index = 0, 0.0, 0
+    urls = _ws_url_candidates()
+    while True:
+        ws, stream = None, None
+        try:
+            if os.getenv('LIVE_WS_ENABLED', 'true').lower() not in {'1', 'true', 'yes', 'on'}:
+                _set_ws_state('DISABLED', subscribed=0, channels=[])
                 time.sleep(5)
                 continue
             info = market_session_now()
-            summary = load_latest()
-            if not bool(info.get("scan_allowed")):
-                _set_ws_state("WAITING_SESSION", subscribed=0, channels=[], error=None)
+            venue = str(info.get('venue') or 'KRX').upper()
+            if not info.get('scan_allowed'):
+                _set_ws_state('WAITING_SESSION', subscribed=0, channels=[], error=None)
                 time.sleep(2)
                 continue
-            venue = str(info.get("venue") or "NXT").upper()
-
-            if venue == "NXT" and time.monotonic() < circuit_until:
-                remain = max(1, int(circuit_until - time.monotonic()))
-                _set_ws_state("REST_FALLBACK", subscribed=0, channels=["NS3"],
-                              error=f"NXT WS circuit open {remain}s", rest_fallback=True)
-                time.sleep(min(5, remain))
+            if time.monotonic() < circuit_until:
+                time.sleep(min(5, max(0.1, circuit_until - time.monotonic())))
                 continue
-
-            subs = _ws_subscriptions(summary, venue)
+            subs = _ws_subscriptions(load_latest(), venue)
             if not subs:
-                _set_ws_state("WAITING_TARGETS", subscribed=0, channels=[], error=None)
+                _set_ws_state('WAITING_TARGETS', subscribed=0, channels=[], error=None)
                 time.sleep(2)
                 continue
-
-            # V1.9.8 수신 원본 경로를 NXT 기본값으로 복원한다.
-            # 원본: NS3 + 6자리 종목코드, 별도 t8450/t8454 ex_shcode 변환 없음.
-            # EX_SHCODE는 환경변수로 명시적으로 선택할 때만 사용한다.
-            nxt_key_mode = str(os.getenv("NXT_WS_KEY_MODE", "ORIGINAL_6DIGIT")).upper()
-            send_subs = []
-            if venue == "NXT" and nxt_key_mode == "EX_SHCODE":
-                for tr_cd, code in subs:
-                    try:
-                        send_subs.append((tr_cd, code, _subscription_tr_key(venue, code)))
-                    except Exception as e:
-                        log.warning("NXT WS EXKEY skip symbol=%s error=%s", code, str(e)[:160])
-            else:
-                send_subs = [(tr_cd, code, str(code).zfill(6)) for tr_cd, code in subs]
-            if not send_subs:
-                _set_ws_state("REST_FALLBACK", subscribed=0, channels=["NS3"] if venue == "NXT" else [],
-                              error="WS subscription targets unavailable", rest_fallback=True)
-                time.sleep(REST_FALLBACK_SECONDS)
-                continue
-
             engine = get_engine()
             engine.ls._ensure_token()
-            token = engine.ls.token
+            endpoint = urls[route_index]
             with LOCK:
-                STATE["ls_status"] = "CONNECTED"
-                STATE["ws_transport_mode"] = ("NXT_NS3_V198_6DIGIT" if nxt_key_mode != "EX_SHCODE" else "NXT_NS3_EX_SHCODE") if venue == "NXT" else "KRX_DIRECT_6DIGIT"
-            log.info("LS CONNECTED token_ready=true")
-            _set_ws_state("CONNECTING", subscribed=0, channels=[], error=None, rest_fallback=(venue == "NXT"))
-            ws = websocket.create_connection(WS_URL, timeout=5, enable_multithread=True)
-            ws.settimeout(2)
-            channels = sorted(set(x[0] for x in send_subs))
-
-            log.info("WS ROUTE venue=%s mode=%s target_count=%s source=V1.9.8", venue, nxt_key_mode if venue == "NXT" else "KRX_6DIGIT", len(send_subs))
-            sent = 0
-            gap = max(0.05, int(os.getenv(
-                "NXT_WS_SUBSCRIBE_INTERVAL_MS" if venue == "NXT" else "WS_SUBSCRIBE_INTERVAL_MS",
-                "100" if venue == "NXT" else "180"
-            )) / 1000.0)
-            for tr_cd, code, tr_key in send_subs:
-                ws.send(json.dumps({
-                    "header": {"token": token, "tr_type": "3"},
-                    "body": {"tr_cd": tr_cd, "tr_key": tr_key},
-                }, ensure_ascii=False))
-                sent += 1
-                with LOCK:
-                    STATE["ws_last_key"] = tr_key
-                if venue == "NXT":
-                    time.sleep(gap)
-
-            signature = (venue, tuple(subs))
-            last_tick_monotonic = time.monotonic()
-            last_ping_monotonic = 0.0
-            _set_ws_state("SUBSCRIBED", subscribed=sent, channels=channels, error=None,
-                          rest_fallback=(venue == "NXT"))
-            log.info("WS CONNECTED venue=%s channels=%s subscribed=%s key_mode=%s",
-                     venue, channels, sent, nxt_key_mode if venue == "NXT" else "6DIGIT")
-
+                STATE['ls_status'] = 'CONNECTED'
+                STATE['ws_transport_mode'] = 'NXT_NS3_NCODE_PAD10' if venue == 'NXT' else 'KRX_6DIGIT'
+                STATE['ws_venue'] = venue
+                STATE['ws_endpoint'] = endpoint
+                STATE['ws_session_ack_count'] = STATE['ws_session_tick_count'] = STATE['ws_sent_count'] = 0
+                STATE['ws_close_code'] = STATE['ws_close_reason'] = None
+            _set_ws_state('CONNECTING', subscribed=0, channels=[], error=None, rest_fallback=True)
+            log.info('WS CONNECT venue=%s endpoint=%s targets=%s', venue, endpoint, len(subs))
+            ws = websocket.create_connection(endpoint, timeout=5, enable_multithread=True)
+            ws.settimeout(1)
+            stream = LSQuoteStream(ws, engine.ls.token, venue)
+            stream.sync(subs)
+            last_targets_check, last_ping = time.monotonic(), 0.0
             while True:
-                info2 = market_session_now()
-                summary2 = load_latest()
-                venue2 = str(info2.get("venue") or venue).upper()
-                subs2 = _ws_subscriptions(summary2, venue2) if bool(info2.get("scan_allowed")) else []
-                if (venue2, tuple(subs2)) != signature:
+                info = market_session_now()
+                if not info.get('scan_allowed') or info.get('venue') != venue:
                     break
-
-                stale_limit = max(WS_STALE_SECONDS, int(os.getenv("NXT_WS_STALE_SECONDS", "90"))) if venue == "NXT" else WS_STALE_SECONDS
-                tick_age = time.monotonic() - last_tick_monotonic
-                if tick_age > stale_limit:
-                    _set_ws_state("STALE", error=f"WS tick stale {int(tick_age)}s", rest_fallback=True)
-                    # ping 성공만으로 실시간 구독 스트림이 정상이라고 보지 않는다.
-                    # 실제 Tick이 stale_limit 동안 없으면 소켓을 닫고 재연결/재구독한다.
-                    raise RuntimeError(f"WS tick stale {int(tick_age)}s; force reconnect")
-
+                now_m = time.monotonic()
+                if now_m - last_targets_check >= 15:
+                    stream.sync(_ws_subscriptions(load_latest(), venue))
+                    last_targets_check = time.monotonic()
+                stale_limit = max(WS_STALE_SECONDS, int(os.getenv('NXT_WS_STALE_SECONDS', '45'))) if venue == 'NXT' else WS_STALE_SECONDS
+                # The no-tick timer starts after initial registration; the
+                # stream can otherwise be called stale while registering 80 keys.
+                since = stream.last_tick if stream.last_tick is not None else last_targets_check
+                if stream.last_tick is None:
+                    since = getattr(stream, 'registered_at', None)
+                    if since is None:
+                        stream.registered_at = now_m
+                        since = now_m
+                if now_m - since > stale_limit:
+                    raise WSSubscriptionError(f'WS tick stale {int(now_m - since)}s venue={venue}')
                 try:
-                    raw = ws.recv()
+                    if stream.receive():
+                        failures = 0
                 except websocket.WebSocketTimeoutException:
-                    now_m = time.monotonic()
-                    if now_m - last_ping_monotonic >= 10.0:
-                        try:
-                            ws.ping()
-                            last_ping_monotonic = now_m
-                        except Exception as e:
-                            raise RuntimeError(f"LS WebSocket ping failed: {e}")
-                    continue
-
-                if raw in (None, ""):
-                    raise RuntimeError("LS WebSocket closed")
-                try:
-                    payload = json.loads(raw)
-                except Exception:
-                    continue
-                if market_session_now().get("venue") != venue:
-                    break
-
-                hdr = payload.get("header") if isinstance(payload, dict) and isinstance(payload.get("header"), dict) else {}
-                rsp_cd = str(hdr.get("rsp_cd") or "").strip()
-                rsp_msg = str(hdr.get("rsp_msg") or "").strip()
-                if rsp_cd:
-                    if rsp_cd in {"00000", "0"}:
-                        with LOCK:
-                            STATE["ws_ack_count"] = int(STATE.get("ws_ack_count") or 0) + 1
-                    else:
-                        with LOCK:
-                            STATE["ws_reject_count"] = int(STATE.get("ws_reject_count") or 0) + 1
-                        log.warning("WS subscription response rsp_cd=%s msg=%s", rsp_cd, rsp_msg[:160])
-
-                code, q, tr_cd = _extract_ws_quote(payload)
-                if code and q and (tr_cd, code) in subs:
-                    received_this_session = True
-                    nxt_failures = 0
-                    last_tick_monotonic = time.monotonic()
-                    _set_live_quote(code, q, f"WS:{tr_cd or 'REAL'}", venue)
-                    with LOCK:
-                        STATE["ws_tick_count"] = int(STATE.get("ws_tick_count") or 0) + 1
-                        STATE["ws_last_tr"] = tr_cd or "REAL"
-                        STATE["ws_last_symbol"] = code
-                        STATE["ws_last_tick_kst"] = now_kst_iso()
-                        STATE["ws_last_price"] = _quote_price(q)
-                        tick_n = STATE["ws_tick_count"]
-                    if tick_n <= 3 or tick_n % 100 == 0:
-                        log.info("WS TICK count=%s tr=%s symbol=%s price=%s diff=%s",
-                                 tick_n, tr_cd or "REAL", code, q.get("price"), q.get("diff"))
-                    _set_ws_state("RECEIVING", last_message=True, rest_fallback=False)
-
-        except Exception as e:
+                    if time.monotonic() - last_ping >= 10:
+                        ws.ping()
+                        last_ping = time.monotonic()
+        except Exception as exc:
+            failures += 1
+            if stream is None or not stream.confirmed:
+                route_index = (route_index + 1) % len(urls)
             with LOCK:
-                STATE["ws_reconnect_count"] = int(STATE.get("ws_reconnect_count") or 0) + 1
-            if venue == "NXT" and not received_this_session:
-                nxt_failures += 1
-            else:
-                nxt_failures = 0
-            _set_ws_state("STALE", error=str(e)[:240], rest_fallback=True)
-            log.warning("WS reconnect venue=%s failures=%s error=%s", venue, nxt_failures, e)
-
-            if venue == "NXT" and nxt_failures >= max(1, int(os.getenv("NXT_WS_MAX_CONSECUTIVE_FAILURES", "3"))):
-                pause = max(15, int(os.getenv("NXT_WS_CIRCUIT_BREAK_SECONDS", "60")))
-                circuit_until = time.monotonic() + pause
-                log.warning("NXT WS CIRCUIT OPEN failures=%s pause=%ss; REST fallback continues", nxt_failures, pause)
-                nxt_failures = 0
-                time.sleep(min(5, pause))
-            else:
-                base = max(2, int(os.getenv("WS_RECONNECT_BACKOFF_SECONDS", "5")))
-                max_b = max(base, int(os.getenv("NXT_WS_RECONNECT_MAX_SECONDS", "30")))
-                attempt = max(0, nxt_failures - 1) if venue == "NXT" else 0
-                backoff = min(max_b, base * (2 ** min(attempt, 3)))
-                time.sleep(backoff)
+                STATE['ws_reconnect_count'] = int(STATE.get('ws_reconnect_count') or 0) + 1
+            _set_ws_state('STALE', subscribed=0, channels=[], error=str(exc)[:240], rest_fallback=True)
+            log.warning('WS reconnect failures=%s error=%s', failures, str(exc)[:240])
+            pause = min(30, max(2, float(os.getenv('WS_RECONNECT_BACKOFF_SECONDS', '5'))) * 2 ** min(3, failures - 1))
+            if failures >= max(1, int(os.getenv('NXT_WS_MAX_CONSECUTIVE_FAILURES', '3'))):
+                pause = max(pause, float(os.getenv('NXT_WS_CIRCUIT_BREAK_SECONDS', '60')))
+            circuit_until = time.monotonic() + pause
         finally:
             if ws is not None:
                 try:
                     ws.close()
                 except Exception:
                     pass
+            # Backoff occurs after closing, so old/new sockets never overlap.
 
 
 def _apply_live_overlay(summary):
@@ -3809,7 +3885,7 @@ async function refresh(){
   document.getElementById('venue').textContent=s.venue||s.expected_venue||'-';document.getElementById('session').textContent=s.session||s.expected_session||'-';
   document.getElementById('phase').textContent=s.phase||'-';
   const ls=document.getElementById('ls');ls.textContent=s.ls_status||(s.ls_configured?'CONFIGURED':'NOT CONFIGURED');ls.className='v '+(s.ls_status==='CONNECTED'?'ok':'warn');
-  const wsState=document.getElementById('wsState'),wsFlow=document.getElementById('wsFlow'),wsLast=document.getElementById('wsLast');const wstat=s.ws_status||'WAITING';const subN=Number(s.ws_subscribed||0),tickN=Number(s.ws_tick_count||0);wsState.textContent=wstat+(s.rest_fallback_active?' · REST F/B':'');wsState.className='liveValue '+(wstat==='RECEIVING'?'ok':(wstat==='STALE'?'bad':'warn'));wsFlow.textContent=`SUB ${subN} · TICK ${tickN.toLocaleString('ko-KR')}`+(s.ws_last_tr?` · ${s.ws_last_tr}`:'');wsLast.textContent=s.ws_last_message_kst||'-';document.getElementById('wsSubCount').textContent=subN.toLocaleString('ko-KR');document.getElementById('wsTickCount').textContent=tickN.toLocaleString('ko-KR');document.getElementById('now').textContent=s.now_kst||'-';document.getElementById('finished').textContent=s.last_finished||'-';
+  const wsState=document.getElementById('wsState'),wsFlow=document.getElementById('wsFlow'),wsLast=document.getElementById('wsLast');const wstat=s.ws_status||'WAITING';const subN=Number(s.ws_subscribed||0),tickN=Number(s.ws_tick_count||0);wsState.textContent=wstat+(s.rest_fallback_active?' · REST F/B':'');wsState.className='liveValue '+(wstat==='RECEIVING'?'ok':(wstat==='STALE'?'bad':'warn'));wsFlow.textContent=`ACK구독 ${subN} · SEND ${Number(s.ws_sent_count||0)} · TICK ${tickN.toLocaleString('ko-KR')}`+(s.ws_last_tr?` · ${s.ws_last_tr}`:'');wsLast.textContent=s.ws_last_message_kst||'-';document.getElementById('wsSubCount').textContent=subN.toLocaleString('ko-KR');document.getElementById('wsTickCount').textContent=tickN.toLocaleString('ko-KR');document.getElementById('now').textContent=s.now_kst||'-';document.getElementById('finished').textContent=s.last_finished||'-';
   document.getElementById('progressText').textContent=(s.progress_total?`${s.progress_current}/${s.progress_total} · ${s.progress_pct}%`:s.phase||'-');
   document.getElementById('bar').style.width=Math.max(0,Math.min(100,Number(s.progress_pct)||0))+'%';document.getElementById('progressMsg').textContent=s.last_error||s.progress_message||'-';
   document.getElementById('runBtn').disabled=!!s.running;
