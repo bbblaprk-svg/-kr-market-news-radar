@@ -2094,7 +2094,7 @@ from urllib.parse import urlparse
 
 from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import Alpha500Integrated, market_session_now
 
-ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_17_WS_KEY_ACK_FIX"
+ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_18_ZEROBASE_SELECTION_ONLY"
 VERSION = ENGINE_VERSION
 PORT = int(os.getenv("PORT", "10000"))
 MASTER = os.getenv("UNIVERSE_MASTER", "섹터마스터_500종목_V3.csv")
@@ -3044,6 +3044,86 @@ def _deep_refresh_one(row, venue):
         LIVE_DEEP_REFRESH_LOCK.release()
 
 
+# Selection-only overlay: reuse the EXISTING 500-quote result from the sector
+# reader. No LS token, WS, REST transport, TR, subscription or quote parser changed.
+LIVE_SELECTION_LOCK = threading.RLock()
+LIVE_SELECTION_SNAPSHOT = {"venue": "", "rows": [], "source_kst": None,
+                           "entered": [], "exited": [], "retained": [], "reentered": []}
+LIVE_SELECTION_SEEN = set()
+
+
+def _selection_refresh_500(summary, qmap, venue, stamp=None):
+    """Zero-base 500-stock selection using existing market-data output only."""
+    global LIVE_SELECTION_SEEN
+    venue = str(venue or "").upper()
+    if venue != str(summary.get("venue") or "").upper():
+        return None
+    base = [dict(r) for r in (summary.get("sector_live_pool") or [])
+            if isinstance(r, dict) and str(r.get("symbol") or "").zfill(6).isdigit()]
+    if not base or not isinstance(qmap, dict):
+        return None
+    min_priced = max(1, int(len(base) * 0.75))
+    priced = sum(1 for r in base if _quote_price(qmap.get(str(r.get("symbol")).zfill(6)) or {}) is not None)
+    if priced < min_priced:
+        return None  # never replace a valid pool with partial/stale data
+    scored = []
+    for row in base:
+        code = str(row.get("symbol")).zfill(6)
+        q = qmap.get(code) or {}
+        px, pct = _quote_price(q), _quote_pct(q)
+        if px is None or pct is None:
+            continue
+        row["current_price"] = px
+        row["change_pct"] = pct
+        row["live_source"] = "SELECTION_EXISTING_500_QUOTES"
+        row["live_updated_kst"] = stamp or now_kst_iso()
+        cache = LIVE_DEEP_CACHE.get(f"{venue}:{code}")
+        if cache:
+            row.update(cache)
+            row["deep_verified"] = True
+        proxy, er, momentum = _live_proxy_score(row)
+        deep_score = float(row.get("deep_score") or 0)
+        row["live_proxy_score"] = proxy
+        row["entry_return_pct"] = er
+        row["live_momentum_score"] = momentum
+        row["live_score"] = round(_clamp_live(
+            0.72 * proxy + 0.28 * deep_score if row.get("deep_verified") and deep_score > 0
+            else proxy - 2.0, 0.0, 100.0), 3)
+        scored.append(row)
+    scored.sort(key=lambda r: (-float(r.get("live_score") or 0), str(r.get("symbol"))))
+    max_n = max(1, int(os.getenv("LIVE_POOL_MAX", "70")))
+    # Candidate thresholds are unchanged; never force-fill to 70.
+    minimum = float(os.getenv("LIVE_SELECTION_MIN_SCORE", "28"))
+    selected = [r for r in scored if float(r.get("live_score") or 0) >= minimum][:max_n]
+    codes = {str(r["symbol"]).zfill(6) for r in selected}
+    with LIVE_SELECTION_LOCK:
+        old = LIVE_SELECTION_SNAPSHOT
+        previous = {str(r.get("symbol")).zfill(6) for r in old.get("rows", [])} if old.get("venue") == venue else set()
+        seen = LIVE_SELECTION_SEEN
+        entered = sorted(codes - previous)
+        exited = sorted(previous - codes)
+        reentered = sorted((codes - previous) & seen)
+        retained = sorted(codes & previous)
+        LIVE_SELECTION_SEEN = seen | codes
+        LIVE_SELECTION_SNAPSHOT.update(
+            venue=venue, rows=selected, base_timestamp=summary.get("timestamp_kst"), source_kst=stamp or now_kst_iso(),
+            entered=entered, exited=exited, retained=retained, reentered=reentered,
+            universe_count=len(base), priced_count=priced)
+    with LOCK:
+        STATE["selection_universe_count"] = len(base)
+        STATE["selection_priced_count"] = priced
+        STATE["selection_entered"] = entered
+        STATE["selection_exited"] = exited
+        STATE["selection_retained"] = retained
+        STATE["selection_reentered"] = reentered
+        STATE["selection_updated_kst"] = stamp or now_kst_iso()
+    logging.getLogger("alpha500_selection").info(
+        "ZEROBASE SELECTION venue=%s universe=%d priced=%d pool=%d entered=%s exited=%s retained=%d reentered=%s",
+        venue, len(base), priced, len(selected), ",".join(entered[:20]),
+        ",".join(exited[:20]), len(retained), ",".join(reentered[:20]))
+    return selected
+
+
 def live_rank_loop():
     interval = max(5, int(os.getenv("LIVE_REBALANCE_SECONDS", "15")))
     deep_n = max(1, int(os.getenv("LIVE_DEEP_N", "30")))
@@ -3061,7 +3141,14 @@ def live_rank_loop():
                 continue
 
             _seed_live_deep_cache(summary)
-            rows = _live_rows_with_quotes(summary)
+            with LIVE_SELECTION_LOCK:
+                snap = dict(LIVE_SELECTION_SNAPSHOT)
+            selected_summary = (
+                {**summary, "live_pool": snap["rows"]}
+                if snap.get("venue") == str(summary.get("venue") or "").upper()
+                and snap.get("base_timestamp") == summary.get("timestamp_kst")
+                and snap.get("rows") else summary)
+            rows = _live_rows_with_quotes(selected_summary)
             rows.sort(key=lambda r: float(r.get("live_score") or 0.0), reverse=True)
             live_deep = rows[:deep_n]
 
@@ -3080,7 +3167,7 @@ def live_rank_loop():
             )
             if refresh_candidate is not None:
                 _deep_refresh_one(refresh_candidate, summary.get("venue"))
-                rows = _live_rows_with_quotes(summary)
+                rows = _live_rows_with_quotes(selected_summary)
                 rows.sort(key=lambda r: float(r.get("live_score") or 0.0), reverse=True)
                 live_deep = rows[:deep_n]
 
@@ -3311,6 +3398,7 @@ def live_sector_loop():
             with LIVE_SECTOR_LOCK:
                 previous = LIVE_SECTOR_SNAPSHOT.get("sector_energy") or summary.get("sector_energy") or []
             sector_rows = _live_sector_rows(summary, qmap, index_returns, previous, rep_n=rep_n)
+            _selection_refresh_500(summary, qmap, venue, now_kst_iso())
             stamp = now_kst_iso()
             source = "LIVE:t8407_500" if venue == "KRX" else "LIVE:t8450_NXT"
             with LIVE_SECTOR_LOCK:
