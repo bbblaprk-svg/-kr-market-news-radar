@@ -19,6 +19,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     AUTO_SCAN=true \
     SCAN_INTERVAL_SECONDS=600 \
     HISTORY_REFRESH_GAP_DAYS=4 \
+    LAZY_HISTORY_ENABLED=true \
+    LAZY_HISTORY_SYNC_BOOTSTRAP_N=0 \
+    LAZY_HISTORY_CANDIDATE_N=80 \
+    LAZY_HISTORY_BG_ENABLED=true \
+    LAZY_HISTORY_BG_BATCH=2 \
+    LAZY_HISTORY_BG_INTERVAL_SECONDS=3 \
+    HISTORY_DELTA_UPDATE=true \
+    FAST_ONLY_STAGE1=true \
     LS_TR_RETRIES=3 \
     LS_TR_BACKOFF_SECONDS=1.2 \
     LS_TR_MAX_BACKOFF_SECONDS=8.0 \
@@ -35,6 +43,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     LIVE_SECTOR_KRX=true \
     LIVE_SECTOR_NXT=false \
     LIVE_SECTOR_REP_N=5 \
+    VOLUME_DIRECTION_ENABLED=true \
+    VOLUME_DIRECTION_TOP_N=20 \
     SELECTION_HISTORY_MAX=200 \
     CLOSE_BET_ENABLED=true \
     CLOSE_BET_TOP_N=5 \
@@ -86,7 +96,7 @@ LS KRX master/ranking
 
 속도 원칙
 =========
-- 최초 history cache가 없는 종목만 t8410 일봉을 1회 bootstrap한다.
+- 500종목은 현재가로 즉시 FAST_ONLY 판정하며, 과거 일봉은 후보부터 백그라운드 LAZY/DELTA로 채운다.
 - 반복 장중 스캔은 t8407 멀티현재가(50종목/호출)로 당일 봉을 갱신한다.
 - KRX/NXT를 절대 혼합하지 않는다.
 - 주문 API를 사용하지 않는다.
@@ -234,6 +244,11 @@ class FastHistory500:
         self.provider_name = "LS"
         self.venue = "KRX"
         self.exchgubun = "K"
+        # LAZY HISTORY: main scan never has to wait for all 500 histories.
+        self.last_lazy_candidates: List[Dict[str, Any]] = []
+        self.last_history_missing_count = 0
+        self.last_history_cache_hit_count = 0
+        self.last_history_bootstrap_sync_count = 0
 
     def set_venue(self, venue: str, exchgubun: Optional[str] = None):
         v = str(venue or "KRX").upper()
@@ -281,7 +296,16 @@ class FastHistory500:
         return (date.today() - last).days > env_int("HISTORY_REFRESH_GAP_DAYS", 4)
 
     def bootstrap_one(self, code: str) -> pd.DataFrame:
-        start = date.today() - timedelta(days=self.lookback_days)
+        """Fetch one symbol only. Existing caches use DELTA update instead of full re-download."""
+        cached = self.store.read(self.provider_name, self.venue, code, limit=260)
+        last = self.store.last_date(self.provider_name, self.venue, code)
+        delta = os.getenv("HISTORY_DELTA_UPDATE", "true").strip().lower() in {"1","true","yes","y","on"}
+        if delta and last is not None and len(cached) >= self.min_bars:
+            # Small overlap absorbs amended/corrected daily bars without redownloading 220 days.
+            start = max(date.today() - timedelta(days=45), last - timedelta(days=4))
+        else:
+            start = date.today() - timedelta(days=self.lookback_days)
+
         if self.venue == "KRX":
             df = self.ls.get_daily_bars(code, start, date.today())
         else:
@@ -310,8 +334,70 @@ class FastHistory500:
             if df.empty:
                 raise BrokerError(f"LS {code} t8451 NXT empty")
             df = df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+        if df is None or df.empty:
+            raise BrokerError(f"LS {code} history empty venue={self.venue}")
         self.store.upsert(self.provider_name, self.venue, code, df)
         return self.store.read(self.provider_name, self.venue, code, limit=240)
+
+    def _lazy_history_priority(self, universe: pd.DataFrame, quotes: Mapping[str, Mapping[str, Any]], missing: Sequence[str]) -> List[Dict[str, Any]]:
+        """Rank missing histories from CURRENT LS quote only; no history required.
+
+        The score is intentionally simple: turnover rank, volume rank, trade-strength
+        rank, moderate positive price direction, and liquidity-anchor preference.
+        It only decides which history to fetch first; it is NOT a buy score.
+        """
+        if not missing:
+            return []
+        meta = universe.copy()
+        if "code" not in meta.columns:
+            return []
+        meta["code"] = meta["code"].astype(str).str.zfill(6)
+        md = meta.set_index("code").to_dict("index")
+        rows = []
+        for code in missing:
+            q = dict(quotes.get(code) or {})
+            m = md.get(code, {})
+            diff = fnum(q.get("diff"), 0.0)
+            value = max(0.0, fnum(q.get("value", q.get("volume_amt")), 0.0))
+            volume = max(0.0, fnum(q.get("volume"), 0.0))
+            strength = max(0.0, fnum(q.get("chdegree"), 0.0))
+            anchor = 1.0 if str(m.get("LIQUIDITY_ANCHOR", "")).upper() == "Y" else 0.0
+            # Best zone is roughly flat to +5%; already exploded names are not prioritized.
+            if -2.5 <= diff <= 5.0:
+                direction = 1.0 - min(abs(diff - 1.5) / 6.0, 1.0)
+            elif 5.0 < diff <= 9.0:
+                direction = max(0.15, 0.75 - (diff - 5.0) * 0.12)
+            else:
+                direction = 0.05
+            rows.append({
+                "symbol": code, "name": str(m.get("name", m.get("종목명", code))),
+                "diff": diff, "value": value, "volume": volume, "strength": strength,
+                "anchor": anchor, "direction": direction,
+            })
+        x = pd.DataFrame(rows)
+        if x.empty:
+            return []
+        for c in ("value", "volume", "strength"):
+            x[c + "_rank"] = x[c].rank(pct=True, method="average").fillna(0.0)
+        x["lazy_priority"] = (
+            35.0 * x["value_rank"] +
+            20.0 * x["volume_rank"] +
+            18.0 * x["strength_rank"] +
+            17.0 * x["direction"] +
+            10.0 * x["anchor"]
+        )
+        x = x.sort_values(["lazy_priority", "value", "strength"], ascending=False)
+        n = max(1, env_int("LAZY_HISTORY_CANDIDATE_N", 80))
+        out = []
+        for _, r in x.head(n).iterrows():
+            out.append({
+                "symbol": str(r["symbol"]), "name": str(r["name"]),
+                "priority": round(float(r["lazy_priority"]), 2),
+                "change_pct": round(float(r["diff"]), 3),
+                "trade_strength": round(float(r["strength"]), 2),
+                "turnover_snapshot": float(r["value"]),
+            })
+        return out
 
     @staticmethod
     def overlay_quote(cached: pd.DataFrame, q: Optional[Mapping[str, Any]]) -> pd.DataFrame:
@@ -341,27 +427,41 @@ class FastHistory500:
 
     def get_all(self, universe: pd.DataFrame, bootstrap_missing: bool = True) -> Tuple[Dict[str, pd.DataFrame], Dict[str, Dict[str, Any]], List[str]]:
         codes = universe["code"].astype(str).str.zfill(6).tolist()
+        # FAST path: one quote sweep first. This is enough for 500-symbol FAST_ONLY judgement.
         quotes = self.multi_quotes(codes)
         data: Dict[str, pd.DataFrame] = {}
         errors: List[str] = []
         missing = [c for c in codes if self._needs_history_refresh(c)]
-        LOG.info("history cache hit=%d missing=%d venue=%s", len(codes) - len(missing), len(missing), self.venue)
-        if missing:
-            LOG.info("history bootstrap/refresh required=%d venue=%s", len(missing), self.venue)
-        for i, code in enumerate(missing, 1):
-            if not bootstrap_missing:
-                continue
-            try:
-                self.bootstrap_one(code)
-            except Exception as e:
-                errors.append(f"{code}:{type(e).__name__}:{str(e)[:100]}")
-            if i % 25 == 0 or i == len(missing):
-                LOG.info("history bootstrap %d/%d venue=%s", i, len(missing), self.venue)
+        self.last_history_missing_count = len(missing)
+        self.last_history_cache_hit_count = len(codes) - len(missing)
+        self.last_lazy_candidates = self._lazy_history_priority(universe, quotes, missing)
+        lazy = os.getenv("LAZY_HISTORY_ENABLED", "true").strip().lower() in {"1","true","yes","y","on"}
+        sync_n = max(0, env_int("LAZY_HISTORY_SYNC_BOOTSTRAP_N", 0)) if lazy else len(missing)
+        sync_codes = [x["symbol"] for x in self.last_lazy_candidates[:sync_n]] if lazy else list(missing)
+        self.last_history_bootstrap_sync_count = 0
+
+        LOG.info(
+            "history mode=%s cache_hit=%d missing=%d sync_bootstrap=%d lazy_queue=%d venue=%s",
+            "LAZY" if lazy else "FULL", self.last_history_cache_hit_count, len(missing),
+            len(sync_codes) if bootstrap_missing else 0, len(self.last_lazy_candidates), self.venue
+        )
+        # In LAZY mode default sync_n=0: the main scan NEVER waits for history.
+        if bootstrap_missing and sync_codes:
+            for i, code in enumerate(sync_codes, 1):
+                try:
+                    self.bootstrap_one(code)
+                    self.last_history_bootstrap_sync_count += 1
+                except Exception as e:
+                    errors.append(f"{code}:{type(e).__name__}:{str(e)[:100]}")
+                if i % 10 == 0 or i == len(sync_codes):
+                    LOG.info("history lazy-sync %d/%d venue=%s", i, len(sync_codes), self.venue)
 
         for code in codes:
             cached = self.store.read(self.provider_name, self.venue, code, limit=240)
             if len(cached) < self.min_bars:
-                errors.append(f"{code}:bars={len(cached)}:{self.venue}")
+                # Not an error in LAZY mode. run_stage1_fast emits FAST_ONLY from quote.
+                if not lazy:
+                    errors.append(f"{code}:bars={len(cached)}:{self.venue}")
                 continue
             data[code] = self.overlay_quote(cached, quotes.get(code))
         return data, quotes, errors
@@ -428,11 +528,35 @@ class Alpha500Integrated(TwoStageDeepScanner):
             m = meta.get(code, {})
             bars = data_cache.get(code)
             if bars is None or bars.empty:
-                rows.append({
-                    "symbol": code, "name": m.get("name", code), "market": m.get("market", "KRX"),
-                    "stage1_state": "ERROR", "stage1_score": 0.0, "current_return_pct": np.nan,
-                    "error": "history unavailable",
-                })
+                q = quotes.get(code, {}) or {}
+                price = fnum(q.get("price"), 0.0)
+                diff = fnum(q.get("diff"), 0.0)
+                fast_only = os.getenv("FAST_ONLY_STAGE1", "true").strip().lower() in {"1","true","yes","y","on"}
+                if fast_only and price > 0:
+                    row = {
+                        "symbol": code, "name": m.get("name", code), "market": m.get("market", "KRX"),
+                        "stage1_state": "FAST_ONLY", "stage1_score": 0.0,
+                        "stage1_close": price, "current_return_pct": diff,
+                        "stage1_above_vwap": False, "stage1_ema20_hold": False,
+                        "trade_strength_snapshot": fnum(q.get("chdegree"), np.nan),
+                        "turnover_snapshot_million": fnum(q.get("value", q.get("volume_amt")), np.nan),
+                        "history_status": "LAZY_PENDING", "error": "",
+                        "stage1_price_source": ("LS:t8407:FAST_ONLY:KRX" if self.active_venue == "KRX" else "LS:t8450:FAST_ONLY:NXT"),
+                        "stage1_fallback_trace": "LAZY_HISTORY_PENDING",
+                    }
+                    for c in [
+                        "BUCKET_BASE","MEGA_SECTOR","SECTOR","MICRO_CLUSTER","ENERGY_CLUSTER","ENERGY_LEVEL",
+                        "SECONDARY_TAG","역할","에너지기본가중","매수후보","시총1000억필터","활성상태",
+                        "LIQUIDITY_ANCHOR","liquidity_score","liquidity_rank","market_cap_100m","ENERGY_EXCLUDE","nxt_eligible",
+                    ]:
+                        row[c] = m.get(c, "")
+                    rows.append(row)
+                else:
+                    rows.append({
+                        "symbol": code, "name": m.get("name", code), "market": m.get("market", "KRX"),
+                        "stage1_state": "ERROR", "stage1_score": 0.0, "current_return_pct": np.nan,
+                        "error": "history unavailable and quote unavailable",
+                    })
                 continue
             try:
                 d = self.stage1_pre_score(bars, code)
@@ -1135,6 +1259,11 @@ class Alpha500Integrated(TwoStageDeepScanner):
             "selection_history": history,
             "history_count": len(history),
             "universe_report": getattr(self, "last_universe_report", {}),
+            "history_mode": "LAZY" if os.getenv("LAZY_HISTORY_ENABLED", "true").strip().lower() in {"1","true","yes","y","on"} else "FULL",
+            "history_cache_hit": int(getattr(self.fast_history, "last_history_cache_hit_count", 0)),
+            "history_missing": int(getattr(self.fast_history, "last_history_missing_count", 0)),
+            "history_sync_bootstrap": int(getattr(self.fast_history, "last_history_bootstrap_sync_count", 0)),
+            "lazy_history_candidates": list(getattr(self.fast_history, "last_lazy_candidates", []) or []),
         }
         write_json_atomic(self.result_dir / f"latest_alpha500_{self.active_venue}.json", summary)
         write_json_atomic(self.result_dir / "latest_alpha500.json", summary)
@@ -1240,7 +1369,17 @@ class Alpha500Integrated(TwoStageDeepScanner):
         return kept, report
 
     def bootstrap_history(self, runtime: pd.DataFrame):
-        _, _, errors = self.fast_history.get_all(runtime, bootstrap_missing=True)
+        """Explicit CLI maintenance path: fill all missing histories. Not used by normal scans."""
+        errors = []
+        codes = runtime["code"].astype(str).str.zfill(6).tolist()
+        missing = [c for c in codes if self.fast_history._needs_history_refresh(c)]
+        for i, code in enumerate(missing, 1):
+            try:
+                self.fast_history.bootstrap_one(code)
+            except Exception as e:
+                errors.append(f"{code}:{type(e).__name__}:{str(e)[:120]}")
+            if i % 25 == 0 or i == len(missing):
+                LOG.info("history maintenance %d/%d venue=%s", i, len(missing), self.active_venue)
         return errors
 
     def run_integrated(self, bootstrap_missing: bool = True, session_info: Optional[Mapping[str, Any]] = None):
@@ -2073,6 +2212,458 @@ if __name__ == "__main__":
     main()
 ALPHA500_EC672D283E77
 
+# embedded: 거래량가속_완만상승_LS브리지_V2.py
+COPY <<'VPA_LS_V2_EOF' /app/거래량가속_완만상승_LS브리지_V2.py
+# -*- coding: utf-8 -*-
+"""
+거래량가속_완만상승_LS브리지_V2.py
+
+가격+거래량 ONLY 독립 판정 엔진.
+- LS REST/WS 수신부를 변경하지 않는다.
+- 누적 거래량 + 현재가를 venue별 1분 샘플로 재구성한다.
+- KRX/NXT 상태와 봉을 절대 혼합하지 않는다.
+- 주문/계좌 기능 없음.
+
+병렬 트랙
+1) ACCEL -> PAUSE -> RE_ACCEL -> DECAY/REJECT
+2) STEADY_UP: 장중 완만한 우상향
+3) STEADY_REACCEL: STEADY_UP 상태에서 거래량 재가속/가속
+"""
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone, timedelta
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
+import math
+import threading
+
+KST = timezone(timedelta(hours=9))
+EPS = 1e-12
+
+
+def _f(v: Any, default: float = 0.0) -> float:
+    try:
+        if v in (None, ""):
+            return default
+        x = float(v)
+        return x if math.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def _mean(xs: Iterable[float]) -> float:
+    z = list(xs)
+    return sum(z) / max(1, len(z))
+
+
+def _median(xs: Iterable[float]) -> float:
+    z = sorted(float(x) for x in xs)
+    if not z:
+        return 0.0
+    n = len(z)
+    m = n // 2
+    return z[m] if n % 2 else (z[m - 1] + z[m]) / 2.0
+
+
+def _pct(a: float, b: float) -> float:
+    return (b - a) / a if abs(a) > EPS else 0.0
+
+
+def _clip(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+@dataclass
+class MinuteBar:
+    minute: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+@dataclass
+class Signal:
+    symbol: str
+    venue: str
+    minute: str
+    combined_state: str
+    accel_state: str
+    steady_state: str
+    score: float
+    accel_score: float
+    steady_score: float
+    volume_ratio: float
+    instant_volume_ratio: float
+    volume_acceleration: float
+    price_velocity_pct: float
+    directionality: float
+    efficiency: float
+    higher_structure: float
+    steady_return_pct: float
+    steady_slope_pct_per_30m: float
+    positive_step_ratio: float
+    max_drawdown_pct: float
+    volume_persistence: float
+    bars: int
+    entry_candidate: bool
+    exit_candidate: bool
+    reason: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class _Series:
+    def __init__(self, max_bars: int = 480):
+        self.trade_date: Optional[str] = None
+        self.current: Optional[MinuteBar] = None
+        self.bars: Deque[MinuteBar] = deque(maxlen=max_bars)
+        self.last_cum_volume: Optional[float] = None
+        self.last_source: str = ""
+        self.last_update: Optional[str] = None
+        self.accel_state: str = "QUIET"
+        self.pause_ttl: int = 0
+        self.prev_response: float = 0.0
+        self.prev_volume_ratio: float = 1.0
+        self.prev_price_velocity: float = 0.0
+
+
+class LSVolumeDirectionBridge:
+    def __init__(self, max_bars: int = 480):
+        self._lock = threading.RLock()
+        self._series: Dict[Tuple[str, str], _Series] = {}
+        self._signals: Dict[Tuple[str, str], Signal] = {}
+        self.max_bars = max_bars
+
+    @staticmethod
+    def _minute_now(q: Dict[str, Any], now: Optional[datetime] = None) -> datetime:
+        # recv time을 기준으로 하되, LS chetime(HHMMSS)이 정상일 경우 같은 KST 날짜에 정렬.
+        now = now or datetime.now(KST)
+        raw = str(q.get("chetime") or "").strip().replace(":", "")
+        if raw.isdigit() and len(raw) >= 6:
+            try:
+                hh, mm, ss = int(raw[-6:-4]), int(raw[-4:-2]), int(raw[-2:])
+                if 0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59:
+                    now = now.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+            except Exception:
+                pass
+        return now.replace(second=0, microsecond=0)
+
+    @staticmethod
+    def _price(q: Dict[str, Any]) -> float:
+        return _f(q.get("price"), 0.0)
+
+    @staticmethod
+    def _cum_volume(q: Dict[str, Any]) -> Optional[float]:
+        # LS S3_/K3_/NS3의 volume은 누적거래량. 없을 때는 None으로 두어 가격봉만 유지.
+        v = q.get("volume")
+        if v in (None, ""):
+            return None
+        x = _f(v, -1.0)
+        return x if x >= 0 else None
+
+    def _reset_day(self, s: _Series, trade_date: str):
+        s.trade_date = trade_date
+        s.current = None
+        s.bars.clear()
+        s.last_cum_volume = None
+        s.accel_state = "QUIET"
+        s.pause_ttl = 0
+        s.prev_response = 0.0
+        s.prev_volume_ratio = 1.0
+        s.prev_price_velocity = 0.0
+
+    def on_quote(self, symbol: str, q: Dict[str, Any], source: str, venue: str, now: Optional[datetime] = None) -> Optional[Signal]:
+        code = str(symbol or "").zfill(6)
+        venue = str(venue or "").upper()
+        if venue not in {"KRX", "NXT"} or not code.isdigit() or len(code) != 6 or not isinstance(q, dict):
+            return None
+        px = self._price(q)
+        if px <= 0:
+            return None
+        dt = self._minute_now(q, now)
+        trade_date = dt.strftime("%Y-%m-%d")
+        minute = dt.strftime("%Y-%m-%dT%H:%M")
+        cumv = self._cum_volume(q)
+        key = (venue, code)
+
+        with self._lock:
+            s = self._series.setdefault(key, _Series(self.max_bars))
+            if s.trade_date != trade_date:
+                self._reset_day(s, trade_date)
+
+            delta_v = 0.0
+            if cumv is not None:
+                if s.last_cum_volume is None:
+                    s.last_cum_volume = cumv
+                elif cumv >= s.last_cum_volume:
+                    delta_v = cumv - s.last_cum_volume
+                    s.last_cum_volume = cumv
+                # REST/WS 수신 순서가 뒤집혀 더 작은 누적값이 오면 무시한다.
+                # last_cum_volume을 되돌리지 않아 다음 tick에서 거래량을 중복 계산하지 않는다.
+
+            if s.current is None:
+                s.current = MinuteBar(minute, px, px, px, px, max(0.0, delta_v))
+            elif s.current.minute == minute:
+                s.current.high = max(s.current.high, px)
+                s.current.low = min(s.current.low, px)
+                s.current.close = px
+                s.current.volume += max(0.0, delta_v)
+            else:
+                # 시간 역행 데이터는 버린다. venue별 상태는 유지한다.
+                if minute < s.current.minute:
+                    return self._signals.get(key)
+                s.bars.append(s.current)
+                s.current = MinuteBar(minute, px, px, px, px, max(0.0, delta_v))
+
+            s.last_source = str(source or "")
+            s.last_update = dt.isoformat(timespec="seconds")
+            sig = self._evaluate(code, venue, s)
+            if sig is not None:
+                self._signals[key] = sig
+            return sig
+
+    def ingest_many(self, qmap: Dict[str, Dict[str, Any]], source: str, venue: str, now: Optional[datetime] = None) -> int:
+        n = 0
+        for code, q in (qmap or {}).items():
+            if self.on_quote(code, q, source, venue, now=now) is not None:
+                n += 1
+        return n
+
+    @staticmethod
+    def _all_bars(s: _Series) -> List[MinuteBar]:
+        z = list(s.bars)
+        if s.current is not None:
+            z.append(s.current)
+        return z
+
+    @staticmethod
+    def _volume_features(bars: List[MinuteBar]) -> Tuple[float, float, float]:
+        vols = [max(0.0, b.volume) for b in bars]
+        if len(vols) < 9:
+            return 1.0, 1.0, 0.0
+        recent = _mean(vols[-3:])
+        prev = _mean(vols[-8:-3])
+        vr = recent / max(prev, EPS)
+        prev3 = _mean(vols[-4:-1])
+        ivr = vols[-1] / max(prev3, EPS)
+        a = _mean(vols[-9:-6]); b = _mean(vols[-6:-3]); c = _mean(vols[-3:])
+        v1 = (b - a) / max(a, EPS)
+        v2 = (c - b) / max(b, EPS)
+        return vr, ivr, v2 - v1
+
+    @staticmethod
+    def _price_features(bars: List[MinuteBar], window: int = 8) -> Tuple[float, float, float, float, float, int]:
+        z = bars[-window:]
+        closes = [b.close for b in z]
+        highs = [b.high for b in z]
+        lows = [b.low for b in z]
+        pv = _pct(closes[0], closes[-1]) if len(closes) >= 2 else 0.0
+        ds = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+        ups = sum(max(x, 0.0) for x in ds)
+        dns = sum(max(-x, 0.0) for x in ds)
+        directionality = ups / max(ups + dns, EPS)
+        gross = sum(abs(x) for x in ds)
+        efficiency = max(closes[-1] - closes[0], 0.0) / max(gross, EPS)
+        hh = sum(1 for i in range(1, len(highs)) if highs[i] >= highs[i - 1])
+        hl = sum(1 for i in range(1, len(lows)) if lows[i] >= lows[i - 1])
+        structure = (hh + hl) / max(2 * (len(z) - 1), 1)
+        recent_high = max(highs) if highs else closes[-1]
+        dd = _pct(recent_high, closes[-1])
+        neg_recent = sum(1 for i in range(max(1, len(closes) - 2), len(closes)) if closes[i] < closes[i - 1])
+        return pv, directionality, efficiency, structure, dd, neg_recent
+
+    @staticmethod
+    def _steady_features(bars: List[MinuteBar]) -> Dict[str, float]:
+        # "하루종일"을 조기에 과장하지 않도록 최소 25개 1분 샘플이 필요하다.
+        z = bars[-240:]
+        n = len(z)
+        if n < 25:
+            return {"ok": 0.0, "score": 0.0, "ret": 0.0, "slope30": 0.0, "pos": 0.0, "eff": 0.0, "hl": 0.0, "maxdd": 0.0, "vp": 0.0, "jump": 0.0}
+        closes = [b.close for b in z]
+        lows = [b.low for b in z]
+        vols = [max(0.0, b.volume) for b in z]
+        logs = [math.log(max(x, EPS)) for x in closes]
+        xbar = (n - 1) / 2.0
+        ybar = _mean(logs)
+        den = sum((i - xbar) ** 2 for i in range(n))
+        slope = sum((i - xbar) * (logs[i] - ybar) for i in range(n)) / max(den, EPS)
+        slope30 = (math.exp(slope * 30.0) - 1.0) * 100.0
+        ret = _pct(closes[0], closes[-1]) * 100.0
+        steps = [_pct(closes[i - 1], closes[i]) for i in range(1, n)]
+        pos = sum(1 for x in steps if x >= 0) / max(1, len(steps))
+        gross = sum(abs(closes[i] - closes[i - 1]) for i in range(1, n))
+        eff = max(closes[-1] - closes[0], 0.0) / max(gross, EPS)
+        hl = sum(1 for i in range(1, n) if lows[i] >= lows[i - 1]) / max(1, n - 1)
+        peak = closes[0]
+        maxdd = 0.0
+        for p in closes:
+            peak = max(peak, p)
+            maxdd = min(maxdd, _pct(peak, p))
+        med_all = _median([v for v in vols if v > 0])
+        med_recent = _median([v for v in vols[-10:] if v > 0])
+        vp = med_recent / max(med_all, EPS) if med_all > 0 else 0.0
+        jump = max((abs(x) for x in steps), default=0.0) * 100.0
+
+        # 완만한 상승: 총수익률 자체보다 기울기/효율/낙폭/고저점 진행을 중시.
+        cond = (
+            ret >= 0.60 and ret <= 7.0 and
+            slope30 >= 0.10 and
+            pos >= 0.56 and
+            eff >= 0.32 and
+            hl >= 0.52 and
+            maxdd >= -0.018 and
+            jump <= 0.018 * 100.0 and
+            (vp >= 0.45 or med_all == 0.0)
+        )
+        score = (
+            24.0 * _clip((slope30 - 0.05) / 0.65, 0.0, 1.0) +
+            20.0 * _clip((pos - 0.50) / 0.30, 0.0, 1.0) +
+            22.0 * _clip((eff - 0.20) / 0.55, 0.0, 1.0) +
+            17.0 * _clip((hl - 0.45) / 0.35, 0.0, 1.0) +
+            12.0 * _clip((0.020 + maxdd) / 0.020, 0.0, 1.0) +
+            5.0 * _clip(vp / 1.2, 0.0, 1.0)
+        )
+        # 한 번의 급등으로 전체 수익 대부분을 만든 종목 감점.
+        if jump > 1.2:
+            score -= min(18.0, (jump - 1.2) * 12.0)
+        return {"ok": 1.0 if cond else 0.0, "score": _clip(score, 0.0, 100.0), "ret": ret, "slope30": slope30, "pos": pos, "eff": eff, "hl": hl, "maxdd": maxdd * 100.0, "vp": vp, "jump": jump}
+
+    def _evaluate(self, code: str, venue: str, s: _Series) -> Optional[Signal]:
+        bars = self._all_bars(s)
+        if len(bars) < 9:
+            return None
+        vr, ivr, va = self._volume_features(bars)
+        pv, directionality, efficiency, structure, dd, neg_recent = self._price_features(bars)
+        steady = self._steady_features(bars)
+        latest_ret = _pct(bars[-2].close, bars[-1].close) if len(bars) >= 2 else 0.0
+        response = max(pv, 0.0) / max(vr - 1.0, 0.10)
+        price_ok = pv >= 0.0015 and directionality >= 0.58 and efficiency >= 0.35 and structure >= 0.50
+        accel_ok = vr >= 1.35 and va >= 0.12
+        response_decay = (
+            s.prev_response > EPS and response < s.prev_response * 0.55 and
+            vr >= max(s.prev_volume_ratio, 1.0) and s.prev_price_velocity > 0 and pv < s.prev_price_velocity * 0.75
+        )
+
+        prev_state = s.accel_state
+        accel_state = "QUIET"
+        reasons: List[str] = []
+        if pv < 0 and directionality < 0.45:
+            accel_state = "REJECT"; s.pause_ttl = 0; reasons.append("가격방향 하락")
+        elif prev_state in {"ACCEL", "RE_ACCEL"} and vr <= s.prev_volume_ratio * 0.90 and dd >= -0.012:
+            accel_state = "PAUSE"; s.pause_ttl = 5; reasons.append("가속후 거래량완화·가격버팀")
+        elif s.pause_ttl > 0 and dd >= -0.012:
+            reaccel_ok = (((vr >= 1.30 and vr >= s.prev_volume_ratio * 1.08) or ivr >= 1.35) and va > 0 and latest_ret > 0 and price_ok)
+            if reaccel_ok:
+                accel_state = "RE_ACCEL"; s.pause_ttl = 0; reasons.append("눌림후 거래량 재가속")
+            else:
+                accel_state = "PAUSE"; s.pause_ttl = max(0, s.pause_ttl - 1); reasons.append("재가속 대기")
+        elif response_decay or neg_recent >= 2:
+            accel_state = "DECAY"; s.pause_ttl = 0; reasons.append("거래량대비 가격반응 둔화")
+        elif accel_ok and price_ok:
+            accel_state = "ACCEL"; reasons.append("거래량가속+가격상승정렬")
+        elif vr >= 1.35:
+            reasons.append("거래량증가·가격효율 미달")
+        else:
+            reasons.append("가속조건 미충족")
+
+        # 가속 점수
+        accel_score = (
+            30.0 * _clip((vr - 1.0) / 1.5, 0.0, 1.0) +
+            20.0 * _clip((va + 0.2) / 0.8, 0.0, 1.0) +
+            20.0 * directionality + 15.0 * efficiency + 15.0 * structure
+        )
+        if accel_state == "RE_ACCEL": accel_score += 10.0
+        if accel_state in {"DECAY", "REJECT"}: accel_score -= 25.0
+        accel_score = _clip(accel_score, 0.0, 100.0)
+
+        steady_state = "STEADY_UP" if steady["ok"] else "NONE"
+        if steady_state == "STEADY_UP":
+            reasons.append("완만우상향")
+
+        if accel_state in {"DECAY", "REJECT"}:
+            combined = accel_state
+        elif steady_state == "STEADY_UP" and accel_state in {"ACCEL", "RE_ACCEL"}:
+            combined = "STEADY_REACCEL"
+        elif accel_state == "RE_ACCEL":
+            combined = "RE_ACCEL"
+        elif steady_state == "STEADY_UP":
+            combined = "STEADY_UP"
+        elif accel_state == "ACCEL":
+            combined = "ACCEL"
+        elif accel_state == "PAUSE":
+            combined = "PAUSE"
+        else:
+            combined = "QUIET"
+
+        # 두 트랙을 한 점수로 섞되, 상태 자체는 독립 보존.
+        score = max(accel_score, steady["score"])
+        if combined == "STEADY_REACCEL": score = min(100.0, 0.45 * steady["score"] + 0.55 * accel_score + 12.0)
+        elif combined == "RE_ACCEL": score = min(100.0, accel_score + 5.0)
+        elif combined == "STEADY_UP": score = steady["score"]
+
+        entry = combined in {"STEADY_REACCEL", "RE_ACCEL"} or (combined == "STEADY_UP" and steady["score"] >= 82.0 and steady["vp"] >= 0.65)
+        exit_ = combined in {"DECAY", "REJECT"}
+
+        s.accel_state = accel_state
+        s.prev_response = response
+        s.prev_volume_ratio = vr
+        s.prev_price_velocity = pv
+        return Signal(
+            symbol=code, venue=venue, minute=bars[-1].minute,
+            combined_state=combined, accel_state=accel_state, steady_state=steady_state,
+            score=round(score, 2), accel_score=round(accel_score, 2), steady_score=round(steady["score"], 2),
+            volume_ratio=round(vr, 4), instant_volume_ratio=round(ivr, 4), volume_acceleration=round(va, 4),
+            price_velocity_pct=round(pv * 100.0, 4), directionality=round(directionality, 4),
+            efficiency=round(efficiency, 4), higher_structure=round(structure, 4),
+            steady_return_pct=round(steady["ret"], 4), steady_slope_pct_per_30m=round(steady["slope30"], 4),
+            positive_step_ratio=round(steady["pos"], 4), max_drawdown_pct=round(steady["maxdd"], 4),
+            volume_persistence=round(steady["vp"], 4), bars=len(bars),
+            entry_candidate=entry, exit_candidate=exit_, reason=" / ".join(reasons),
+        )
+
+    def snapshot(self, venue: str, top_n: int = 20) -> Dict[str, Any]:
+        venue = str(venue or "").upper()
+        priority = {"STEADY_REACCEL": 7, "RE_ACCEL": 6, "STEADY_UP": 5, "ACCEL": 4, "PAUSE": 3, "QUIET": 2, "DECAY": 1, "REJECT": 0}
+        with self._lock:
+            rows = [s.to_dict() for (v, _), s in self._signals.items() if v == venue]
+        rows.sort(key=lambda r: (priority.get(r["combined_state"], -1), r["score"]), reverse=True)
+        active = [r for r in rows if r["combined_state"] not in {"QUIET", "DECAY", "REJECT"}]
+        return {
+            "venue": venue,
+            "engine": "VOLUME_DIRECTION_LS_V2",
+            "price_volume_only": True,
+            "tracked": len(rows),
+            "active": len(active),
+            "entry_candidates": sum(1 for r in rows if r["entry_candidate"]),
+            "top": active[:max(1, int(top_n))],
+        }
+
+
+if __name__ == "__main__":
+    # 최소 smoke test: 완만 상승 후 거래량 가속.
+    bridge = LSVolumeDirectionBridge()
+    base = 10000.0
+    cum = 0.0
+    start = datetime(2026, 10, 30, 9, 0, tzinfo=KST)
+    for i in range(50):
+        px = base * (1.0 + 0.00045 * i + (0.00015 if i % 5 == 0 else 0.0))
+        vol = 1000 + i * 10
+        if i >= 46:
+            vol *= (2 + i - 46)
+        cum += vol
+        q = {"price": px, "volume": cum}
+        bridge.on_quote("005930", q, "TEST", "KRX", now=start + timedelta(minutes=i))
+    snap = bridge.snapshot("KRX")
+    assert snap["tracked"] == 1
+    assert snap["top"], snap
+    print(snap["top"][0])
+
+VPA_LS_V2_EOF
+
 # embedded: 오백종목_통합엔진_웹서비스_V1_0.py
 COPY <<'ALPHA500_155215198450' /app/오백종목_통합엔진_웹서비스_V1_0.py
 # -*- coding: utf-8 -*-
@@ -2093,8 +2684,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import Alpha500Integrated, market_session_now
+from 거래량가속_완만상승_LS브리지_V2 import LSVolumeDirectionBridge
 
-ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_18_ZEROBASE_SELECTION_ONLY"
+ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_20_LAZY_HISTORY"
 VERSION = ENGINE_VERSION
 PORT = int(os.getenv("PORT", "10000"))
 MASTER = os.getenv("UNIVERSE_MASTER", "섹터마스터_500종목_V3.csv")
@@ -2175,15 +2767,28 @@ STATE = {
     "nxt_eod_hold_at": None,
     "nxt_eod_hold_trade_date": None,
     "nxt_eod_hold_status": "LOCAL_BEST_EFFORT",
+    "lazy_history_status": "STARTING",
+    "lazy_history_last_symbol": None,
+    "lazy_history_last_error": None,
+    "lazy_history_fetched": 0,
+    "lazy_history_skipped_cached": 0,
 }
 LOCK = threading.RLock()
 ENGINE = None
 ENGINE_LOCK = threading.RLock()
 REST_ENGINE = None
+LAZY_HISTORY_ENGINE = {}
+LAZY_HISTORY_ENGINE_LOCK = threading.RLock()
 LIVE_LOCK = threading.RLock()
 LIVE_QUOTES = {}
 LIVE_UPDATED_KST = None
 LIVE_QUOTE_META = {}
+
+# 가격+거래량 ONLY 병렬 엔진. LS 수신/구독 로직과 완전히 분리된 소비자다.
+VOLUME_DIRECTION_ENABLED = os.getenv("VOLUME_DIRECTION_ENABLED", "true").strip().lower() in {"1","true","yes","y","on"}
+VOLUME_DIRECTION_TOP_N = max(1, int(os.getenv("VOLUME_DIRECTION_TOP_N", "20")))
+VOLUME_DIRECTION = LSVolumeDirectionBridge()
+VOLUME_DIRECTION_LAST_ERROR = None
 
 LIVE_RANK_LOCK = threading.RLock()
 LIVE_RANK_SNAPSHOT = {"venue": None, "live_deep30": [], "live_watch10": [], "live_rebalanced_kst": None}
@@ -2304,6 +2909,115 @@ def get_rest_history(venue):
         REST_ENGINE.set_venue(venue, "N" if venue == "NXT" else "K")
         return REST_ENGINE
 
+def get_lazy_history_engine(venue):
+    """Separate history worker object: never mutates the live scan provider's venue state."""
+    venue = str(venue or "KRX").upper()
+    with LAZY_HISTORY_ENGINE_LOCK:
+        if venue not in LAZY_HISTORY_ENGINE:
+            from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import FastHistory500
+            db = os.getenv("CACHE_DB", str(RESULT_DIR.parent / "alpha500_bars.sqlite3"))
+            h = FastHistory500(get_engine().ls, db_path=db)
+            h.set_venue(venue, "N" if venue == "NXT" else "K")
+            LAZY_HISTORY_ENGINE[venue] = h
+        return LAZY_HISTORY_ENGINE[venue]
+
+
+def lazy_history_loop():
+    """Background-only history fill.
+
+    Main scan stays nonblocking. Priority:
+      1) price+volume engine active/entry candidates
+      2) current LS quote lazy-priority list saved by the latest 500 scan
+    """
+    log = logging.getLogger("alpha500_lazy_history")
+    enabled = os.getenv("LAZY_HISTORY_BG_ENABLED", "true").strip().lower() in {"1","true","yes","y","on"}
+    batch = max(1, int(os.getenv("LAZY_HISTORY_BG_BATCH", "2")))
+    interval = max(1.0, float(os.getenv("LAZY_HISTORY_BG_INTERVAL_SECONDS", "3")))
+    while True:
+        if not enabled:
+            with LOCK:
+                STATE["lazy_history_status"] = "DISABLED"
+            time.sleep(10)
+            continue
+        try:
+            with LOCK:
+                busy = bool(STATE.get("running"))
+            if busy:
+                with LOCK:
+                    STATE["lazy_history_status"] = "PAUSED_SCAN"
+                time.sleep(interval)
+                continue
+            summary = load_latest()
+            if not isinstance(summary, dict):
+                with LOCK:
+                    STATE["lazy_history_status"] = "WAITING_SUMMARY"
+                time.sleep(interval)
+                continue
+            venue = str(summary.get("venue") or market_session_now().get("venue") or "KRX").upper()
+            candidates = []
+            seen = set()
+
+            # First: actual current price/volume acceleration names.
+            if VOLUME_DIRECTION_ENABLED:
+                try:
+                    vd = VOLUME_DIRECTION.snapshot(venue, max(20, VOLUME_DIRECTION_TOP_N))
+                    for r in vd.get("top") or []:
+                        code = str(r.get("symbol", "")).zfill(6)
+                        state = str(r.get("state", ""))
+                        if code.isdigit() and state in {"STEADY_REACCEL","RE_ACCEL","STEADY_UP","ACCEL","PAUSE"} and code not in seen:
+                            candidates.append(code); seen.add(code)
+                except Exception:
+                    pass
+
+            # Then: 500 quote sweep priority queue.
+            for r in summary.get("lazy_history_candidates") or []:
+                code = str(r.get("symbol", "")).zfill(6)
+                if code.isdigit() and code not in seen:
+                    candidates.append(code); seen.add(code)
+
+            if not candidates:
+                with LOCK:
+                    STATE["lazy_history_status"] = "IDLE_NO_QUEUE"
+                time.sleep(interval)
+                continue
+
+            h = get_lazy_history_engine(venue)
+            fetched = 0
+            skipped = 0
+            for code in candidates:
+                if fetched >= batch:
+                    break
+                try:
+                    if not h._needs_history_refresh(code):
+                        skipped += 1
+                        continue
+                    with LOCK:
+                        STATE["lazy_history_status"] = "FETCHING"
+                        STATE["lazy_history_last_symbol"] = code
+                    h.bootstrap_one(code)
+                    fetched += 1
+                    with LOCK:
+                        STATE["lazy_history_fetched"] = int(STATE.get("lazy_history_fetched") or 0) + 1
+                        STATE["lazy_history_last_error"] = None
+                    log.info("LAZY HISTORY fetched venue=%s symbol=%s batch=%d/%d", venue, code, fetched, batch)
+                except Exception as e:
+                    with LOCK:
+                        STATE["lazy_history_last_error"] = f"{type(e).__name__}: {str(e)[:180]}"
+                    log.warning("LAZY HISTORY failed venue=%s symbol=%s error=%s", venue, code, str(e)[:180])
+            with LOCK:
+                STATE["lazy_history_skipped_cached"] = int(STATE.get("lazy_history_skipped_cached") or 0) + skipped
+                if fetched == 0:
+                    STATE["lazy_history_status"] = "IDLE_CACHED" if skipped else "IDLE"
+                else:
+                    STATE["lazy_history_status"] = "READY"
+        except Exception as e:
+            with LOCK:
+                STATE["lazy_history_status"] = "ERROR"
+                STATE["lazy_history_last_error"] = f"{type(e).__name__}: {str(e)[:180]}"
+            log.warning("LAZY HISTORY loop failed: %s", e)
+        time.sleep(interval)
+
+
 def _quote_pct(q):
     try:
         v = q.get("diff")
@@ -2369,6 +3083,15 @@ def _set_live_quote(code: str, q: dict, source: str, venue: str = ""):
             "venue": str(venue or "").upper(),
         }
         LIVE_UPDATED_KST = q2["_updated_kst"]
+
+    # LS 데이터 수신부의 결과를 읽기만 한다. 구독키/WS/REST 동작에는 관여하지 않는다.
+    global VOLUME_DIRECTION_LAST_ERROR
+    if VOLUME_DIRECTION_ENABLED:
+        try:
+            VOLUME_DIRECTION.on_quote(code, q2, source, str(venue or "").upper())
+            VOLUME_DIRECTION_LAST_ERROR = None
+        except Exception as e:
+            VOLUME_DIRECTION_LAST_ERROR = f"{type(e).__name__}: {str(e)[:180]}"
 
 
 def _flatten_dict(obj):
@@ -2872,6 +3595,17 @@ def _apply_live_overlay(summary):
         out["top_clusters"] = ss.get("top_clusters") or ss["sector_energy"][:15]
         out["live_sector_updated_kst"] = ss.get("updated_kst")
         out["live_sector_source"] = ss.get("source") or "LIVE"
+    # 가격+거래량 ONLY 병렬 결과. 기존 후보/섹터/딥 점수에는 가산하지 않는다.
+    try:
+        vd = VOLUME_DIRECTION.snapshot(str(out.get("venue") or "").upper(), VOLUME_DIRECTION_TOP_N) if VOLUME_DIRECTION_ENABLED else {"enabled": False, "top": []}
+        vd["enabled"] = bool(VOLUME_DIRECTION_ENABLED)
+        vd["last_error"] = VOLUME_DIRECTION_LAST_ERROR
+        out["volume_direction"] = vd
+        out["volume_direction_top"] = vd.get("top") or []
+    except Exception as e:
+        out["volume_direction"] = {"enabled": bool(VOLUME_DIRECTION_ENABLED), "top": [], "last_error": f"{type(e).__name__}: {str(e)[:180]}"}
+        out["volume_direction_top"] = []
+
     with LOCK:
         out["ws_status"] = STATE.get("ws_status")
         out["ws_last_message_kst"] = STATE.get("ws_last_message_kst")
@@ -3379,6 +4113,12 @@ def live_sector_loop():
             engine = get_engine()
             engine.fast_history.set_venue(venue, str(info.get("exchgubun") or ("N" if venue == "NXT" else "K")))
             qmap = engine.fast_history.multi_quotes(codes)
+            if VOLUME_DIRECTION_ENABLED and qmap:
+                try:
+                    VOLUME_DIRECTION.ingest_many(qmap, "REST:t8407_500" if venue == "KRX" else "REST:t8450_NXT", venue)
+                    VOLUME_DIRECTION_LAST_ERROR = None
+                except Exception as e:
+                    VOLUME_DIRECTION_LAST_ERROR = f"{type(e).__name__}: {str(e)[:180]}"
 
             index_returns = {}
             if venue == "KRX":
@@ -3854,6 +4594,20 @@ def state_copy():
     d["live_rebalance_seconds"] = int(os.getenv("LIVE_REBALANCE_SECONDS", "15"))
     d["live_pool_max"] = int(os.getenv("LIVE_POOL_MAX", "70"))
     d["live_sector_interval_seconds"] = int(os.getenv("LIVE_SECTOR_INTERVAL_SECONDS", "60"))
+    d["volume_direction_enabled"] = bool(VOLUME_DIRECTION_ENABLED)
+    d["volume_direction_top_n"] = int(VOLUME_DIRECTION_TOP_N)
+    d["volume_direction_last_error"] = VOLUME_DIRECTION_LAST_ERROR
+    d["lazy_history_enabled"] = os.getenv("LAZY_HISTORY_ENABLED", "true").strip().lower() in {"1","true","yes","y","on"}
+    d["lazy_history_bg_enabled"] = os.getenv("LAZY_HISTORY_BG_ENABLED", "true").strip().lower() in {"1","true","yes","y","on"}
+    try:
+        _vd = VOLUME_DIRECTION.snapshot(str(d.get("venue") or "").upper(), VOLUME_DIRECTION_TOP_N) if VOLUME_DIRECTION_ENABLED else {}
+        d["volume_direction_tracked"] = int(_vd.get("tracked") or 0)
+        d["volume_direction_active"] = int(_vd.get("active") or 0)
+        d["volume_direction_entry_candidates"] = int(_vd.get("entry_candidates") or 0)
+    except Exception:
+        d["volume_direction_tracked"] = 0
+        d["volume_direction_active"] = 0
+        d["volume_direction_entry_candidates"] = 0
     d["close_bet_enabled"] = os.getenv("CLOSE_BET_ENABLED", "true").strip().lower() in {"1","true","yes","y","on"}
     d["close_bet_top_n"] = int(os.getenv("CLOSE_BET_TOP_N", "5"))
     d["preclose_rescan_enabled"] = os.getenv("PRECLOSE_RESCAN_ENABLED", "true").strip().lower() in {"1","true","yes","y","on"}
@@ -4002,7 +4756,7 @@ refresh();setInterval(refresh,3000);
 
     def do_HEAD(self):
         path = urlparse(self.path).path
-        if path in {"/", "/health", "/api/status", "/api/results"}:
+        if path in {"/", "/health", "/api/status", "/api/results", "/api/volume-direction"}:
             if path == "/":
                 return self._dashboard()
             self.send_response(200); self.send_header("Content-Length", "0"); self.end_headers(); return
@@ -4021,6 +4775,13 @@ refresh();setInterval(refresh,3000);
             latest = load_latest()
             payload = _apply_live_overlay(latest) if latest is not None else {"status": "NO_RESULT_YET", **state_copy()}
             return self._json(200, _attach_close_bet(payload))
+        if path == "/api/volume-direction":
+            venue = str(market_session_now().get("venue") or STATE.get("venue") or "KRX").upper()
+            payload = VOLUME_DIRECTION.snapshot(venue, VOLUME_DIRECTION_TOP_N) if VOLUME_DIRECTION_ENABLED else {"venue": venue, "enabled": False, "top": []}
+            payload["enabled"] = bool(VOLUME_DIRECTION_ENABLED)
+            payload["last_error"] = VOLUME_DIRECTION_LAST_ERROR
+            payload["now_kst"] = now_kst_iso()
+            return self._json(200, payload)
         if path == "/api/run":
             with LOCK: busy = STATE["running"]
             ok = False
@@ -4061,6 +4822,7 @@ def main():
     threading.Thread(target=live_quote_loop, daemon=True).start()
     threading.Thread(target=live_rank_loop, daemon=True).start()
     threading.Thread(target=live_sector_loop, daemon=True).start()
+    threading.Thread(target=lazy_history_loop, daemon=True).start()
     threading.Thread(target=close_bet_loop, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(json.dumps({"event": "server_listening", "version": VERSION, "port": PORT, "kst": now_kst_iso()}, ensure_ascii=False))
