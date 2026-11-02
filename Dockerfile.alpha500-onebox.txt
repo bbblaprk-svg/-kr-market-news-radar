@@ -64,6 +64,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     CLOSE_BET_ENERGY_DELTA_MIN=0.35 \
     CLOSE_BET_BREADTH_MIN=0.55 \
     CLOSE_BET_EXCEPTION_MAX=1 \
+    CLOSE_BET_BUY_SCORE_MIN=72 \
+    CLOSE_BET_WAIT_SCORE_MIN=65 \
+    INTRADAY_BUY_DEEP_MIN=72 \
+    INTRADAY_MAX_RETURN_PCT=5.0 \
+    INDEPENDENT_LEADER_HISTORY_MAX=200 \
+    INDEPENDENT_LEADER_RELEASE_GRACE_SECONDS=90 \
+    PRECLOSE_FORCE_FULL_SCAN=true \
+    KRX_CLOSE_BET_MINUTE=927 \
+    NXT_CLOSE_BET_MINUTE=1170 \
     CLOSE_BET_MICRO_ENABLED=true \
     CLOSE_BET_MICRO_LARGE_CLUSTER_MIN=12 \
     CLOSE_BET_MICRO_SCORE_MIN=52.0 \
@@ -3120,12 +3129,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
 import time
 import traceback
 import websocket
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -3134,7 +3145,7 @@ from urllib.parse import urlparse
 from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import Alpha500Integrated, market_session_now
 from 거래량가속_완만상승_LS브리지_V2 import LSVolumeDirectionBridge
 
-ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_30_SIGNAL_SCORECARD"
+ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_32_LEADER_HISTORY_SCORECARD"
 VERSION = ENGINE_VERSION
 PORT = int(os.getenv("PORT", "10000"))
 MASTER = os.getenv("UNIVERSE_MASTER", "섹터마스터_500종목_V3.csv")
@@ -4218,8 +4229,13 @@ def _apply_live_overlay(summary):
         out["volume_direction_top"] = []
         out["volume_direction_history"] = []
 
+    # 실제 매수행동은 후보점수와 별도로 한 줄 행동코드로 통합한다.
+    out = _annotate_live_actions(out)
+
     # 표시용 대표종목/가격·거래량 신호 메타 보강. 동일 venue 데이터만 사용한다.
     out = _enrich_volume_direction_and_sector_reps(out, qmap, meta)
+    # 독립선도주 전용 발생기록/성과 추적. 데이터 수집과 분리된 표시·검증 계층이다.
+    out = _update_independent_leader_history(out, qmap, meta)
     if same_sector_venue and ss.get("sector_energy"):
         out["sector_display_venue"] = str(out.get("venue") or "").upper()
         out["sector_display_source"] = ss.get("source") or "LIVE"
@@ -4917,6 +4933,289 @@ def _cb_num(v, default=0.0):
         return float(default)
 
 
+def _row_action_decision(r, mode="INTRADAY"):
+    """Decision/UI-only final action. Never changes LS REST/WS ingestion or core ranking."""
+    mode=str(mode or "INTRADAY").upper()
+    deep=_cb_num(r.get("deep_score"),0); verified=bool(r.get("deep_verified",False))
+    stage=str(r.get("stage1_state") or ""); state=str(r.get("cluster_state") or "")
+    trend=str(r.get("energy_trend") or "UNKNOWN"); delta_raw=r.get("energy_delta")
+    delta=None if delta_raw is None else _cb_num(delta_raw,0)
+    change=_cb_num(r.get("change_pct"),0); vd=str(r.get("volume_direction_state") or "")
+    selection=str(r.get("selection_type") or "")
+    reasons=[]
+    if vd in {"DECAY","REJECT"}:
+        return {"final_action":"매수금지","action_reason":f"가격·거래량 {vd}","action_code":"NO_BUY"}
+    if state=="S5":
+        return {"final_action":"매수금지","action_reason":"섹터 S5","action_code":"NO_BUY"}
+    if trend=="FALLING" and delta is not None and delta<=_cb_num(os.getenv("ENERGY_FALLING_DELTA","-0.50"),-0.5):
+        return {"final_action":"매수금지","action_reason":f"섹터에너지 하락 ΔE {delta:+.1f}","action_code":"NO_BUY"}
+    if change>_cb_num(os.getenv("INTRADAY_MAX_RETURN_PCT","5.0"),5.0) and mode=="INTRADAY":
+        return {"final_action":"매수금지","action_reason":f"당일 +{change:.1f}% 과발산", "action_code":"NO_BUY"}
+    if mode=="CLOSE":
+        lane=str(r.get("close_bet_lane") or "")
+        score=_cb_num(r.get("close_bet_score"),0)
+        buy_min=_cb_num(os.getenv("CLOSE_BET_BUY_SCORE_MIN","72"),72)
+        wait_min=_cb_num(os.getenv("CLOSE_BET_WAIT_SCORE_MIN","65"),65)
+        if score>=buy_min and lane=="INDEPENDENT_LEADER":
+            return {"final_action":"예외매수","action_reason":f"독립선도주 · 종가점수 {score:.1f}","action_code":"EXCEPTION_BUY"}
+        if score>=buy_min and lane=="RISING_SECTOR":
+            return {"final_action":"종가매수","action_reason":f"상승에너지 · 종가점수 {score:.1f}","action_code":"CLOSE_BUY"}
+        if score>=wait_min:
+            return {"final_action":"대기","action_reason":f"종가점수 {score:.1f} < {buy_min:.0f}","action_code":"WAIT"}
+        return {"final_action":"매수금지","action_reason":f"종가점수 {score:.1f} < {wait_min:.0f}","action_code":"NO_BUY"}
+    core_final=(selection=="FINAL" or bool(r.get("final_selected",False)))
+    deep_min=_cb_num(os.getenv("INTRADAY_BUY_DEEP_MIN","72"),72)
+    stage_ok=stage in {"UP_START","REVERSAL_ARMED"}
+    sector_ok=state in {"S2","S3"}
+    energy_ok=(trend!="FALLING") and (delta is None or delta>=0)
+    vd_ok=vd in {"RE_ACCEL","STEADY_REACCEL"}
+    if core_final and verified and deep>=deep_min and stage_ok and sector_ok and energy_ok and vd_ok:
+        return {"final_action":"지금매수","action_reason":f"FINAL · Deep {deep:.1f} · {stage} · {state} · {vd}","action_code":"BUY_NOW"}
+    missing=[]
+    if not core_final: missing.append("FINAL")
+    if not verified or deep<deep_min: missing.append(f"Deep<{deep_min:.0f}")
+    if not stage_ok: missing.append("변곡상태")
+    if not sector_ok: missing.append("S2/S3")
+    if not energy_ok: missing.append("에너지")
+    if not vd_ok: missing.append("RE_ACCEL")
+    return {"final_action":"대기","action_reason":"미확인: "+", ".join(missing[:4]),"action_code":"WAIT"}
+
+
+def _independent_leader_table(summary, limit=10):
+    if not isinstance(summary,dict): return []
+    vd_map={str(x.get("symbol") or "").zfill(6):x for x in (summary.get("volume_direction_top") or []) if isinstance(x,dict)}
+    seen={}; order=("live_deep30","top_final","live_watch10","top_watch","live_pool")
+    for key in order:
+        for x in summary.get(key) or []:
+            if not isinstance(x,dict): continue
+            code=str(x.get("symbol") or "").zfill(6)
+            if not (code.isdigit() and len(code)==6): continue
+            if code not in seen: seen[code]=dict(x)
+            else:
+                for k,v in x.items():
+                    if seen[code].get(k) in (None,"") and v not in (None,""): seen[code][k]=v
+    rows=[]
+    for code,r in seen.items():
+        vz=vd_map.get(code) or {}; vd=str(vz.get("combined_state") or r.get("volume_direction_state") or "")
+        r["volume_direction_state"]=vd
+        deep=_cb_num(r.get("deep_score"),0); mrs=_cb_num(r.get("market_rs_score"),50); asym=str(r.get("asym_rs_class") or "")
+        verified=bool(r.get("deep_verified",False)); trend=str(r.get("energy_trend") or "UNKNOWN"); delta=_cb_num(r.get("energy_delta"),0); state=str(r.get("cluster_state") or "")
+        gates={
+            "asym":asym in {"SUPER","STRONG"}, "deep":deep>=72, "mrs":mrs>=62,
+            "verified":verified, "vd":vd in {"RE_ACCEL","STEADY_REACCEL"}
+        }
+        exceptional=deep>=80 and _cb_num(r.get("integrated_score"),0)>=70 and mrs>=68
+        blocked=(state=="S5") or (trend=="FALLING" and delta<=-2.0) or vd in {"DECAY","REJECT"}
+        passed=sum(1 for v in gates.values() if v)
+        qualified=(all(gates.values()) or (gates["asym"] and gates["deep"] and gates["mrs"] and gates["verified"] and exceptional)) and not blocked
+        if qualified: status="예외매수"
+        elif blocked: status="매수금지"
+        elif passed>=3 or asym in {"SUPER","STRONG"} or deep>=60 or mrs>=60: status="대기"
+        else: status="탈락"
+        # table is for genuine/near independent leaders, not every stock.
+        if status=="탈락" and passed<2: continue
+        score=20*passed + min(10,max(0,(deep-60)*0.5)) + min(8,max(0,(mrs-55)*0.5))
+        reason=[]
+        if not gates["asym"]: reason.append("비대칭RS 미달")
+        if not gates["deep"]: reason.append("Deep<72")
+        if not gates["mrs"]: reason.append("MarketRS<62")
+        if not gates["verified"]: reason.append("Deep미검증")
+        if not gates["vd"]: reason.append("재가속미확인")
+        if blocked: reason.append("섹터/가격 차단")
+        z=dict(r); z.update({
+            "independent_status":status,"independent_score":round(score,1),"independent_pass_count":passed,
+            "independent_asym_ok":gates["asym"],"independent_deep_ok":gates["deep"],"independent_mrs_ok":gates["mrs"],
+            "independent_verified_ok":gates["verified"],"independent_vd_ok":gates["vd"],"independent_blocked":blocked,
+            "independent_reason":" · ".join(reason) if reason else "독립선도주 전조건 충족",
+        })
+        rows.append(z)
+    rows.sort(key=lambda x:(x.get("independent_status")=="예외매수",_cb_num(x.get("independent_score")),_cb_num(x.get("deep_score")),_cb_num(x.get("market_rs_score"))),reverse=True)
+    return rows[:max(1,int(limit))]
+
+
+def _independent_leader_history_path(venue):
+    return RESULT_DIR / f"독립선도주_발생기록_{str(venue or 'KRX').upper()}_200.json"
+
+
+def _independent_leader_state_path(venue):
+    return RESULT_DIR / f"독립선도주_상태_{str(venue or 'KRX').upper()}.json"
+
+
+def _leader_read_json(path, default):
+    try:
+        if path.exists():
+            z=json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(z,type(default)): return z
+    except Exception:
+        pass
+    return default
+
+
+def _leader_write_json(path, obj):
+    try:
+        path.parent.mkdir(parents=True,exist_ok=True)
+        tmp=path.with_suffix(path.suffix+".tmp")
+        tmp.write_text(json.dumps(obj,ensure_ascii=False,indent=2,default=str),encoding="utf-8")
+        tmp.replace(path)
+    except Exception as e:
+        logging.getLogger("alpha500_leader_history").warning("leader history write failed: %s",str(e)[:180])
+
+
+def _leader_iso_dt(v):
+    try:
+        return datetime.fromisoformat(str(v))
+    except Exception:
+        return None
+
+
+def _update_independent_leader_history(out, qmap, meta):
+    """독립선도주 판정 상태전환을 최대 200건 기록하고 +1/+3/+5 거래일 성과를 누적한다.
+
+    판정/UI 기록층 전용이다. LS REST/WS 구독·수신·과거봉 수집에는 관여하지 않는다.
+    같은 상태가 유지되는 동안 3초 refresh마다 중복 행을 만들지 않고, 상태전환/재진입만 새 이벤트로 기록한다.
+    """
+    if not isinstance(out,dict): return out
+    venue=str(out.get("venue") or "KRX").upper()
+    max_n=max(20,int(os.getenv("INDEPENDENT_LEADER_HISTORY_MAX","200")))
+    grace=max(30,int(os.getenv("INDEPENDENT_LEADER_RELEASE_GRACE_SECONDS","90")))
+    hp=_independent_leader_history_path(venue); sp=_independent_leader_state_path(venue)
+    history=_leader_read_json(hp,[]); state=_leader_read_json(sp,{})
+    if not isinstance(history,list): history=[]
+    if not isinstance(state,dict): state={}
+    now=now_kst(); stamp=now.isoformat(timespec="seconds")
+    trade_date=str(out.get("timestamp_kst") or stamp)[:10]
+
+    # 500종목 스냅샷을 가격/이름/군집 fallback으로 사용하고, 동일 venue LIVE quote가 있으면 우선한다.
+    current_map={}
+    for key in ("sector_live_pool","live_deep30","live_watch10","top_final","top_watch","live_pool"):
+        for z in out.get(key) or []:
+            if not isinstance(z,dict): continue
+            code=str(z.get("symbol") or "").zfill(6)
+            if code.isdigit() and len(code)==6:
+                current_map.setdefault(code,{}).update({k:v for k,v in z.items() if v not in (None,"")})
+
+    def current_px(code, fallback=0.0):
+        q=qmap.get(code) or {}; m=meta.get(code) or {}
+        if m and str(m.get("venue") or venue).upper()!=venue: q={}
+        px=_quote_price(q) if isinstance(q,dict) else None
+        if px is not None and _cb_num(px,0)>0:
+            return _cb_num(px,0), str(m.get("source") or q.get("_source") or "LIVE")
+        z=current_map.get(code) or {}
+        px=_cb_num(z.get("current_price"),0)
+        if px>0: return px,"SCAN_SNAPSHOT"
+        return _cb_num(fallback,0),"HISTORY"
+
+    # 기존 예외매수 이벤트 성과를 현재가로 갱신. 이후 거래일 관측 횟수로 +1/+3/+5를 고정한다.
+    for h in history:
+        if not isinstance(h,dict): continue
+        code=str(h.get("symbol") or "").zfill(6)
+        px,src=current_px(code,h.get("current_price") or h.get("event_price") or 0)
+        if px>0:
+            h["current_price"]=px; h["price_source"]=src; h["evaluated_at_kst"]=stamp
+            ep=_cb_num(h.get("signal_price") or h.get("event_price"),0)
+            if ep>0: h["current_return_pct"]=round((px/ep-1.0)*100.0,4)
+        if h.get("is_exception_signal") and px>0:
+            sig_date=str(h.get("signal_trade_date") or h.get("trade_date") or "")[:10]
+            obs=h.get("observed_trade_dates") if isinstance(h.get("observed_trade_dates"),list) else []
+            if trade_date and sig_date and trade_date>sig_date and trade_date not in obs:
+                obs.append(trade_date); obs=obs[:10]; h["observed_trade_dates"]=obs
+            ret=h.get("current_return_pct")
+            if ret is not None:
+                if len(obs)>=1 and h.get("return_1d") is None: h["return_1d"]=ret
+                if len(obs)>=3 and h.get("return_3d") is None: h["return_3d"]=ret
+                if len(obs)>=5 and h.get("return_5d") is None: h["return_5d"]=ret
+
+    leaders=[x for x in (out.get("independent_leaders") or []) if isinstance(x,dict)]
+    present=set()
+    for r in leaders:
+        code=str(r.get("symbol") or "").zfill(6)
+        if not (code.isdigit() and len(code)==6): continue
+        present.add(code)
+        status=str(r.get("independent_status") or "대기")
+        st=state.get(code) if isinstance(state.get(code),dict) else {}
+        prev=str(st.get("status") or "")
+        was_active=bool(st.get("active",False))
+        px,src=current_px(code,r.get("current_price") or r.get("entry_price") or 0)
+        if px<=0: px=_cb_num(r.get("current_price") or r.get("entry_price"),0)
+        first_seen=_cb_num(st.get("first_seen_price"),0) or px
+        buy_occ=int(st.get("buy_occurrence") or 0)
+        first_signal=_cb_num(st.get("first_signal_price"),0)
+        latest_signal=_cb_num(st.get("latest_signal_price"),0)
+        event_needed=(not was_active) or (prev!=status)
+        event_type="재진입" if (not was_active and prev) else ("최초발생" if not prev else "상태전환")
+        if event_needed:
+            is_signal=status=="예외매수"
+            if is_signal:
+                buy_occ+=1
+                if first_signal<=0: first_signal=px
+                latest_signal=px
+            event_no=int(st.get("event_no") or 0)+1
+            reason=str(r.get("independent_reason") or "-")
+            ev={
+                "event_at_kst":stamp,"trade_date":trade_date,"venue":venue,"symbol":code,
+                "name":str(r.get("name") or code),"event_no":event_no,"event_type":event_type,
+                "occurrence":buy_occ,"independent_status":status,"previous_status":prev or "-",
+                "is_exception_signal":is_signal,"first_seen_price":first_seen,
+                "first_signal_price":first_signal if first_signal>0 else None,
+                "latest_signal_price":latest_signal if latest_signal>0 else None,
+                "signal_price":px if is_signal else None,"signal_trade_date":trade_date if is_signal else None,
+                "event_price":px,"current_price":px,"price_source":src,"event_change_pct":r.get("change_pct"),
+                "deep_score":r.get("deep_score"),"deep_grade":r.get("deep_grade"),"deep_verified":bool(r.get("deep_verified",False)),
+                "asym_rs_class":r.get("asym_rs_class"),"market_rs_score":r.get("market_rs_score"),
+                "volume_direction_state":r.get("volume_direction_state"),"energy_delta":r.get("energy_delta"),
+                "energy_trend":r.get("energy_trend"),"cluster_state":r.get("cluster_state"),
+                "ENERGY_CLUSTER":r.get("ENERGY_CLUSTER"),"independent_pass_count":r.get("independent_pass_count"),
+                "independent_score":r.get("independent_score"),"final_action":status,"reason":reason,
+                "current_return_pct":0.0 if is_signal and px>0 else None,
+                "return_1d":None,"return_3d":None,"return_5d":None,"observed_trade_dates":[],
+            }
+            history.insert(0,ev)
+            st["event_no"]=event_no
+        st.update({"status":status,"active":True,"last_seen_kst":stamp,"missing_since_kst":None,
+                   "first_seen_price":first_seen,"first_signal_price":first_signal,"latest_signal_price":latest_signal,
+                   "buy_occurrence":buy_occ,"name":str(r.get("name") or code)})
+        state[code]=st
+
+    # 테이블 이탈이 90초 이상 지속될 때 한 번만 '해제' 이벤트를 기록한다.
+    for code,st0 in list(state.items()):
+        if code in present or not isinstance(st0,dict) or not st0.get("active"): continue
+        miss=st0.get("missing_since_kst")
+        if not miss:
+            st0["missing_since_kst"]=stamp; state[code]=st0; continue
+        md=_leader_iso_dt(miss)
+        if md is None or (now-md).total_seconds()<grace: continue
+        px,src=current_px(code,st0.get("latest_signal_price") or st0.get("first_seen_price") or 0)
+        evno=int(st0.get("event_no") or 0)+1
+        ev={"event_at_kst":stamp,"trade_date":trade_date,"venue":venue,"symbol":code,
+            "name":str(st0.get("name") or code),"event_no":evno,"event_type":"해제",
+            "occurrence":int(st0.get("buy_occurrence") or 0),"independent_status":"해제",
+            "previous_status":str(st0.get("status") or "-"),"is_exception_signal":False,
+            "first_seen_price":st0.get("first_seen_price"),"first_signal_price":st0.get("first_signal_price"),
+            "latest_signal_price":st0.get("latest_signal_price"),"signal_price":None,"signal_trade_date":None,
+            "event_price":px,"current_price":px,"price_source":src,"reason":"독립선도주 판정테이블 90초 이상 이탈",
+            "return_1d":None,"return_3d":None,"return_5d":None,"observed_trade_dates":[]}
+        history.insert(0,ev); st0.update({"active":False,"status":"해제","event_no":evno,"last_seen_kst":stamp,"missing_since_kst":None}); state[code]=st0
+
+    history=history[:max_n]
+    _leader_write_json(hp,history); _leader_write_json(sp,state)
+    out["independent_leader_history"]=history
+    out["independent_leader_history_count"]=len(history)
+    out["independent_leader_signal_count"]=sum(1 for x in history if isinstance(x,dict) and x.get("is_exception_signal"))
+    return out
+
+
+def _annotate_live_actions(out):
+    vd_map={str(x.get("symbol") or "").zfill(6):x for x in (out.get("volume_direction_top") or []) if isinstance(x,dict)}
+    for key in ("top_final","live_deep30","live_watch10","top_watch","live_pool"):
+        for r in out.get(key) or []:
+            if not isinstance(r,dict): continue
+            code=str(r.get("symbol") or "").zfill(6); vz=vd_map.get(code) or {}
+            if vz: r["volume_direction_state"]=str(vz.get("combined_state") or "")
+            r.update(_row_action_decision(r,"INTRADAY"))
+    out["independent_leaders"]=_independent_leader_table(out,10)
+    return out
+
+
 def _micro_flow_key(r):
     cluster = str(r.get("ENERGY_CLUSTER") or "").strip()
     micro = str(r.get("MICRO_CLUSTER") or r.get("ENERGY_DETAIL") or r.get("SECTOR") or "미분류").strip()
@@ -5163,12 +5462,15 @@ def _close_micro_context(rows, summary, pre=None):
 
 
 def _close_bet_score(r, venue, krx_close_map=None):
+    fail=[]; gate={}
     try: change=float(r.get("change_pct") or 0.0)
     except Exception: change=0.0
-    if not (float(os.getenv("CLOSE_BET_MIN_RETURN_PCT","-3.0"))<=change<=float(os.getenv("CLOSE_BET_MAX_RETURN_PCT","7.0"))): return None
+    lo=float(os.getenv("CLOSE_BET_MIN_RETURN_PCT","-3.0")); hi=float(os.getenv("CLOSE_BET_MAX_RETURN_PCT","7.0"))
+    gate["return_range"]=lo<=change<=hi
+    if not gate["return_range"]: fail.append(f"등락률 범위이탈 {change:+.1f}%")
     state,asym=str(r.get("cluster_state") or ""),str(r.get("asym_rs_class") or "")
-    stage=str(r.get("stage1_state") or "")
-    if stage and stage not in {"UP_START","REVERSAL_ARMED","DOWN_WEAKEN","UP_TREND"}: return None
+    stage=str(r.get("stage1_state") or ""); gate["stage"]=(not stage) or stage in {"UP_START","REVERSAL_ARMED","DOWN_WEAKEN","UP_TREND"}
+    if not gate["stage"]: fail.append(f"Stage {stage} 부적합")
     deep=_cb_num(r.get("deep_score")); integ=_cb_num(r.get("integrated_score",r.get("stage1_score"))); energy=_cb_num(r.get("cluster_energy")); mrs=_cb_num(r.get("market_rs_score"),50); strength=_cb_num(r.get("trade_strength"),100)
     grade=str(r.get("deep_grade") or ""); delta=_cb_num(r.get("energy_delta"),0); rank=int(_cb_num(r.get("rank_move"),0)); breadth=_cb_num(r.get("cluster_breadth"),0); trend=str(r.get("energy_trend") or "UNKNOWN")
     micro_state=str(r.get("micro_flow_state") or ""); micro_score=_cb_num(r.get("micro_flow_score"),50); micro_delta=_cb_num(r.get("micro_flow_delta"),0); parent_n=int(_cb_num(r.get("micro_parent_members"),r.get("cluster_direct_members") or r.get("cluster_members") or 0))
@@ -5177,12 +5479,28 @@ def _close_bet_score(r, venue, krx_close_map=None):
     breadth_ok=(breadth>=breadth_min) if breadth>0 else True
     micro_required=os.getenv("CLOSE_BET_MICRO_ENABLED","true").lower() in {"1","true","yes","y","on"} and parent_n>=large_min
     micro_ok=(not micro_required) or (micro_score>=micro_min and micro_state!="FALLING")
-    main_ok=state in {"S2","S3"} and rising and breadth_ok and micro_ok
+    main_parts={"S2S3":state in {"S2","S3"},"rising":rising,"breadth":breadth_ok,"micro":micro_ok}
+    main_ok=all(main_parts.values())
     vd_state=str(r.get("volume_direction_state") or ""); vd_ok=vd_state in {"RE_ACCEL","STEADY_REACCEL"}
-    independent=asym in {"SUPER","STRONG"} and deep>=72 and mrs>=62 and bool(r.get("deep_verified",False))
+    independent_parts={"asym":asym in {"SUPER","STRONG"},"deep":deep>=72,"mrs":mrs>=62,"verified":bool(r.get("deep_verified",False))}
+    independent=all(independent_parts.values())
     exceptional=deep>=80 and integ>=70 and mrs>=68
-    rescue_ok=(not main_ok) and not (trend=="FALLING" and delta<=-2.0) and state!="S5" and independent and (vd_ok or exceptional)
-    if not main_ok and not rescue_ok: return None
+    blocked=(trend=="FALLING" and delta<=-2.0) or state=="S5"
+    rescue_ok=(not main_ok) and not blocked and independent and (vd_ok or exceptional)
+    if not main_ok and not rescue_ok:
+        if not main_parts["S2S3"]: fail.append("섹터 S2/S3 아님")
+        if not main_parts["rising"]: fail.append(f"에너지상승 미달 ΔE {delta:+.1f}/순위 {rank:+d}")
+        if not main_parts["breadth"]: fail.append(f"Breadth {breadth*100:.0f}%<{breadth_min*100:.0f}%")
+        if not main_parts["micro"]: fail.append(f"MICRO {micro_state or '-'} {micro_score:.0f}")
+        if not independent_parts["asym"]: fail.append("비대칭RS SUPER/STRONG 아님")
+        if not independent_parts["deep"]: fail.append(f"Deep {deep:.1f}<72")
+        if not independent_parts["mrs"]: fail.append(f"MarketRS {mrs:.1f}<62")
+        if not independent_parts["verified"]: fail.append("Deep 미검증")
+        if independent and not (vd_ok or exceptional): fail.append("가격·거래량 재가속 미확인")
+        if blocked: fail.append("FALLING/S5 차단")
+    r["close_bet_fail_reasons"]=fail
+    r["close_bet_gate_pass_count"]=sum(int(v) for v in main_parts.values())+sum(int(v) for v in independent_parts.values())+int(vd_ok)
+    if not gate["return_range"] or not gate["stage"] or (not main_ok and not rescue_ok): return None
     grade_bonus={"S":8.0,"A":6.0,"B":3.5,"WATCH":0.0}.get(grade,-3.0)
     score=0.38*deep+0.25*integ+0.17*energy+0.10*mrs+0.10*min(100,max(0,strength-60))+grade_bonus
     if change>5.5: score-=(change-5.5)*4
@@ -5218,19 +5536,48 @@ def _close_bet_score(r, venue, krx_close_map=None):
     return round(score,2),premium,reasons
 
 
+def _iso_kst(v):
+    try:
+        return datetime.fromisoformat(str(v)) if v else None
+    except Exception:
+        return None
+
+
+def _write_close_bet_snapshot(snap):
+    venue=str(snap.get("venue") or "KRX").upper()
+    for pp in (_close_bet_path(venue),_close_bet_path(venue,latest=False,ymd=now_kst().strftime("%Y%m%d"))):
+        tmp=pp.with_suffix(pp.suffix+".tmp"); tmp.write_text(json.dumps(snap,ensure_ascii=False,indent=2,default=str),encoding="utf-8"); tmp.replace(pp)
+    with LOCK:
+        if venue=="KRX": STATE["close_bet_krx_at"]=snap.get("captured_at_kst"); STATE["close_bet_krx_count"]=len(snap.get("candidates") or [])
+        else: STATE["close_bet_nxt_at"]=snap.get("captured_at_kst"); STATE["close_bet_nxt_count"]=len(snap.get("candidates") or [])
+        STATE["close_bet_last_error"]=snap.get("invalid_reason") if snap.get("decision_status")=="INVALID" else None
+    return snap
+
+
+def _invalid_close_bet(venue, trigger_label, reason, summary=None, pre=None):
+    snap={"captured_at_kst":now_kst_iso(),"trade_date":now_kst().strftime("%Y-%m-%d"),"venue":str(venue).upper(),"trigger":trigger_label,
+          "source_summary_kst":(summary or {}).get("timestamp_kst"),"preclose_rescan_kst":(pre or {}).get("captured_at_kst"),"preclose_universe_checked":int((pre or {}).get("universe_checked") or 0),
+          "candidate_count":0,"main_track_count":0,"exception_track_count":0,"data_status":"INVALID","decision_status":"INVALID","invalid_reason":reason,"quote_sources":[],"no_force_fill":True,"candidates":[],"near_candidates":[],"rejected_top10":[]}
+    logging.getLogger("alpha500_close_bet").warning("CLOSE BET INVALID venue=%s reason=%s",venue,reason)
+    return _write_close_bet_snapshot(snap)
+
+
 def build_close_bet(venue, trigger_label):
     venue=str(venue or "KRX").upper(); summary=load_latest_for_venue(venue)
     if not isinstance(summary,dict): raise RuntimeError(f"{venue} latest summary unavailable")
-    base_rows=_candidate_union(summary)
     pre=_read_preclose(venue) or {}
+    st=_iso_kst(summary.get("timestamp_kst")); pt=_iso_kst(pre.get("captured_at_kst"))
+    # A close-bet must use a full scan completed after the 15:20/19:20 preclose rescan.
+    if pt and (st is None or st<pt):
+        raise RuntimeError(f"FULL_SCAN_AFTER_PRECLOSE_PENDING venue={venue} summary={summary.get('timestamp_kst')} pre={pre.get('captured_at_kst')}")
+    base_rows=_candidate_union(summary)
     merged={str(r.get("symbol","")).zfill(6):dict(r) for r in base_rows if isinstance(r,dict)}
     for r in pre.get("candidates") or []:
         if not isinstance(r,dict): continue
         code=str(r.get("symbol","")).zfill(6)
         if code in merged:
             x=dict(r); x.update({k:v for k,v in merged[code].items() if k not in x or x.get(k) in (None,"")}); merged[code]=x
-        else:
-            merged[code]=dict(r)
+        else: merged[code]=dict(r)
     vd_map={str(x.get("symbol") or "").zfill(6):x for x in (summary.get("volume_direction_top") or (summary.get("volume_direction") or {}).get("top") or []) if isinstance(x,dict)}
     for code,r in merged.items():
         vz=vd_map.get(code) or {}; r["volume_direction_state"]=str(vz.get("combined_state") or r.get("volume_direction_state") or "")
@@ -5238,18 +5585,23 @@ def build_close_bet(venue, trigger_label):
     rows=_close_micro_context(rows,summary,pre)
     krx_close=_read_close_bet("KRX") if venue=="NXT" else None
     krx_close_map={str(x.get("symbol","")).zfill(6):x for x in ((krx_close or {}).get("candidates") or [])}
-    scored=[]
+    scored=[]; rejected=[]
     for r in rows:
         z=_close_bet_score(r,venue,krx_close_map)
-        if z is None: continue
-        score,premium,reasons=z; o=dict(r); o["close_bet_score"]=score; o["nxt_vs_krx_close_pct"]=None if premium is None else round(premium,3); o["close_bet_reasons"]=reasons; o["selection_type"]=f"{venue}_CLOSE_BET"; scored.append(o)
+        if z is None:
+            o=dict(r); o["close_bet_score"]=_cb_num(o.get("preclose_score"),0); o["final_action"]="매수금지"; o["action_code"]="NO_BUY"; o["action_reason"]=" · ".join((o.get("close_bet_fail_reasons") or [])[:4]) or "핵심게이트 미달"; rejected.append(o); continue
+        score,premium,reasons=z; o=dict(r); o["close_bet_score"]=score; o["nxt_vs_krx_close_pct"]=None if premium is None else round(premium,3); o["close_bet_reasons"]=reasons; o["selection_type"]=f"{venue}_CLOSE_BET"; o.update(_row_action_decision(o,"CLOSE")); scored.append(o)
     scored.sort(key=lambda x:(float(x.get("close_bet_score") or 0.0),float(x.get("deep_score") or 0.0)),reverse=True)
+    rejected.sort(key=lambda x:(int(x.get("close_bet_gate_pass_count") or 0),float(x.get("deep_score") or 0),float(x.get("integrated_score") or 0)),reverse=True)
+    buy_min=_cb_num(os.getenv("CLOSE_BET_BUY_SCORE_MIN","72"),72); wait_min=_cb_num(os.getenv("CLOSE_BET_WAIT_SCORE_MIN","65"),65)
+    eligible=[x for x in scored if _cb_num(x.get("close_bet_score"))>=buy_min]
+    near=[x for x in scored if wait_min<=_cb_num(x.get("close_bet_score"))<buy_min]
     max_n=max(1,int(os.getenv("CLOSE_BET_TOP_N","5")))
     ratio=max(0.5,min(1.0,_cb_num(os.getenv("CLOSE_BET_RISING_MAIN_RATIO","0.80"),0.80)))
     main_slots=max(1,min(max_n,int(round(max_n*ratio))))
     rescue_max=max(0,min(max_n-main_slots if max_n>1 else 0,int(os.getenv("CLOSE_BET_EXCEPTION_MAX","1"))))
-    main=[r for r in scored if r.get("close_bet_lane")=="RISING_SECTOR"]
-    rescue=[r for r in scored if r.get("close_bet_lane")=="INDEPENDENT_LEADER"]
+    main=[r for r in eligible if r.get("close_bet_lane")=="RISING_SECTOR"]
+    rescue=[r for r in eligible if r.get("close_bet_lane")=="INDEPENDENT_LEADER"]
     candidates=list(main[:main_slots]); seen={str(x.get("symbol") or "").zfill(6) for x in candidates}
     for x in rescue[:rescue_max]:
         code=str(x.get("symbol") or "").zfill(6)
@@ -5261,16 +5613,10 @@ def build_close_bet(venue, trigger_label):
     candidates=sorted(candidates,key=lambda x:(float(x.get("close_bet_score") or 0),float(x.get("deep_score") or 0)),reverse=True)[:max_n]
     sources=sorted({str(x.get("close_bet_quote_source") or "SNAPSHOT") for x in candidates})
     data_status="WS_CONFIRMED" if candidates and all(x.startswith("WS:") for x in sources) else ("REST_FALLBACK" if any(x.startswith("REST:") for x in sources) else "SNAPSHOT")
-    snap={"captured_at_kst":now_kst_iso(),"trade_date":now_kst().strftime("%Y-%m-%d"),"venue":venue,"trigger":trigger_label,"source_summary_kst":summary.get("timestamp_kst"),"preclose_rescan_kst":(pre or {}).get("captured_at_kst"),"preclose_universe_checked":int((pre or {}).get("universe_checked") or 0),"candidate_count":len(candidates),"main_track_count":sum(1 for x in candidates if x.get("close_bet_lane")=="RISING_SECTOR"),"exception_track_count":sum(1 for x in candidates if x.get("close_bet_lane")=="INDEPENDENT_LEADER"),"data_status":data_status,"quote_sources":sources,"no_force_fill":True,"candidates":candidates}
-    for p in (_close_bet_path(venue),_close_bet_path(venue,latest=False,ymd=now_kst().strftime("%Y%m%d"))):
-        tmp=p.with_suffix(p.suffix+".tmp"); tmp.write_text(json.dumps(snap,ensure_ascii=False,indent=2,default=str),encoding="utf-8"); tmp.replace(p)
-    with LOCK:
-        if venue=="KRX": STATE["close_bet_krx_at"]=snap["captured_at_kst"]; STATE["close_bet_krx_count"]=len(candidates)
-        else: STATE["close_bet_nxt_at"]=snap["captured_at_kst"]; STATE["close_bet_nxt_count"]=len(candidates)
-        STATE["close_bet_last_error"]=None
-    logging.getLogger("alpha500_close_bet").info("CLOSE BET venue=%s trigger=%s candidates=%d data_status=%s sources=%s",venue,trigger_label,len(candidates),data_status,sources)
+    snap={"captured_at_kst":now_kst_iso(),"trade_date":now_kst().strftime("%Y-%m-%d"),"venue":venue,"trigger":trigger_label,"source_summary_kst":summary.get("timestamp_kst"),"preclose_rescan_kst":(pre or {}).get("captured_at_kst"),"preclose_universe_checked":int((pre or {}).get("universe_checked") or 0),"candidate_count":len(candidates),"main_track_count":sum(1 for x in candidates if x.get("close_bet_lane")=="RISING_SECTOR"),"exception_track_count":sum(1 for x in candidates if x.get("close_bet_lane")=="INDEPENDENT_LEADER"),"data_status":data_status,"decision_status":"BET" if candidates else "NO_BET","buy_score_min":buy_min,"wait_score_min":wait_min,"quote_sources":sources,"no_force_fill":True,"candidates":candidates,"near_candidates":near[:10],"rejected_top10":rejected[:10]}
+    _write_close_bet_snapshot(snap)
+    logging.getLogger("alpha500_close_bet").info("CLOSE BET venue=%s trigger=%s status=%s candidates=%d near=%d rejected=%d data_status=%s sources=%s",venue,trigger_label,snap["decision_status"],len(candidates),len(near),len(rejected),data_status,sources)
     return snap
-
 
 def close_bet_loop():
     poll=max(5,int(os.getenv("CLOSE_BET_POLL_SECONDS","10")))
@@ -5280,14 +5626,32 @@ def close_bet_loop():
             if os.getenv("CLOSE_BET_ENABLED","true").strip().lower() not in {"1","true","yes","y","on"}: time.sleep(poll); continue
             n=now_kst(); day=n.strftime("%Y-%m-%d"); hm=n.hour*60+n.minute
             pre_enabled=os.getenv("PRECLOSE_RESCAN_ENABLED","true").strip().lower() in {"1","true","yes","y","on"}
-            if pre_enabled and 15*60+20<=hm<15*60+30 and done["PRECLOSE_KRX"]!=day:
+            if pre_enabled and 15*60+20<=hm<15*60+27 and done["PRECLOSE_KRX"]!=day:
                 build_preclose_rescan("KRX","15:20_KRX_PRECLOSE"); done["PRECLOSE_KRX"]=day
-            if 15*60+30<=hm<15*60+40 and done["KRX"]!=day:
-                build_close_bet("KRX","15:30_KRX_CLOSE"); done["KRX"]=day
+                if os.getenv("PRECLOSE_FORCE_FULL_SCAN","true").strip().lower() in {"1","true","yes","y","on"}:
+                    with LOCK: busy=bool(STATE.get("running"))
+                    if not busy: threading.Thread(target=run_scan,args=(market_session_now(),),daemon=True).start()
+            krx_min=int(os.getenv("KRX_CLOSE_BET_MINUTE","927"))
+            if krx_min<=hm<15*60+30 and done["KRX"]!=day:
+                try:
+                    build_close_bet("KRX","15:27_KRX_CLOSE_BET"); done["KRX"]=day
+                except RuntimeError as e:
+                    if "FULL_SCAN_AFTER_PRECLOSE_PENDING" not in str(e): raise
+            if 15*60+30<=hm<15*60+31 and done["KRX"]!=day:
+                summary=load_latest_for_venue("KRX"); pre=_read_preclose("KRX") or {}; _invalid_close_bet("KRX","15:30_KRX_INVALID","15:20 사전스캔 이후 Full Scan 미완료",summary,pre); done["KRX"]=day
             if pre_enabled and 19*60+20<=hm<19*60+30 and done["PRECLOSE_NXT"]!=day:
                 build_preclose_rescan("NXT","19:20_NXT_PRECLOSE"); done["PRECLOSE_NXT"]=day
-            if 19*60+30<=hm<20*60 and done["NXT"]!=day:
-                build_close_bet("NXT","19:30_NXT_CLOSE_BET"); done["NXT"]=day
+                if os.getenv("PRECLOSE_FORCE_FULL_SCAN","true").strip().lower() in {"1","true","yes","y","on"}:
+                    with LOCK: busy=bool(STATE.get("running"))
+                    if not busy: threading.Thread(target=run_scan,args=(market_session_now(),),daemon=True).start()
+            nxt_min=int(os.getenv("NXT_CLOSE_BET_MINUTE","1170"))
+            if nxt_min<=hm<19*60+35 and done["NXT"]!=day:
+                try:
+                    build_close_bet("NXT","19:30_NXT_CLOSE_BET"); done["NXT"]=day
+                except RuntimeError as e:
+                    if "FULL_SCAN_AFTER_PRECLOSE_PENDING" not in str(e): raise
+            if 19*60+35<=hm<19*60+36 and done["NXT"]!=day:
+                summary=load_latest_for_venue("NXT"); pre=_read_preclose("NXT") or {}; _invalid_close_bet("NXT","19:35_NXT_INVALID","19:20 사전스캔 이후 Full Scan 미완료",summary,pre); done["NXT"]=day
             eod_enabled=os.getenv("NXT_EOD_HOLD_ENABLED","true").strip().lower() in {"1","true","yes","y","on"}
             eod_min=int(os.getenv("NXT_EOD_HOLD_MINUTE","1195"))
             if eod_enabled and eod_min<=hm<20*60 and done["EOD_NXT"]!=day:
@@ -5299,11 +5663,12 @@ def close_bet_loop():
             logging.getLogger("alpha500_close_bet").warning("CLOSE BET/PRECLOSE loop failed: %s",e)
         time.sleep(poll)
 
-
 def _attach_close_bet(result):
     if not isinstance(result,dict): result={}
-    out=json.loads(json.dumps(result,ensure_ascii=False,default=str)); out["close_bet_krx"]=_read_close_bet("KRX"); out["close_bet_nxt"]=_read_close_bet("NXT"); return out
-
+    out=json.loads(json.dumps(result,ensure_ascii=False,default=str)); out["close_bet_krx"]=_read_close_bet("KRX"); out["close_bet_nxt"]=_read_close_bet("NXT")
+    # Refresh independent-leader table after close-bet snapshots are attached.
+    if not out.get("independent_leaders"): out["independent_leaders"]=_independent_leader_table(out,10)
+    return out
 
 def run_scan(session_info=None):
     info = dict(session_info or market_session_now())
@@ -5422,6 +5787,8 @@ def state_copy():
         d["volume_direction_entry_candidates"] = 0
     d["close_bet_enabled"] = os.getenv("CLOSE_BET_ENABLED", "true").strip().lower() in {"1","true","yes","y","on"}
     d["close_bet_top_n"] = int(os.getenv("CLOSE_BET_TOP_N", "5"))
+    d["close_bet_buy_score_min"] = float(os.getenv("CLOSE_BET_BUY_SCORE_MIN", "72"))
+    d["close_bet_wait_score_min"] = float(os.getenv("CLOSE_BET_WAIT_SCORE_MIN", "65"))
     d["preclose_rescan_enabled"] = os.getenv("PRECLOSE_RESCAN_ENABLED", "true").strip().lower() in {"1","true","yes","y","on"}
     d["nxt_eod_hold_enabled"] = os.getenv("NXT_EOD_HOLD_ENABLED", "true").strip().lower() in {"1","true","yes","y","on"}
     d["nxt_eod_persistence"] = "LOCAL_BEST_EFFORT"
@@ -5468,7 +5835,7 @@ class Handler(BaseHTTPRequestHandler):
 <title>ALPHA500 LS Cluster Radar</title>
 <style>
 :root{color-scheme:dark;--bg:#07111f;--card:#0e1b2d;--line:#20324a;--txt:#eef5ff;--muted:#92a9c5;--ok:#36d399;--warn:#fbbf24;--bad:#fb7185;--accent:#60a5fa;--cyan:#67e8f9}
-*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#07111f,#091525);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1400px;margin:auto;padding:16px}.top{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}.title{font-size:22px;font-weight:850}.sub{color:var(--muted);font-size:12px;margin-top:4px}.grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:9px;margin:14px 0}.card{background:rgba(14,27,45,.94);border:1px solid var(--line);border-radius:14px;padding:12px}.k{color:var(--muted);font-size:11px}.v{font-size:17px;font-weight:850;margin-top:6px;word-break:break-word}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.cyan{color:var(--cyan)}button{background:var(--accent);border:0;border-radius:10px;padding:10px 14px;font-weight:850;color:#06111f}.progress{height:10px;background:#14233a;border-radius:999px;overflow:hidden;margin-top:8px}.bar{height:100%;width:0;background:linear-gradient(90deg,#60a5fa,#36d399);transition:width .3s}.phase{font-size:13px;color:var(--muted);margin-top:7px}.section{margin-top:16px}.section h2{font-size:17px;margin:0 0 8px}.note{font-size:12px;color:var(--muted);margin:6px 0}.tablebox{border:1px solid var(--line);border-radius:12px;overflow:auto;background:#07101d}.historybox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}table{width:100%;border-collapse:collapse;min-width:1000px;font-size:12px}th{position:sticky;top:0;background:#122139;color:#b9cbe1;z-index:2;text-align:right;padding:9px 8px;border-bottom:1px solid var(--line);white-space:nowrap}td{text-align:right;padding:9px 8px;border-bottom:1px solid #13233a;white-space:nowrap}th.left,td.left{text-align:left}tr:hover td{background:#0c1b2e}.pos{color:#fb7185}.neg{color:#60a5fa}.up{color:#36d399;font-weight:800}.down{color:#fb7185;font-weight:800}.badge{padding:3px 7px;border-radius:999px;background:#162843}.empty{padding:18px;color:var(--muted)}.sectorMain td{border-bottom:0}.sectorReps td{padding:2px 8px 6px;border-bottom:1px solid #13233a;background:#081421}.sectorRepList{display:flex;gap:10px;align-items:center;overflow:hidden;white-space:nowrap;font-size:8px;line-height:1.15;color:#7f98b8;font-variant-numeric:tabular-nums}.sectorRepItem{display:inline-flex;gap:3px;align-items:center;min-width:0}.sectorRepName{color:#a9bdd5;font-weight:700}.sectorRepPrice{color:#7891b0}.summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.sbox{background:#0b1727;border:1px solid var(--line);border-radius:10px;padding:10px}.snum{font-weight:850;font-size:18px}.foot{color:var(--muted);font-size:11px;margin-top:14px}.stickytime{font-variant-numeric:tabular-nums}.livecard{grid-column:span 3;min-width:0}.livecols,.candidateNoteGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;min-width:0}.livecols{margin-top:6px;min-height:42px}.livecell,.noteCell{min-width:0;border:1px solid #1a2b43;background:#0a1727;border-radius:8px;padding:6px 8px;overflow:hidden}.liveLabel,.noteLabel{display:block;color:var(--muted);font-size:10px;margin-bottom:2px}.liveValue,.noteValue{display:block;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.counterCard .v{font-variant-numeric:tabular-nums;font-size:20px}.historyMeta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin:6px 0}.historyMeta b{color:#cbd8e8}.candidateNoteGrid{min-height:48px;margin:6px 0}.candidateNoteGrid .noteValue{font-size:11px;color:#cbd8e8}#candidateTable{min-width:1480px}#candidateTable td{overflow:hidden;text-overflow:ellipsis}#candidateTable th:nth-child(1){width:70px}#candidateTable th:nth-child(2){width:130px}#candidateTable th:nth-child(3){width:90px}#candidateTable th:nth-child(4){width:80px}#candidateTable th:nth-child(5){width:90px}#candidateTable th:nth-child(6){width:80px}#candidateTable th:nth-child(7){width:75px}#candidateTable th:nth-child(8){width:70px}#candidateTable th:nth-child(9){width:130px}#candidateTable th:nth-child(10){width:150px}#candidateTable th:nth-child(11){width:80px}#candidateTable th:nth-child(12){width:90px}.vdMeta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin:6px 0}.vdState{display:inline-block;padding:3px 7px;border-radius:999px;background:#162843;font-weight:800}.vdHot{color:#36d399}.vdWarm{color:#67e8f9}.vdPause{color:#fbbf24}.vdBad{color:#fb7185}.vdAction{display:inline-block;padding:3px 7px;border-radius:999px;background:#162843;font-weight:800}.vdActionEntry{color:#36d399}.vdActionWait{color:#fbbf24}.vdActionExit{color:#fb7185}.vdComment{white-space:normal;min-width:330px;max-width:520px;line-height:1.35;color:#cbd8e8}#vdTable{min-width:1320px}#vdHistoryTable{min-width:1650px}.vdHistoryBox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}.scorecardbox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}#scorecardTable{min-width:1320px}.scoreWin{color:#fb7185;font-weight:800}.scoreLoss{color:#60a5fa;font-weight:800}.scoreFlat{color:#fbbf24;font-weight:800}.repSupplement{color:#fbbf24;font-size:9px;margin-left:2px}.evidenceSup{color:#fbbf24}.evidenceBad{color:#fb7185}.sectorSourceStrong{color:#cbd8e8;font-weight:700}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#07111f,#091525);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1400px;margin:auto;padding:16px}.top{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}.title{font-size:22px;font-weight:850}.sub{color:var(--muted);font-size:12px;margin-top:4px}.grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:9px;margin:14px 0}.card{background:rgba(14,27,45,.94);border:1px solid var(--line);border-radius:14px;padding:12px}.k{color:var(--muted);font-size:11px}.v{font-size:17px;font-weight:850;margin-top:6px;word-break:break-word}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.cyan{color:var(--cyan)}button{background:var(--accent);border:0;border-radius:10px;padding:10px 14px;font-weight:850;color:#06111f}.progress{height:10px;background:#14233a;border-radius:999px;overflow:hidden;margin-top:8px}.bar{height:100%;width:0;background:linear-gradient(90deg,#60a5fa,#36d399);transition:width .3s}.phase{font-size:13px;color:var(--muted);margin-top:7px}.section{margin-top:16px}.section h2{font-size:17px;margin:0 0 8px}.note{font-size:12px;color:var(--muted);margin:6px 0}.tablebox{border:1px solid var(--line);border-radius:12px;overflow:auto;background:#07101d}.historybox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}table{width:100%;border-collapse:collapse;min-width:1000px;font-size:12px}th{position:sticky;top:0;background:#122139;color:#b9cbe1;z-index:2;text-align:right;padding:9px 8px;border-bottom:1px solid var(--line);white-space:nowrap}td{text-align:right;padding:9px 8px;border-bottom:1px solid #13233a;white-space:nowrap}th.left,td.left{text-align:left}tr:hover td{background:#0c1b2e}.pos{color:#fb7185}.neg{color:#60a5fa}.up{color:#36d399;font-weight:800}.down{color:#fb7185;font-weight:800}.badge{padding:3px 7px;border-radius:999px;background:#162843}.empty{padding:18px;color:var(--muted)}.sectorMain td{border-bottom:0}.sectorReps td{padding:2px 8px 6px;border-bottom:1px solid #13233a;background:#081421}.sectorRepList{display:flex;gap:10px;align-items:center;overflow:hidden;white-space:nowrap;font-size:8px;line-height:1.15;color:#7f98b8;font-variant-numeric:tabular-nums}.sectorRepItem{display:inline-flex;gap:3px;align-items:center;min-width:0}.sectorRepName{color:#a9bdd5;font-weight:700}.sectorRepPrice{color:#7891b0}.summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.sbox{background:#0b1727;border:1px solid var(--line);border-radius:10px;padding:10px}.snum{font-weight:850;font-size:18px}.foot{color:var(--muted);font-size:11px;margin-top:14px}.stickytime{font-variant-numeric:tabular-nums}.livecard{grid-column:span 3;min-width:0}.livecols,.candidateNoteGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;min-width:0}.livecols{margin-top:6px;min-height:42px}.livecell,.noteCell{min-width:0;border:1px solid #1a2b43;background:#0a1727;border-radius:8px;padding:6px 8px;overflow:hidden}.liveLabel,.noteLabel{display:block;color:var(--muted);font-size:10px;margin-bottom:2px}.liveValue,.noteValue{display:block;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.counterCard .v{font-variant-numeric:tabular-nums;font-size:20px}.historyMeta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin:6px 0}.historyMeta b{color:#cbd8e8}.candidateNoteGrid{min-height:48px;margin:6px 0}.candidateNoteGrid .noteValue{font-size:11px;color:#cbd8e8}#candidateTable{min-width:1480px}#candidateTable td{overflow:hidden;text-overflow:ellipsis}#candidateTable th:nth-child(1){width:70px}#candidateTable th:nth-child(2){width:130px}#candidateTable th:nth-child(3){width:90px}#candidateTable th:nth-child(4){width:80px}#candidateTable th:nth-child(5){width:90px}#candidateTable th:nth-child(6){width:80px}#candidateTable th:nth-child(7){width:75px}#candidateTable th:nth-child(8){width:70px}#candidateTable th:nth-child(9){width:130px}#candidateTable th:nth-child(10){width:150px}#candidateTable th:nth-child(11){width:80px}#candidateTable th:nth-child(12){width:90px}.vdMeta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin:6px 0}.vdState{display:inline-block;padding:3px 7px;border-radius:999px;background:#162843;font-weight:800}.vdHot{color:#36d399}.vdWarm{color:#67e8f9}.vdPause{color:#fbbf24}.vdBad{color:#fb7185}.vdAction{display:inline-block;padding:3px 7px;border-radius:999px;background:#162843;font-weight:800}.vdActionEntry{color:#36d399}.vdActionWait{color:#fbbf24}.vdActionExit{color:#fb7185}.vdComment{white-space:normal;min-width:330px;max-width:520px;line-height:1.35;color:#cbd8e8}#vdTable{min-width:1320px}#vdHistoryTable{min-width:1650px}.vdHistoryBox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}.scorecardbox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}#scorecardTable{min-width:1320px}.scoreWin{color:#fb7185;font-weight:800}.scoreLoss{color:#60a5fa;font-weight:800}.scoreFlat{color:#fbbf24;font-weight:800}.repSupplement{color:#fbbf24;font-size:9px;margin-left:2px}.evidenceSup{color:#fbbf24}.evidenceBad{color:#fb7185}.sectorSourceStrong{color:#cbd8e8;font-weight:700}.actionBadge{display:inline-block;padding:4px 8px;border-radius:999px;font-weight:900}.actionBuy{color:#36d399;background:#102b26}.actionClose{color:#67e8f9;background:#0d2b33}.actionException{color:#c084fc;background:#261a36}.actionWait{color:#fbbf24;background:#302710}.actionNo{color:#fb7185;background:#321621}.gatePass{color:#36d399;font-weight:800}.gateFail{color:#fb7185;font-weight:800}#independentLeaderTable{min-width:1500px}#independentLeaderHistoryTable{min-width:1850px}#independentLeaderScorecardTable{min-width:1320px}#candidateTable{min-width:1750px}
 @media(max-width:900px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.livecard{grid-column:1/-1}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.v{font-size:15px}.wrap{padding:12px}.historybox{height:620px;max-height:620px}.vdHistoryBox{height:620px;max-height:620px}.scorecardbox{height:620px;max-height:620px}}
 </style></head>
 <body><div class="wrap">
@@ -5489,12 +5856,16 @@ class Handler(BaseHTTPRequestHandler):
 <div class="card"><div id="progressText" class="v" style="font-size:15px">-</div><div class="progress"><div id="bar" class="bar"></div></div><div id="progressMsg" class="phase">-</div></div>
 
 <div class="section"><h2>판정 요약</h2><div id="summary" class="summary"></div></div>
-<div class="section"><h2>현재 후보 · 실시간 현재가/등락률/진입가</h2><div id="candidateNote" class="note candidateNoteGrid"><div class="noteCell"><span class="noteLabel">후보상태</span><span id="candidateStatus" class="noteValue">-</span></div><div class="noteCell"><span class="noteLabel">현재가 갱신</span><span id="candidateLive" class="noteValue">-</span></div><div class="noteCell"><span class="noteLabel">실시간 재선정</span><span id="candidateRank" class="noteValue">-</span></div></div><div class="tablebox"><table id="candidateTable"><thead><tr><th>실시간순위</th><th class="left">종목</th><th>현재가</th><th>등락률</th><th>진입가</th><th>추천점수</th><th>통합점수</th><th>딥점수</th><th>등급</th><th class="left">에너지군</th><th>에너지</th><th>Δ에너지</th><th>순위이동</th><th>에너지방향</th><th>상태</th></tr></thead><tbody id="candidates"></tbody></table></div></div>
+<div class="section"><h2>오늘 행동 · 언제 무엇을 살지</h2><div id="actionSummary" class="summary"></div><div class="note"><b>장중 지금매수</b>: FINAL + Deep≥72 + UP_START/REVERSAL_ARMED + S2/S3 + 에너지 비하락 + RE_ACCEL/STEADY_REACCEL · <b>KRX 종가매수</b>: 15:20 사전스캔 → Full Scan 재확인 → 15:27 판정, 점수≥72 · <b>NXT 종가매수</b>: 19:20 사전스캔 → 19:30 판정, 점수≥72 · 65~71.9는 대기 · 조건 미달/DECAY/FALLING은 매수금지</div></div>
+<div class="section"><h2>현재 후보 · 실시간 현재가/등락률/진입가</h2><div id="candidateNote" class="note candidateNoteGrid"><div class="noteCell"><span class="noteLabel">후보상태</span><span id="candidateStatus" class="noteValue">-</span></div><div class="noteCell"><span class="noteLabel">현재가 갱신</span><span id="candidateLive" class="noteValue">-</span></div><div class="noteCell"><span class="noteLabel">실시간 재선정</span><span id="candidateRank" class="noteValue">-</span></div></div><div class="tablebox"><table id="candidateTable"><thead><tr><th>실시간순위</th><th>최종행동</th><th class="left">종목</th><th>현재가</th><th>등락률</th><th>진입가</th><th>추천점수</th><th>통합점수</th><th>딥점수</th><th>등급</th><th class="left">에너지군</th><th>에너지</th><th>Δ에너지</th><th>순위이동</th><th>에너지방향</th><th>상태</th><th class="left">행동근거</th></tr></thead><tbody id="candidates"></tbody></table></div></div>
 <div class="section"><h2>가격·거래량 독립 레이더 <span id="vdStamp" class="sub"></span></h2><div class="note">외국인·기관·뉴스·섹터점수 없이 LS 가격·거래량만 사용합니다. STEADY_REACCEL &gt; RE_ACCEL &gt; STEADY_UP &gt; ACCEL 순으로 표시합니다. 신호가는 같은 상태가 유지되는 동안 최초 발생가로 고정됩니다.</div><div class="vdMeta"><div class="noteCell"><span class="noteLabel">추적</span><span id="vdTracked" class="noteValue">0</span></div><div class="noteCell"><span class="noteLabel">활성</span><span id="vdActive" class="noteValue">0</span></div><div class="noteCell"><span class="noteLabel">진입후보</span><span id="vdEntry" class="noteValue">0</span></div><div class="noteCell"><span class="noteLabel">상태</span><span id="vdStatus" class="noteValue">대기</span></div></div><div class="tablebox"><table id="vdTable"><thead><tr><th>순위</th><th>상태</th><th class="left">종목</th><th>신호가</th><th>현재가</th><th>등락률</th><th>점수</th><th>VOLx</th><th>IVOLx</th><th>거래가속</th><th>가격속도</th><th>완만상승</th><th>30분기울기</th><th>1분봉수</th><th>판정</th><th class="left">에너지군</th></tr></thead><tbody id="volumeDirection"></tbody></table></div></div>
 <div class="section"><h2>가격·거래량 독립레이더 발생기록부 <span id="vdHistCount" class="note"></span></h2><div class="historyMeta"><span><b>최근 20행 높이 고정</b> · 최대 200건 서버 영구기록 · 상태 전환 시 신호발생가/행동판정 고정 · 나머지 내부 스크롤</span><span id="vdHistPersist">서버기록 대기</span></div><div class="vdHistoryBox"><table id="vdHistoryTable"><thead><tr><th class="left">발생시각 KST</th><th>거래소</th><th>횟수</th><th>상태</th><th class="left">종목</th><th>신호발생가</th><th>발생등락률</th><th>점수</th><th>VOLx</th><th>IVOLx</th><th>거래가속</th><th>가격속도</th><th>완만점수</th><th>판정</th><th class="left">코멘트</th><th class="left">에너지군</th></tr></thead><tbody id="vdHistory"></tbody></table></div></div>
 <div class="section"><h2>전략 앵커센서</h2><div class="note">에너지군 순위에는 포함하지 않고 대형주 방향 확인용으로만 사용합니다.</div><div class="tablebox"><table><thead><tr><th class="left">앵커군</th><th class="left">종목</th><th>현재가</th><th>등락률</th><th>시장RS</th><th>체결강도</th></tr></thead><tbody id="anchorSensors"></tbody></table></div></div>
 <div class="section"><h2>섹터 에너지 변화 · 자금 이동도 <span id="sectorLiveStamp" class="sub"></span></h2><div id="sectorSourceNote" class="note"><span class="sectorSourceStrong">실제 30개 에너지군 전체 추적</span> · 최소 3개·목표 5개 · 부족 시 MICRO→SECTOR→MEGA 순 보강(0.55) · 직1 최고 S2/직2 최고 S3 · KRX/NXT 절대 분리</div><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">에너지 군집</th><th>상태</th><th>에너지</th><th>Δ에너지</th><th>순위이동</th><th>Breadth</th><th>평균등락</th><th>시장RS</th><th>거래가속</th><th>판정표본</th></tr></thead><tbody id="sectors"></tbody></table></div></div>
-<div class="section"><h2>종가배팅 · 15:30 KRX / 19:30 NXT</h2><div class="note">상승에너지 주력 80% + 독립선도주 예외 최대 20% · 큰 군집은 전체 500종목 풀의 MICRO 자금가속 확인 · 강제충원 없음</div><h3>15:30 KRX CLOSE-BET <span id="krxCloseBetStamp" class="sub"></span></h3><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">종목</th><th>가격</th><th>등락률</th><th>점수</th><th>트랙</th><th>에너지</th><th>ΔE</th><th class="left">MICRO</th><th>딥</th><th>체결강도</th><th>데이터</th><th class="left">근거</th></tr></thead><tbody id="krxCloseBet"></tbody></table></div><h3>19:30 NXT CLOSE-BET <span id="nxtCloseBetStamp" class="sub"></span></h3><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">종목</th><th>NXT가격</th><th>등락률</th><th>점수</th><th>트랙</th><th>에너지</th><th>ΔE</th><th class="left">MICRO</th><th>딥</th><th>KRX대비</th><th>데이터</th><th class="left">근거</th></tr></thead><tbody id="nxtCloseBet"></tbody></table></div></div>
+<div class="section"><h2>종가배팅 · KRX 15:27 / NXT 19:30</h2><div class="note">상승에너지 주력 80% + 독립선도주 예외 최대 20% · <b>점수 72 이상만 실제 매수</b> · 65~71.9 대기 · 65 미만 매수금지 · Full Scan 미완료는 INVALID</div><h3>15:27 KRX CLOSE-BET <span id="krxCloseBetStamp" class="sub"></span></h3><div class="tablebox"><table><thead><tr><th>순위</th><th>행동</th><th class="left">종목</th><th>가격</th><th>등락률</th><th>점수</th><th>트랙</th><th>에너지</th><th>ΔE</th><th class="left">MICRO</th><th>딥</th><th>체결강도</th><th>데이터</th><th class="left">근거/탈락사유</th></tr></thead><tbody id="krxCloseBet"></tbody></table></div><h3>19:30 NXT CLOSE-BET <span id="nxtCloseBetStamp" class="sub"></span></h3><div class="tablebox"><table><thead><tr><th>순위</th><th>행동</th><th class="left">종목</th><th>NXT가격</th><th>등락률</th><th>점수</th><th>트랙</th><th>에너지</th><th>ΔE</th><th class="left">MICRO</th><th>딥</th><th>KRX대비</th><th>데이터</th><th class="left">근거/탈락사유</th></tr></thead><tbody id="nxtCloseBet"></tbody></table></div></div>
+<div class="section"><h2>독립선도주 판정테이블</h2><div class="note">섹터가 아직 강하지 않아도 종목 자체가 먼저 움직이는 경우만 별도 판정합니다. 필수: 비대칭RS SUPER/STRONG + Deep≥72 + Market RS≥62 + Deep 검증 + 가격·거래량 재가속. FALLING ΔE≤-2 또는 S5/DECAY/REJECT는 차단합니다.</div><div class="tablebox"><table id="independentLeaderTable"><thead><tr><th>순위</th><th>최종판정</th><th class="left">종목</th><th>Deep</th><th>Deep검증</th><th>비대칭RS</th><th>MarketRS</th><th>가격·거래량</th><th>ΔE</th><th>에너지방향</th><th>섹터상태</th><th>통과</th><th>선도점수</th><th class="left">미충족/차단 이유</th></tr></thead><tbody id="independentLeaders"></tbody></table></div></div>
+<div class="section"><h2>독립선도주 발생기록부 <span id="indLeaderHistCount" class="note"></span></h2><div class="historyMeta"><span><b>화면 20행 고정</b> · 최대 200건 서버기록 · 최초발생/상태전환/재진입/해제를 별도 기록 · 예외매수 재발생 횟수 누적</span><span id="indLeaderHistPersist">서버기록 대기</span></div><div class="historybox"><table id="independentLeaderHistoryTable"><thead><tr><th class="left">발생시각 KST</th><th>거래소</th><th>이벤트</th><th>발생횟수</th><th>상태</th><th class="left">종목</th><th>최초신호가</th><th>최근신호가</th><th>현재가</th><th>신호대비수익률</th><th>Deep</th><th>검증</th><th>비대칭RS</th><th>MarketRS</th><th>가격·거래량</th><th>ΔE</th><th>통과</th><th class="left">행동/해제사유</th></tr></thead><tbody id="independentLeaderHistory"></tbody></table></div></div>
+<div class="section"><h2>독립선도주 전용 성적표 <span id="indLeaderScoreCount" class="note"></span></h2><div class="note">실제 <b>예외매수</b>로 발생한 신호만 성적에 포함합니다. 신호가격은 발생 순간 고정하며, 이후 실제 거래일 관측 순서로 +1일/+3일/+5일 수익률을 자동 확정합니다.</div><div id="indLeaderScoreSummary" class="summary"></div><div class="scorecardbox"><table id="independentLeaderScorecardTable"><thead><tr><th class="left">신호시각 KST</th><th>거래소</th><th>발생횟수</th><th class="left">종목</th><th>신호가</th><th>현재가</th><th>현재수익률</th><th>+1거래일</th><th>+3거래일</th><th>+5거래일</th><th>Deep</th><th>비대칭RS</th><th>MarketRS</th><th class="left">에너지군</th><th>평가가격</th></tr></thead><tbody id="independentLeaderScorecard"></tbody></table></div></div>
 <div class="section"><h2>신호 기록부 <span id="histCount" class="note"></span></h2><div class="historyMeta"><span><b>화면 20행 고정</b> · 최대 200건 내부 스크롤</span><span id="histPersist">브라우저백업 대기</span></div><div class="historybox"><table><thead><tr><th class="left">선정시각 KST</th><th>거래소</th><th>세션</th><th>횟수</th><th>구분</th><th class="left">종목</th><th>현재가</th><th>현재등락률</th><th>진입가</th><th>딥점수</th><th>등급</th><th class="left">에너지군</th><th>에너지</th><th>상태</th></tr></thead><tbody id="history"></tbody></table></div></div>
 <div class="foot">08:00 NXT PRE에서 당일 첫 판정을 시작합니다. KRX와 NXT의 가격·과거봉·섹터에너지 캐시는 서로 분리되며 통합(U) 시세는 사용하지 않습니다. 진입가는 판정 시점 신호 기준가입니다.</div>
 <div class="section"><h2>신호발생가 대비 수익률 성적표 <span id="scorecardCount" class="note"></span></h2><div class="note">신호 기록부의 최초 진입가를 신호발생가로 고정하고, 현재가 대비 수익률을 실시간 재계산합니다. LIVE 시세가 없으면 마지막 판정 스냅샷 가격을 사용하며 별도 표기합니다.</div><div id="scorecardSummary" class="summary"></div><div class="historyMeta"><span><b>최대 200건</b> · 수익률 = (현재가 ÷ 신호발생가 - 1) × 100</span><span id="scorecardSource">평가 대기</span></div><div class="scorecardbox"><table id="scorecardTable"><thead><tr><th class="left">발생시각 KST</th><th>거래소</th><th>횟수</th><th>구분</th><th class="left">종목</th><th>신호발생가</th><th>현재가</th><th>신호대비수익률</th><th>결과</th><th>딥등급</th><th class="left">에너지군</th><th>평가가격</th></tr></thead><tbody id="scorecard"></tbody></table></div></div>
@@ -5505,6 +5876,7 @@ const num=(v,d=0)=>{const n=Number(v);return Number.isFinite(n)?n.toLocaleString
 const pct=v=>{const n=Number(v);return Number.isFinite(n)?((n>0?'+':'')+n.toFixed(2)+'%'):'-'};
 const cls=v=>Number(v)>0?'pos':Number(v)<0?'neg':'';
 const box=(k,v)=>`<div class="sbox"><div class="k">${esc(k)}</div><div class="snum">${esc(v)}</div></div>`;
+function actionBadge(a){const x=String(a||'대기');const c=x==='지금매수'?'actionBuy':x==='종가매수'?'actionClose':x==='예외매수'?'actionException':x==='매수금지'?'actionNo':'actionWait';return `<span class="actionBadge ${c}">${esc(x)}</span>`}
 function mergeHistory(serverRows,venue){const key='ALPHA500_HISTORY_'+String(venue||'KRX').toUpperCase();let local=[];try{local=JSON.parse(localStorage.getItem(key)||'[]');if(!Array.isArray(local))local=[]}catch(e){local=[]}const m=new Map();[...(serverRows||[]),...local].forEach(r=>{const k=[r.selected_at_kst||'',r.symbol||'',r.selection_type||'',r.entry_price||''].join('|');if(!m.has(k))m.set(k,r)});const out=[...m.values()].sort((a,b)=>String(b.selected_at_kst||'').localeCompare(String(a.selected_at_kst||''))).slice(0,200);try{localStorage.setItem(key,JSON.stringify(out))}catch(e){}return out;}
 function clamp(v,a,b){v=Number(v)||0;return Math.max(a,Math.min(b,v))}
 function liveRankScore(r){
@@ -5519,12 +5891,10 @@ function liveRankScore(r){
  return base+0.15*dyn;
 }
 function candidateRows(rows){
- if(!rows?.length)return '<tr><td colspan="15" class="empty left">현재 표시할 후보가 없습니다.</td></tr>';
+ if(!rows?.length)return '<tr><td colspan="17" class="empty left">현재 표시할 후보가 없습니다.</td></tr>';
  const sorted=[...rows].sort((a,b)=>liveRankScore(b)-liveRankScore(a));
- return sorted.map((r,i)=>{const d=Number(r.energy_delta),rm=Number(r.rank_move)||0;const dt=Number.isFinite(d)?((d>0?'+':'')+d.toFixed(1)):'-';const mt=rm>0?'↑'+rm:rm<0?'↓'+Math.abs(rm):'→';const tr=String(r.energy_trend||'UNKNOWN');const tc=tr.startsWith('RISING')?'up':tr==='FALLING'?'down':'';const rec=Number(r.buy_recommendation_score)>0?r.buy_recommendation_score:r.buy_priority_score;return `<tr><td>${i+1}</td><td class="left"><b>${esc(r.name)}</b></td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.entry_price)}</td><td>${num(rec,1)}</td><td>${num(r.integrated_score,1)}</td><td>${num(r.deep_score,1)}</td><td><span class="badge">${esc(r.deep_grade)}</span></td><td class="left">${esc(r.ENERGY_CLUSTER)}</td><td>${num(r.cluster_energy,1)}</td><td class="${Number.isFinite(d)?cls(d):''}">${dt}</td><td class="${rm>0?'up':rm<0?'down':''}">${mt}</td><td class="${tc}">${esc(tr)}</td><td>${esc(r.cluster_state)}</td></tr>`}).join('')
+ return sorted.map((r,i)=>{const d=Number(r.energy_delta),rm=Number(r.rank_move)||0;const dt=Number.isFinite(d)?((d>0?'+':'')+d.toFixed(1)):'-';const mt=rm>0?'↑'+rm:rm<0?'↓'+Math.abs(rm):'→';const tr=String(r.energy_trend||'UNKNOWN');const tc=tr.startsWith('RISING')?'up':tr==='FALLING'?'down':'';const rec=Number(r.buy_recommendation_score)>0?r.buy_recommendation_score:r.buy_priority_score;return `<tr><td>${i+1}</td><td>${actionBadge(r.final_action)}</td><td class="left"><b>${esc(r.name)}</b></td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.entry_price)}</td><td>${num(rec,1)}</td><td>${num(r.integrated_score,1)}</td><td>${num(r.deep_score,1)}</td><td><span class="badge">${esc(r.deep_grade)}</span></td><td class="left">${esc(r.ENERGY_CLUSTER)}</td><td>${num(r.cluster_energy,1)}</td><td class="${Number.isFinite(d)?cls(d):''}">${dt}</td><td class="${rm>0?'up':rm<0?'down':''}">${mt}</td><td class="${tc}">${esc(tr)}</td><td>${esc(r.cluster_state)}</td><td class="left">${esc(r.action_reason||'-')}</td></tr>`}).join('')
 }
-function vdStateClass(s){s=String(s||'');if(s==='STEADY_REACCEL'||s==='RE_ACCEL')return 'vdHot';if(s==='STEADY_UP'||s==='ACCEL')return 'vdWarm';if(s==='PAUSE')return 'vdPause';if(s==='DECAY'||s==='REJECT')return 'vdBad';return ''}
-function vdActionClass(a){a=String(a||'');if(a.includes('무효')||a.includes('청산'))return 'vdActionExit';if(a.includes('진입')&&!a.includes('대기'))return 'vdActionEntry';return 'vdActionWait'}
 function volumeDirectionRows(rows){
  if(!rows?.length)return '<tr><td colspan="16" class="empty left">아직 활성 가격·거래량 신호가 없습니다. 1분봉 누적 후 자동 표시됩니다.</td></tr>';
  return rows.map((r,i)=>`<tr><td>${i+1}</td><td><span class="vdState ${vdStateClass(r.combined_state)}">${esc(r.combined_state)}</span></td><td class="left"><b>${esc(r.name||'종목명확인중')}</b></td><td>${num(r.signal_price)}</td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.score,1)}</td><td>${num(r.volume_ratio,2)}</td><td>${num(r.instant_volume_ratio,2)}</td><td>${num(r.volume_acceleration,2)}</td><td class="${cls(r.price_velocity_pct)}">${pct(r.price_velocity_pct)}</td><td>${num(r.steady_score,1)}</td><td class="${cls(r.steady_slope_pct_per_30m)}">${pct(r.steady_slope_pct_per_30m)}</td><td>${num(r.bars)}</td><td><span class="vdAction ${vdActionClass(r.signal_action)}">${esc(r.signal_action||'-')}</span></td><td class="left">${esc(r.ENERGY_CLUSTER||'-')}</td></tr>`).join('')
@@ -5548,8 +5918,19 @@ function sectorRows(rows){
   return main+sub;
  }).join('')
 }
-function closeBetRows(snap,isNxt){const rows=snap?.candidates||[];if(!rows.length)return '<tr><td colspan="13" class="empty left">적격 종가배팅 후보 없음</td></tr>';return rows.map((r,i)=>{const d=Number(r.energy_delta),md=Number(r.micro_flow_delta);const micro=[r.MICRO_CLUSTER||r.ENERGY_DETAIL||'-',r.micro_flow_state||'-',Number.isFinite(md)?((md>0?'+':'')+md.toFixed(1)):'' ].filter(Boolean).join(' · ');return `<tr><td>${i+1}</td><td class="left"><b>${esc(r.name)}</b></td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.close_bet_score,1)}</td><td>${esc(r.close_bet_lane||'-')}</td><td>${num(r.cluster_energy,1)}</td><td class="${Number.isFinite(d)?cls(d):''}">${Number.isFinite(d)?((d>0?'+':'')+d.toFixed(1)):'-'}</td><td class="left">${esc(micro)}</td><td>${num(r.deep_score,1)}</td><td>${isNxt?(r.nxt_vs_krx_close_pct==null?'-':pct(r.nxt_vs_krx_close_pct)):num(r.trade_strength,0)}</td><td>${esc(r.close_bet_quote_source||snap.data_status||'-')}</td><td class="left">${esc((r.close_bet_reasons||[]).join(' · '))}</td></tr>`}).join('')}
+function closeBetRows(snap,isNxt){
+ if(!snap)return '<tr><td colspan="14" class="empty left">판정 대기</td></tr>';
+ if(snap.decision_status==='INVALID')return `<tr><td colspan="14" class="empty left bad">판정무효(INVALID) · ${esc(snap.invalid_reason||'데이터/스캔 준비 미완료')}</td></tr>`;
+ const buys=snap.candidates||[], waits=snap.near_candidates||[], rejects=snap.rejected_top10||[];let rows=[...buys,...waits];if(!rows.length)rows=rejects.slice(0,10);
+ if(!rows.length)return '<tr><td colspan="14" class="empty left">정상 판정 완료 · 적격 종가매수 없음(NO_BET)</td></tr>';
+ return rows.map((r,i)=>{const d=Number(r.energy_delta),md=Number(r.micro_flow_delta);const micro=[r.MICRO_CLUSTER||r.ENERGY_DETAIL||'-',r.micro_flow_state||'-',Number.isFinite(md)?((md>0?'+':'')+md.toFixed(1)):'' ].filter(Boolean).join(' · ');const why=(r.close_bet_reasons||[]).length?(r.close_bet_reasons||[]).join(' · '):(r.action_reason||((r.close_bet_fail_reasons||[]).join(' · ')));return `<tr><td>${i+1}</td><td>${actionBadge(r.final_action||'매수금지')}</td><td class="left"><b>${esc(r.name)}</b></td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.close_bet_score,1)}</td><td>${esc(r.close_bet_lane||'-')}</td><td>${num(r.cluster_energy,1)}</td><td class="${Number.isFinite(d)?cls(d):''}">${Number.isFinite(d)?((d>0?'+':'')+d.toFixed(1)):'-'}</td><td class="left">${esc(micro)}</td><td>${num(r.deep_score,1)}</td><td>${isNxt?(r.nxt_vs_krx_close_pct==null?'-':pct(r.nxt_vs_krx_close_pct)):num(r.trade_strength,0)}</td><td>${esc(r.close_bet_quote_source||snap.data_status||'-')}</td><td class="left">${esc(why||'-')}</td></tr>`}).join('')
+}
+function independentLeaderRows(rows){if(!rows?.length)return '<tr><td colspan="14" class="empty left">독립선도주 또는 근접 후보 없음</td></tr>';return rows.map((r,i)=>{const d=Number(r.energy_delta);const pass=n=>n?'<span class="gatePass">PASS</span>':'<span class="gateFail">FAIL</span>';return `<tr><td>${i+1}</td><td>${actionBadge(r.independent_status)}</td><td class="left"><b>${esc(r.name||r.symbol)}</b></td><td>${num(r.deep_score,1)}</td><td>${pass(r.independent_verified_ok)}</td><td>${esc(r.asym_rs_class||'-')} ${pass(r.independent_asym_ok)}</td><td>${num(r.market_rs_score,1)} ${pass(r.independent_mrs_ok)}</td><td>${esc(r.volume_direction_state||'-')} ${pass(r.independent_vd_ok)}</td><td class="${Number.isFinite(d)?cls(d):''}">${Number.isFinite(d)?((d>0?'+':'')+d.toFixed(1)):'-'}</td><td>${esc(r.energy_trend||'-')}</td><td>${esc(r.cluster_state||'-')}</td><td>${num(r.independent_pass_count)}/5</td><td>${num(r.independent_score,1)}</td><td class="left">${esc(r.independent_reason||'-')}</td></tr>`}).join('')}
 function historyRows(rows){if(!rows?.length)return '<tr><td colspan="14" class="empty left">아직 선정 히스토리가 없습니다.</td></tr>';return rows.slice(0,200).map(r=>`<tr><td class="left">${esc(r.selected_at_kst||'-')}</td><td>${esc(r.venue||'-')}</td><td>${esc(r.session||'-')}</td><td>${num(r.occurrence)}</td><td>${esc(r.selection_type)}</td><td class="left"><b>${esc(r.name)}</b></td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.entry_price)}</td><td>${num(r.deep_score,1)}</td><td>${esc(r.deep_grade)}</td><td class="left">${esc(r.ENERGY_CLUSTER)}</td><td>${num(r.cluster_energy,1)}</td><td>${esc(r.cluster_state)}</td></tr>`).join('')}
+function independentLeaderHistoryRows(rows){const a=(rows||[]).slice(0,200);if(!a.length)return '<tr><td colspan="18" class="empty left">아직 독립선도주 발생기록이 없습니다.</td></tr>';return a.map(r=>{const ret=Number(r.current_return_pct),rc=Number.isFinite(ret)?(ret>0?'scoreWin':ret<0?'scoreLoss':'scoreFlat'):'';const d=Number(r.energy_delta);return `<tr><td class="left">${esc(r.event_at_kst||'-')}</td><td>${esc(r.venue||'-')}</td><td>${esc(r.event_type||'-')}</td><td>${num(r.occurrence)}</td><td>${actionBadge(r.independent_status)}</td><td class="left"><b>${esc(r.name||r.symbol||'-')}</b></td><td>${num(r.first_signal_price)}</td><td>${num(r.latest_signal_price)}</td><td>${num(r.current_price)}</td><td class="${rc}">${Number.isFinite(ret)?pct(ret):'-'}</td><td>${num(r.deep_score,1)}</td><td>${r.deep_verified?'<span class="gatePass">PASS</span>':'-'}</td><td>${esc(r.asym_rs_class||'-')}</td><td>${num(r.market_rs_score,1)}</td><td>${esc(r.volume_direction_state||'-')}</td><td class="${Number.isFinite(d)?cls(d):''}">${Number.isFinite(d)?((d>0?'+':'')+d.toFixed(1)):'-'}</td><td>${r.independent_pass_count==null?'-':num(r.independent_pass_count)+'/5'}</td><td class="left">${esc(r.reason||'-')}</td></tr>`}).join('')}
+function independentLeaderSignalRows(rows){const a=(rows||[]).filter(r=>r?.is_exception_signal).slice(0,200);if(!a.length)return '<tr><td colspan="15" class="empty left">아직 예외매수 확정 신호가 없습니다.</td></tr>';return a.map(r=>{const ret=Number(r.current_return_pct),rc=Number.isFinite(ret)?(ret>0?'scoreWin':ret<0?'scoreLoss':'scoreFlat'):'';return `<tr><td class="left">${esc(r.event_at_kst||'-')}</td><td>${esc(r.venue||'-')}</td><td>${num(r.occurrence)}</td><td class="left"><b>${esc(r.name||r.symbol||'-')}</b></td><td>${num(r.signal_price)}</td><td>${num(r.current_price)}</td><td class="${rc}">${Number.isFinite(ret)?pct(ret):'-'}</td><td>${r.return_1d==null?'-':pct(r.return_1d)}</td><td>${r.return_3d==null?'-':pct(r.return_3d)}</td><td>${r.return_5d==null?'-':pct(r.return_5d)}</td><td>${num(r.deep_score,1)}</td><td>${esc(r.asym_rs_class||'-')}</td><td>${num(r.market_rs_score,1)}</td><td class="left">${esc(r.ENERGY_CLUSTER||'-')}</td><td>${esc(r.price_source||'-')}</td></tr>`}).join('')}
+function leaderMetric(rows,key){const a=(rows||[]).filter(r=>r?.is_exception_signal&&Number.isFinite(Number(r[key]))).map(r=>Number(r[key]));if(!a.length)return {n:0,win:null,avg:null};const w=a.filter(x=>x>0).length,l=a.filter(x=>x<0).length;return {n:a.length,win:(w+l)?100*w/(w+l):null,avg:a.reduce((z,x)=>z+x,0)/a.length}}
+function independentLeaderScoreSummaryHtml(rows){const sig=(rows||[]).filter(r=>r?.is_exception_signal);const cur=leaderMetric(sig,'current_return_pct'),d1=leaderMetric(sig,'return_1d'),d3=leaderMetric(sig,'return_3d'),d5=leaderMetric(sig,'return_5d');const f=m=>m.n?`${m.win==null?'-':m.win.toFixed(1)+'%'} · 평균 ${pct(m.avg)} · n=${m.n}`:'평가대기';return box('예외매수 신호',`${sig.length}/200`)+box('현재 승률·평균',f(cur))+box('+1거래일',f(d1))+box('+3거래일',f(d3))+box('+5거래일',f(d5))}
 function scorecardEval(rows){return (rows||[]).slice(0,200).map(r=>{const ep=Number(r.entry_price),cp=Number(r.current_price);if(!(Number.isFinite(ep)&&ep>0&&Number.isFinite(cp)&&cp>0))return {...r,scorecard_return:null,scorecard_result:'평가대기'};const ret=(cp/ep-1)*100;return {...r,scorecard_return:ret,scorecard_result:ret>0?'수익':ret<0?'손실':'보합'};})}
 function scorecardRows(rows){const a=scorecardEval(rows);if(!a.length)return '<tr><td colspan="12" class="empty left">아직 평가할 신호가 없습니다.</td></tr>';return a.map(r=>{const ret=r.scorecard_return;const rc=ret>0?'scoreWin':ret<0?'scoreLoss':'scoreFlat';const src=r.live_quote?(r.live_source||'LIVE'):'SCAN_SNAPSHOT';return `<tr><td class="left">${esc(r.selected_at_kst||'-')}</td><td>${esc(r.venue||'-')}</td><td>${num(r.occurrence)}</td><td>${esc(r.selection_type||'-')}</td><td class="left"><b>${esc(r.name||'-')}</b></td><td>${num(r.entry_price)}</td><td>${num(r.current_price)}</td><td class="${rc}">${ret==null?'-':pct(ret)}</td><td class="${rc}">${esc(r.scorecard_result)}</td><td>${esc(r.deep_grade||'-')}</td><td class="left">${esc(r.ENERGY_CLUSTER||'-')}</td><td>${esc(src)}</td></tr>`}).join('')}
 function scorecardSummaryHtml(rows){const a=scorecardEval(rows).filter(r=>Number.isFinite(r.scorecard_return));const n=a.length,w=a.filter(r=>r.scorecard_return>0).length,l=a.filter(r=>r.scorecard_return<0).length,f=n-w-l;const decided=w+l;const winRate=decided?100*w/decided:null;const avg=n?a.reduce((z,r)=>z+r.scorecard_return,0)/n:null;const best=n?Math.max(...a.map(r=>r.scorecard_return)):null;const worst=n?Math.min(...a.map(r=>r.scorecard_return)):null;return box('평가건수',`${n}/200`)+box('수익 / 보합 / 손실',`${w} / ${f} / ${l}`)+box('승률',winRate==null?'-':winRate.toFixed(1)+'%')+box('평균수익률',avg==null?'-':pct(avg))+box('최고 / 최저',n?`${pct(best)} / ${pct(worst)}`:'-')}
@@ -5587,7 +5968,8 @@ async function refresh(){
   document.getElementById('sectors').innerHTML=sectorRows(r.sector_energy||r.top_clusters||[]);
   const sls=document.getElementById('sectorLiveStamp');if(sls)sls.textContent=`· ${r.sector_display_venue||r.venue||'-'} · ${r.sector_display_source||r.live_sector_source||'SNAPSHOT'}${r.sector_display_updated_kst?' · '+r.sector_display_updated_kst:''}`;
   const ssn=document.getElementById('sectorSourceNote');if(ssn)ssn.textContent=r.sector_display_note||'KRX/NXT 데이터 분리';
-  const kb=r.close_bet_krx||null,nb=r.close_bet_nxt||null;document.getElementById('krxCloseBet').innerHTML=closeBetRows(kb,false);document.getElementById('nxtCloseBet').innerHTML=closeBetRows(nb,true);document.getElementById('krxCloseBetStamp').textContent=kb?`· ${kb.captured_at_kst||'-'} · ${kb.data_status||'-'}`:'· 대기';document.getElementById('nxtCloseBetStamp').textContent=nb?`· ${nb.captured_at_kst||'-'} · ${nb.data_status||'-'}`:'· 대기';
+  const kb=r.close_bet_krx||null,nb=r.close_bet_nxt||null;document.getElementById('krxCloseBet').innerHTML=closeBetRows(kb,false);document.getElementById('nxtCloseBet').innerHTML=closeBetRows(nb,true);document.getElementById('krxCloseBetStamp').textContent=kb?`· ${kb.captured_at_kst||'-'} · ${kb.decision_status||'-'} · ${kb.data_status||'-'}`:'· 대기';document.getElementById('nxtCloseBetStamp').textContent=nb?`· ${nb.captured_at_kst||'-'} · ${nb.decision_status||'-'} · ${nb.data_status||'-'}`:'· 대기';document.getElementById('independentLeaders').innerHTML=independentLeaderRows(r.independent_leaders||[]);const ilh=(r.independent_leader_history||[]).slice(0,200);document.getElementById('independentLeaderHistory').innerHTML=independentLeaderHistoryRows(ilh);document.getElementById('indLeaderHistCount').textContent=`저장 ${ilh.length}/200`;document.getElementById('indLeaderHistPersist').textContent=`서버기록 ${ilh.length}/200`;document.getElementById('independentLeaderScorecard').innerHTML=independentLeaderSignalRows(ilh);document.getElementById('indLeaderScoreSummary').innerHTML=independentLeaderScoreSummaryHtml(ilh);document.getElementById('indLeaderScoreCount').textContent=`예외매수 ${ilh.filter(x=>x?.is_exception_signal).length}건`;
+  const actionRows=show||[];const actions=[...actionRows,...((kb?.candidates)||[]),...((nb?.candidates)||[])];const cnt=a=>actions.filter(x=>x.final_action===a).length;document.getElementById('actionSummary').innerHTML=box('지금매수',cnt('지금매수'))+box('종가매수',cnt('종가매수'))+box('예외매수',cnt('예외매수'))+box('대기',actionRows.filter(x=>x.final_action==='대기').length)+box('매수금지',actionRows.filter(x=>x.final_action==='매수금지').length);
   const serverH=(r.selection_history||[]).slice(0,200),h=mergeHistory(serverH,r.venue);document.getElementById('histCount').textContent=`저장 ${h.length}/200`;document.getElementById('history').innerHTML=historyRows(h);const hp=document.getElementById('histPersist');if(hp)hp.textContent=`브라우저백업 ${h.length}/200 · 서버 ${serverH.length}`;const sc=scorecardEval(h);document.getElementById('scorecard').innerHTML=scorecardRows(h);document.getElementById('scorecardSummary').innerHTML=scorecardSummaryHtml(h);const evalN=sc.filter(x=>Number.isFinite(x.scorecard_return)).length,liveN=sc.filter(x=>Number.isFinite(x.scorecard_return)&&x.live_quote).length;document.getElementById('scorecardCount').textContent=`평가 ${evalN}/${h.length}`;document.getElementById('scorecardSource').textContent=`LIVE ${liveN} · SNAPSHOT ${Math.max(0,evalN-liveN)}`;
  }catch(e){document.getElementById('candidateStatus').textContent='RESULT ERROR';document.getElementById('candidateLive').textContent=String(e);document.getElementById('candidateRank').textContent='-'}
 }
