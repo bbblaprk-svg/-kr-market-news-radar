@@ -17,6 +17,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     FINAL_TOP_N=10 \
     ENERGY_MIN_MEMBERS=3 \
     ENERGY_TARGET_MEMBERS=5 \
+    ENERGY_EXPECTED_CLUSTERS=30 \
+    ENERGY_MOMENTUM_ENABLED=true \
+    ENERGY_RISING_DELTA_MIN=0.35 \
+    ENERGY_STRONG_RISING_DELTA=1.00 \
+    ENERGY_FALLING_DELTA=-0.50 \
+    ENERGY_SUPPLEMENT_MAX_USES=2 \
     AUTO_SCAN=true \
     SCAN_INTERVAL_SECONDS=600 \
     HISTORY_REFRESH_GAP_DAYS=4 \
@@ -54,6 +60,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     CLOSE_BET_POLL_SECONDS=10 \
     CLOSE_BET_MAX_RETURN_PCT=7.0 \
     CLOSE_BET_MIN_RETURN_PCT=-3.0 \
+    CLOSE_BET_RISING_MAIN_RATIO=0.80 \
+    CLOSE_BET_ENERGY_DELTA_MIN=0.35 \
+    CLOSE_BET_BREADTH_MIN=0.55 \
+    CLOSE_BET_EXCEPTION_MAX=1 \
+    CLOSE_BET_MICRO_ENABLED=true \
+    CLOSE_BET_MICRO_LARGE_CLUSTER_MIN=12 \
+    CLOSE_BET_MICRO_SCORE_MIN=52.0 \
+    CLOSE_BET_MICRO_ACCEL_DELTA=2.0 \
     PRECLOSE_RESCAN_ENABLED=true \
     PRECLOSE_RESCAN_TOP_N=60 \
     NXT_EOD_HOLD_ENABLED=true \
@@ -91,7 +105,7 @@ LS KRX master/ranking
  -> 500 Universe (20일 거래대금 고유동성 100 강제편입)
  -> 500종목 경량 Stage1 (Alpha Heikin-Ashi)
  -> KOSPI/KOSDAQ 실시간 지수 + 5D/20D 비대칭 RS
- -> 133개 내외 ENERGY_CLUSTER (163 MICRO_CLUSTER의 소표본 fallback)
+ -> 실제 30개 ENERGY_CLUSTER + 전략 앵커센서 2군 (MICRO/SECTOR 상세태그 보존)
  -> Strong-sector lane 70% + Independent-RS rescue lane 30%
  -> Stage2 70개
  -> LS Deep 30개 (체결강도/외인기관/프로그램)
@@ -718,28 +732,42 @@ class Alpha500Integrated(TwoStageDeepScanner):
         return float(x.iloc[-1] / base) if base and base > 0 else float("nan")
 
     @staticmethod
+    def strategic_anchor_group(name: Any) -> str:
+        """에너지 순위와 분리해 보는 대형 전략 앵커센서."""
+        name = str(name or "").strip()
+        if name in {"SK하이닉스", "SK스퀘어"}:
+            return "SK하이닉스·SK스퀘어"
+        if name in {"삼성전자", "삼성물산"}:
+            return "삼성전자·삼성물산"
+        return ""
+
+    @staticmethod
     def rational_energy_group(name: Any, mega: Any, sector: Any, micro: Any = "", original: Any = "") -> str:
-        """투자자 관점 에너지군. 전략 종목군을 우선하고 지나친 소분류를 병합한다."""
+        """500종목을 실제 30개 자금이동 ENERGY_CLUSTER로 통합한다.
+
+        원칙
+        - 대형 전략 앵커 4종목은 ENERGY 순위에서 제외하고 ANCHOR_SENSOR로 별도 관찰.
+        - 에너지 판정은 지나친 테마세분화보다 자금이 함께 움직이는 실전군을 우선.
+        - 세부 SECTOR/MICRO_CLUSTER는 버리지 않고 종목선별 확대경으로 계속 보존.
+        """
         name = str(name or "").strip()
         mega = str(mega or "").strip()
         sector = str(sector or "").strip()
         micro = str(micro or "").strip()
         original = str(original or "").strip()
 
-        # 1) 사용자가 지정한 전략 앵커군: 종목명 우선
-        if name in {"SK하이닉스", "SK스퀘어"}:
-            return "SK하이닉스·SK스퀘어"
-        if name in {"삼성전자", "삼성물산"}:
-            return "삼성전자·삼성물산"
-        if name == "삼성전기":
-            return "반도체_MLCC"
+        # 전략 앵커는 30개 ENERGY_CLUSTER 계산에서 제외한다.
+        if Alpha500Integrated.strategic_anchor_group(name):
+            return ""
 
-        # 2) 반도체: 공정/테마 기준으로 과도한 세분화를 9개 실전군으로 축약
+        # 반도체 7개 실전 에너지군
+        if name == "삼성전기":
+            return "반도체_기판·유리기판"
+        if name in {"DB하이텍", "가온칩스", "에이디테크놀로지", "코아시아"}:
+            return "반도체_파운드리_생태계"
         if mega == "반도체":
-            if sector == "반도체_PCB_FCBGA_기판":
-                return "반도체_기판"
-            if sector == "반도체_유리기판_TGV":
-                return "반도체_유리기판"
+            if sector in {"반도체_PCB_FCBGA_기판", "반도체_유리기판_TGV"}:
+                return "반도체_기판·유리기판"
             if sector == "반도체_전력반도체_SiC_GaN":
                 return "반도체_전력반도체"
             if sector == "반도체_팹리스_AI_IP_디자인하우스":
@@ -766,48 +794,44 @@ class Alpha500Integrated(TwoStageDeepScanner):
             }:
                 return "반도체_부품소재"
             if sector == "반도체_IDM_메모리_파운드리":
-                return "반도체_파운드리_IDM"
-            return "반도체_기타"
+                return "반도체_파운드리_생태계"
+            return "반도체_부품소재"
 
-        # 3) 나머지 시장: 상관성이 높은 소분류만 합치고 성격이 다른 테마는 유지
+        # 비반도체 23개 실전 에너지군 = 총 30개
         merge = {
-            "AI·로봇": "AI·로봇",
-            "로봇": "AI·로봇",
-            "2차전지 셀·소재": "2차전지_셀·소재",
-            "2차전지": "2차전지_셀·소재",
-            "2차전지 장비·리사이클": "2차전지_장비·리사이클",
-            "의료기기·의료AI": "의료기기·의료AI",
-            "의료기기": "의료기기·의료AI",
-            "인터넷플랫폼": "플랫폼·IT·통신",
-            "IT서비스": "플랫폼·IT·통신",
-            "통신": "플랫폼·IT·통신",
-            "지주": "지주·밸류업",
-            "지주·밸류업": "지주·밸류업",
-            "신재생": "신재생·유틸리티",
-            "유틸리티": "신재생·유틸리티",
-            "게임": "콘텐츠·게임",
-            "엔터·콘텐츠": "콘텐츠·게임",
-            "자동차": "자동차·EV부품",
-            "EV부품": "자동차·EV부품",
-            "전력기기": "전력인프라_기기·전선",
-            "전선": "전력인프라_기기·전선",
-            "건설": "건설·산업재",
-            "산업재": "건설·산업재",
+            "AI·로봇": "AI·로봇", "로봇": "AI·로봇",
+            "바이오": "바이오", "제약": "제약",
+            "의료기기·의료AI": "의료기기·의료AI", "의료기기": "의료기기·의료AI",
+            "전력기기": "전력·신재생인프라", "전선": "전력·신재생인프라",
+            "신재생": "전력·신재생인프라", "유틸리티": "전력·신재생인프라",
+            "원전": "원전",
+            "2차전지 셀·소재": "2차전지", "2차전지": "2차전지", "2차전지 장비·리사이클": "2차전지",
+            "데이터센터": "데이터센터",
+            "방산": "방산·우주항공", "우주": "방산·우주항공",
+            "조선": "조선", "조선기자재": "조선기자재",
+            "화장품": "화장품",
+            "음식료": "소비·유통·음식료", "소비유통": "소비·유통·음식료",
+            "인터넷플랫폼": "플랫폼·콘텐츠·통신", "IT서비스": "플랫폼·콘텐츠·통신",
+            "통신": "플랫폼·콘텐츠·통신", "게임": "플랫폼·콘텐츠·통신", "엔터·콘텐츠": "플랫폼·콘텐츠·통신",
+            "보안": "보안", "양자": "양자",
+            "금융": "금융", "지주": "지주·밸류업", "지주·밸류업": "지주·밸류업",
+            "자동차": "자동차·EV·자율주행", "EV부품": "자동차·EV·자율주행", "자율주행": "자동차·EV·자율주행",
+            "화학정유": "소재·산업재", "철강비철": "소재·산업재", "건설": "소재·산업재", "산업재": "소재·산업재",
+            "운송": "운송",
+            "정치테마": "정책·남북경협", "대북·남북경협": "정책·남북경협",
+            "디스플레이": "디스플레이",
         }
-        if mega in merge:
-            return merge[mega]
-
-        # 충분한 표본을 가진 메가섹터는 그대로 에너지군으로 사용
-        return mega or sector or original or "기타"
+        return merge.get(mega, "기타·신규테마")
 
     def calculate_cluster_energy(self, stage1: pd.DataFrame, data_cache: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """군집 에너지 계산.
 
         객관성 규칙:
+        - 실제 30개 ENERGY_CLUSTER를 모두 추적한다. 전략 앵커 4종목은 별도센서로 분리한다.
         - 직접 구성원이 3개 이상이면 직접 군집을 사용한다.
-        - 1~2개 군집은 동일 MEGA_SECTOR의 대형/유동성 동질 종목을 보강해 최대 5개 표본으로 계산한다.
-        - 보강종목은 직접 구성원보다 0.55 가중치만 부여한다.
-        - 보강 후에도 3개 미만이면 정상 S등급을 부여하지 않고 S? / INSUFFICIENT로 표시한다.
+        - 1~2개가 된 경우에만 MICRO → SECTOR → MEGA 순으로 최대 5개 표본을 보강한다.
+        - 보강종목은 0.55 가중치, 동일 종목의 보강 사용은 기본 최대 2개 군집으로 제한한다.
+        - 직1 보강군은 최고 S2, 직2 보강군은 최고 S3. 3개 미만이면 S? / INSUFFICIENT.
         - KRX/NXT는 이 함수에 들어오기 전에 venue별 stage1으로 이미 분리되어 있다.
         """
         x = stage1.copy()
@@ -820,6 +844,7 @@ class Alpha500Integrated(TwoStageDeepScanner):
         mega = x.get("MEGA_SECTOR", pd.Series("", index=x.index)).astype(str)
         sectors = x.get("SECTOR", pd.Series("", index=x.index)).astype(str)
         micros = x.get("MICRO_CLUSTER", pd.Series("", index=x.index)).astype(str)
+        x["ANCHOR_SENSOR"] = names.map(self.strategic_anchor_group)
         x["ENERGY_CLUSTER"] = [
             self.rational_energy_group(names.loc[i], mega.loc[i], sectors.loc[i], micros.loc[i], x.loc[i, "ENERGY_DETAIL"])
             for i in x.index
@@ -843,38 +868,65 @@ class Alpha500Integrated(TwoStageDeepScanner):
             m = z.mode()
             return str(m.iloc[0]) if not m.empty else str(z.iloc[0])
 
+        supplement_usage: Dict[str, int] = defaultdict(int)
+        supplement_max_uses = max(1, env_int("ENERGY_SUPPLEMENT_MAX_USES", 2))
+
         def _supplement(cluster: str, direct: pd.DataFrame) -> pd.DataFrame:
+            """MICRO → SECTOR → MEGA 순으로만 보강하고 동일 보강주의 과다 재사용을 제한한다."""
             direct = direct.copy()
             direct["_energy_supplemented"] = False
             if len(direct) >= target_members:
                 return direct
             used = set(direct["symbol"].astype(str))
-            anchor_mega = _mode_text(direct, "MEGA_SECTOR")
+            anchor_micro = _mode_text(direct, "MICRO_CLUSTER")
             anchor_sector = _mode_text(direct, "SECTOR")
+            anchor_mega = _mode_text(direct, "MEGA_SECTOR")
             cand = valid[~valid["symbol"].astype(str).isin(used)].copy()
-            # 의미가 가장 가까운 동질군부터: 동일 MEGA → 동일 SECTOR(메가 정보가 빈 경우 보완).
+            if cand.empty:
+                return direct
+            cand["_cap"] = pd.to_numeric(cand.get("market_cap_100m"), errors="coerce").fillna(0.0)
+            cand["_liq"] = pd.to_numeric(cand.get("liquidity_score"), errors="coerce").fillna(0.0)
+            cand["_turn"] = pd.to_numeric(cand.get("turnover_snapshot_million"), errors="coerce").fillna(0.0)
+            cand["_supp_use"] = cand["symbol"].astype(str).map(lambda z: supplement_usage.get(z, 0))
+            cand = cand[cand["_supp_use"] < supplement_max_uses]
+            tiers = []
+            if anchor_micro:
+                tiers.append(cand[cand.get("MICRO_CLUSTER", "").fillna("").astype(str).eq(anchor_micro)])
+            if anchor_sector:
+                tiers.append(cand[cand.get("SECTOR", "").fillna("").astype(str).eq(anchor_sector)])
             if anchor_mega:
-                same = cand[cand.get("MEGA_SECTOR", "").fillna("").astype(str).eq(anchor_mega)].copy()
-            elif anchor_sector:
-                same = cand[cand.get("SECTOR", "").fillna("").astype(str).eq(anchor_sector)].copy()
-            else:
-                same = cand.iloc[0:0].copy()
-            if same.empty:
-                return direct
-            # 보강은 강한 종목만 골라 편향되지 않도록 시총/유동성 우선. 현재 수익률은 정렬 기준에서 제외.
-            same["_cap"] = pd.to_numeric(same.get("market_cap_100m"), errors="coerce").fillna(0.0)
-            same["_liq"] = pd.to_numeric(same.get("liquidity_score"), errors="coerce").fillna(0.0)
-            same["_turn"] = pd.to_numeric(same.get("turnover_snapshot_million"), errors="coerce").fillna(0.0)
-            same = same.sort_values(["_cap", "_liq", "_turn"], ascending=False)
+                tiers.append(cand[cand.get("MEGA_SECTOR", "").fillna("").astype(str).eq(anchor_mega)])
+            additions = []
+            added = set()
             need = max(0, target_members - len(direct))
-            add = same.head(need).copy()
-            if add.empty:
+            for tier in tiers:
+                if need <= 0 or tier.empty:
+                    continue
+                tier = tier[~tier["symbol"].astype(str).isin(used | added)].copy()
+                if tier.empty:
+                    continue
+                tier = tier.sort_values(["_supp_use", "_cap", "_liq", "_turn"], ascending=[True, False, False, False])
+                for _, z in tier.iterrows():
+                    code = str(z.get("symbol", ""))
+                    if not code or code in used or code in added:
+                        continue
+                    additions.append(dict(z))
+                    added.add(code)
+                    supplement_usage[code] += 1
+                    need -= 1
+                    if need <= 0:
+                        break
+            if not additions:
                 return direct
+            add = pd.DataFrame(additions)
             add["_energy_supplemented"] = True
             return pd.concat([direct, add], ignore_index=True, sort=False)
 
+        # 표본이 작은 군집부터 보강 우선권을 준다.
+        group_items = [(str(k), v.copy()) for k, v in valid.groupby("ENERGY_CLUSTER")]
+        group_items.sort(key=lambda kv: (len(kv[1]), kv[0]))
         rows = []
-        for cluster, direct in valid.groupby("ENERGY_CLUSTER"):
+        for cluster, direct in group_items:
             direct = direct.copy()
             g = _supplement(str(cluster), direct)
             direct_n = int(len(direct))
@@ -936,6 +988,13 @@ class Alpha500Integrated(TwoStageDeepScanner):
                 elif energy >= 45: state = "S1"
                 else: state = "S0"
 
+            # 직접표본이 적은 보강군은 과신을 방지한다: 직1 최고 S2, 직2 최고 S3.
+            if sufficient and state not in {"S5", "S?"}:
+                if direct_n <= 1 and state in {"S3", "S4"}:
+                    state = "S2"
+                elif direct_n == 2 and state == "S4":
+                    state = "S3"
+
             reps = []
             # 직접 구성원은 최소 하나 보이게 하고, 나머지는 동일 메가 보강주로 채운다.
             direct_sorted = direct.copy()
@@ -982,10 +1041,100 @@ class Alpha500Integrated(TwoStageDeepScanner):
             return x, cdf
         x = x.merge(cdf.drop(columns=["representatives"], errors="ignore"), on="ENERGY_CLUSTER", how="left")
         x["cluster_rs"] = pd.to_numeric(x["current_return_pct"], errors="coerce") - pd.to_numeric(x["cluster_avg_return"], errors="coerce")
+        expected = max(1, env_int("ENERGY_EXPECTED_CLUSTERS", 30))
+        if len(cdf) != expected:
+            LOG.warning("ENERGY_CLUSTER count=%d expected=%d venue=%s", len(cdf), expected, self.active_venue)
         return x, cdf.sort_values(["cluster_energy", "cluster_rotation"], ascending=False).reset_index(drop=True)
+
+    def attach_energy_momentum(self, stage1: pd.DataFrame, clusters: pd.DataFrame) -> pd.DataFrame:
+        """판정층 전용: 직전 섹터 스냅샷 대비 에너지 상승/하락과 순위 이동을 종목에 부착한다.
+
+        LS REST/WS/과거봉 수집에는 관여하지 않는다. 첫 회차 또는 비교자료가 없으면 UNKNOWN/중립으로 둔다.
+        """
+        x = stage1.copy()
+        enabled = os.getenv("ENERGY_MOMENTUM_ENABLED", "true").strip().lower() in {"1","true","yes","y","on"}
+        prev_path = self.result_dir / f"latest_sector_energy_{self.active_venue}.json"
+        prev_rows = []
+        if enabled:
+            try:
+                if prev_path.exists():
+                    prev_rows = json.loads(prev_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                LOG.warning("energy momentum previous snapshot unavailable: %s", e)
+                prev_rows = []
+        prev_map = {str(z.get("ENERGY_CLUSTER")): z for z in prev_rows if isinstance(z, dict)}
+
+        current_map: Dict[str, Dict[str, Any]] = {}
+        if clusters is not None and not clusters.empty:
+            csort = clusters.sort_values(["cluster_energy", "cluster_rotation"], ascending=False).reset_index(drop=True)
+            rising_min = env_float("ENERGY_RISING_DELTA_MIN", 0.35)
+            strong_min = env_float("ENERGY_STRONG_RISING_DELTA", 1.00)
+            falling_min = env_float("ENERGY_FALLING_DELTA", -0.50)
+            for idx, r in csort.iterrows():
+                cluster = str(r.get("ENERGY_CLUSTER", ""))
+                rank = idx + 1
+                energy = fnum(r.get("cluster_energy"), 0.0)
+                prev = prev_map.get(cluster) or {}
+                has_prev = prev.get("cluster_energy") is not None and prev.get("rank") is not None
+                if has_prev:
+                    delta = round(energy - fnum(prev.get("cluster_energy"), energy), 3)
+                    rank_move = int(fnum(prev.get("rank"), rank)) - rank
+                else:
+                    delta = float("nan")
+                    rank_move = 0
+
+                state = str(r.get("cluster_state", ""))
+                adjustment = 0.0
+                if enabled and has_prev:
+                    adjustment += float(np.clip(delta * 1.35, -8.0, 8.0))
+                    adjustment += float(np.clip(rank_move * 0.85, -5.0, 5.0))
+                    if state in {"S2", "S3"} and delta >= rising_min and rank_move >= 0:
+                        adjustment += 2.0
+                    if state in {"S2", "S3"} and delta >= strong_min and rank_move > 0:
+                        adjustment += 1.5
+                    if delta <= falling_min and rank_move <= 0:
+                        adjustment -= 2.0
+                    adjustment = float(np.clip(adjustment, -12.0, 12.0))
+
+                if not has_prev or not enabled:
+                    trend = "UNKNOWN"
+                elif delta >= strong_min and rank_move > 0:
+                    trend = "RISING_STRONG"
+                elif delta >= rising_min and rank_move >= 0:
+                    trend = "RISING"
+                elif delta > 0:
+                    trend = "RISING_WEAK"
+                elif abs(delta) < rising_min and rank_move >= 0:
+                    trend = "FLAT"
+                elif delta <= falling_min or rank_move < 0:
+                    trend = "FALLING"
+                else:
+                    trend = "FLAT"
+
+                current_map[cluster] = {
+                    "cluster_rank": rank,
+                    "previous_cluster_rank": prev.get("rank") if has_prev else None,
+                    "energy_delta": delta,
+                    "rank_move": rank_move if has_prev else 0,
+                    "energy_trend": trend,
+                    "energy_momentum_adjustment": round(adjustment, 3),
+                    "energy_momentum_score": round(clip100(50.0 + adjustment * 4.0), 2),
+                }
+
+        for col, default in [
+            ("cluster_rank", np.nan), ("previous_cluster_rank", np.nan),
+            ("energy_delta", np.nan), ("rank_move", 0),
+            ("energy_trend", "UNKNOWN"), ("energy_momentum_adjustment", 0.0),
+            ("energy_momentum_score", 50.0),
+        ]:
+            x[col] = x.get("ENERGY_CLUSTER", pd.Series("", index=x.index)).astype(str).map(
+                lambda c, _col=col, _default=default: current_map.get(c, {}).get(_col, _default)
+            )
+        return x
 
     def attach_integrated_score(self, stage1: pd.DataFrame) -> pd.DataFrame:
         x = stage1.copy()
+        base_scores = []
         scores = []
         for _, r in x.iterrows():
             s1 = fnum(r.get("stage1_score"), 0.0)
@@ -993,17 +1142,24 @@ class Alpha500Integrated(TwoStageDeepScanner):
             mrs = fnum(r.get("market_rs_score"), 50.0)
             crs = 50 + np.clip(fnum(r.get("cluster_rs"), 0.0) * 10.0, -25, 25)
             asym = {"SUPER": 95, "STRONG": 85, "POSITIVE": 70, "NEUTRAL": 50, "WEAK": 25}.get(str(r.get("asym_rs_class")), 50)
-            score = 0.45 * s1 + 0.20 * energy + 0.15 * mrs + 0.10 * crs + 0.10 * asym
+            base = 0.45 * s1 + 0.20 * energy + 0.15 * mrs + 0.10 * crs + 0.10 * asym
             if str(r.get("cluster_state")) == "S4":
-                score -= 7.0
+                base -= 7.0
             if str(r.get("cluster_state")) == "S5":
-                score -= 12.0
+                base -= 12.0
             # 이미 크게 발산한 날 신규 추격을 억제
             if fnum(r.get("current_return_pct"), 0.0) > env_float("MAX_FRESH_RETURN_PCT", 7.0):
-                score -= min(15.0, (fnum(r.get("current_return_pct")) - 7.0) * 2.5)
-            scores.append(clip100(score))
+                base -= min(15.0, (fnum(r.get("current_return_pct")) - 7.0) * 2.5)
+            base = clip100(base)
+            # 데이터수급은 그대로 두고, 판정층에서만 에너지 상승/하락 보정치를 더한다.
+            adj = fnum(r.get("energy_momentum_adjustment"), 0.0)
+            score = clip100(base + adj)
+            base_scores.append(base)
+            scores.append(score)
         x["stage1_score_raw"] = x["stage1_score"]
+        x["integrated_score_base"] = base_scores
         x["integrated_score"] = scores
+        x["buy_priority_score"] = scores
         # 기존 Deep scorer가 이 점수를 구조점수로 사용하도록 stage1_score를 통합점수로 교체한다.
         x["stage1_score"] = x["integrated_score"]
         return x
@@ -1028,19 +1184,22 @@ class Alpha500Integrated(TwoStageDeepScanner):
         if valid.empty:
             return valid
 
+        trend_priority = {"RISING_STRONG": 5, "RISING": 4, "RISING_WEAK": 3, "FLAT": 2, "UNKNOWN": 1, "FALLING": 0}
+        valid["_energy_trend_priority"] = valid.get("energy_trend", pd.Series("UNKNOWN", index=valid.index)).astype(str).map(trend_priority).fillna(1)
         strong = valid[valid["cluster_state"].isin(["S2", "S3"])].copy()
         rescue = valid[
             valid["asym_rs_class"].isin(["SUPER", "STRONG"]) |
             (pd.to_numeric(valid["market_rs"], errors="coerce") >= 2.0) |
             (pd.to_numeric(valid["rs5"], errors="coerce") >= 4.0)
         ].copy()
-        strong = strong.sort_values(["integrated_score", "cluster_energy", "market_rs_score"], ascending=False)
-        rescue = rescue.sort_values(["integrated_score", "market_rs_score", "rs5"], ascending=False)
+        # Strong-sector lane은 에너지 상승 방향을 최우선. Rescue lane은 종목 자체 RS 독립성을 유지한다.
+        strong = strong.sort_values(["_energy_trend_priority", "integrated_score", "cluster_energy", "market_rs_score"], ascending=False)
+        rescue = rescue.sort_values(["integrated_score", "market_rs_score", "rs5", "_energy_trend_priority"], ascending=False)
         n_strong = int(round(self.stage2_n * 0.70))
         chosen = pd.concat([strong.head(n_strong), rescue.head(self.stage2_n - n_strong)], ignore_index=True)
         chosen = chosen.drop_duplicates("symbol", keep="first")
         if len(chosen) < self.stage2_n:
-            rest = valid[~valid["symbol"].isin(chosen["symbol"])].sort_values("integrated_score", ascending=False)
+            rest = valid[~valid["symbol"].isin(chosen["symbol"])].sort_values(["_energy_trend_priority", "integrated_score"], ascending=False)
             chosen = pd.concat([chosen, rest.head(self.stage2_n - len(chosen))], ignore_index=True)
         return chosen.head(self.stage2_n).reset_index(drop=True)
 
@@ -1088,7 +1247,7 @@ class Alpha500Integrated(TwoStageDeepScanner):
         # 과열 S4는 독립 RS SUPER/STRONG일 때만 Deep 허용
         allow = (x["cluster_state"] != "S4") | x["asym_rs_class"].isin(["SUPER", "STRONG"])
         x = x[allow]
-        return x.sort_values(["integrated_score", "market_rs_score", "cluster_energy"], ascending=False).head(self.deep_n).reset_index(drop=True)
+        return x.sort_values(["_energy_trend_priority", "integrated_score", "market_rs_score", "cluster_energy"], ascending=False).head(self.deep_n).reset_index(drop=True)
 
     def run_deep_custom(self, candidates: pd.DataFrame) -> pd.DataFrame:
         if candidates.empty:
@@ -1139,7 +1298,19 @@ class Alpha500Integrated(TwoStageDeepScanner):
                 deep["deep_grade"].isin(["S", "A", "B"]) &
                 deep["stage1_state"].isin(["UP_START", "REVERSAL_ARMED", "DOWN_WEAKEN"]) &
                 ((deep["cluster_state"].isin(["S2", "S3"])) | deep["asym_rs_class"].isin(["SUPER", "STRONG"]))
-            ].head(self.final_top_n).copy()
+            ].copy()
+            if not final.empty:
+                trend_bonus = final.get("energy_trend", pd.Series("UNKNOWN", index=final.index)).astype(str).map({
+                    "RISING_STRONG": 4.0, "RISING": 2.5, "RISING_WEAK": 1.0,
+                    "FLAT": 0.0, "UNKNOWN": 0.0, "FALLING": -5.0,
+                }).fillna(0.0)
+                final["buy_recommendation_score"] = (
+                    0.65 * pd.to_numeric(final["deep_score"], errors="coerce").fillna(0.0) +
+                    0.35 * pd.to_numeric(final["integrated_score"], errors="coerce").fillna(0.0) +
+                    trend_bonus
+                ).clip(0.0, 100.0)
+                final = final.sort_values(["buy_recommendation_score", "deep_score", "integrated_score"], ascending=False)
+            final = final.head(self.final_top_n).copy()
 
         LOG.info("FINALIZE start final=%d deep=%d sectors=%d csv=%s", len(final), len(deep), len(clusters), save_full)
         if save_full:
@@ -1212,11 +1383,18 @@ class Alpha500Integrated(TwoStageDeepScanner):
                     "entry_price": px,
                     "MEGA_SECTOR": str(r.get("MEGA_SECTOR", "")),
                     "SECTOR": str(r.get("SECTOR", "")),
+                    "MICRO_CLUSTER": str(r.get("MICRO_CLUSTER", "")),
                     "BUCKET_BASE": str(r.get("BUCKET_BASE", "")),
                     "ENERGY_CLUSTER": str(r.get("ENERGY_CLUSTER", "")),
                     "ENERGY_DETAIL": str(r.get("ENERGY_DETAIL", r.get("MICRO_CLUSTER", ""))),
                     "cluster_state": str(r.get("cluster_state", "")),
                     "cluster_energy": round(fnum(r.get("cluster_energy"), 0.0), 2),
+                    "energy_delta": None if pd.isna(r.get("energy_delta")) else round(fnum(r.get("energy_delta"), 0.0), 2),
+                    "rank_move": int(fnum(r.get("rank_move"), 0.0)),
+                    "energy_trend": str(r.get("energy_trend", "UNKNOWN")),
+                    "energy_momentum_adjustment": round(fnum(r.get("energy_momentum_adjustment"), 0.0), 2),
+                    "buy_priority_score": round(fnum(r.get("buy_priority_score"), fnum(r.get("integrated_score"), 0.0)), 2),
+                    "buy_recommendation_score": round(fnum(r.get("buy_recommendation_score"), 0.0), 2),
                     "cluster_breadth": round(fnum(r.get("cluster_breadth"), 0.0), 4),
                     "cluster_avg_return": round(fnum(r.get("cluster_avg_return"), 0.0), 3),
                     "cluster_members": int(fnum(r.get("cluster_members"), 0.0)),
@@ -1271,6 +1449,7 @@ class Alpha500Integrated(TwoStageDeepScanner):
                     "ENERGY_DETAIL": str(r.get("ENERGY_DETAIL", r.get("MICRO_CLUSTER", ""))),
                     "MEGA_SECTOR": str(r.get("MEGA_SECTOR", "")),
                     "SECTOR": str(r.get("SECTOR", "")),
+                    "MICRO_CLUSTER": str(r.get("MICRO_CLUSTER", "")),
                     "BUCKET_BASE": str(r.get("BUCKET_BASE", "")),
                     "current_price": fnum(r.get("stage1_close"), 0.0),
                     "change_pct": round(fnum(r.get("current_return_pct"), 0.0), 4),
@@ -1336,6 +1515,23 @@ class Alpha500Integrated(TwoStageDeepScanner):
         history = history[:env_int("SELECTION_HISTORY_MAX", 200)]
         write_json_atomic(history_path, history)
 
+        anchor_sensors: List[Dict[str, Any]] = []
+        if isinstance(stage1, pd.DataFrame) and not stage1.empty and "ANCHOR_SENSOR" in stage1.columns:
+            az = stage1[stage1["ANCHOR_SENSOR"].fillna("").astype(str).ne("")].copy()
+            for _, r in az.iterrows():
+                anchor_sensors.append({
+                    "anchor_group": str(r.get("ANCHOR_SENSOR", "")),
+                    "symbol": str(r.get("symbol", "")).zfill(6),
+                    "name": str(r.get("name", r.get("symbol", ""))),
+                    "venue": self.active_venue,
+                    "market": str(r.get("market", "")),
+                    "current_price": fnum(r.get("stage1_close"), 0.0),
+                    "change_pct": round(fnum(r.get("current_return_pct"), 0.0), 4),
+                    "market_rs": round(fnum(r.get("market_rs"), 0.0), 4),
+                    "trade_strength": round(fnum(r.get("trade_strength_snapshot"), 0.0), 2),
+                    "turnover_snapshot": fnum(r.get("turnover_snapshot_million"), 0.0),
+                })
+
         current_index = index_ctx.get("current", {})
         summary = {
             "timestamp_kst": stamp_kst,
@@ -1344,17 +1540,27 @@ class Alpha500Integrated(TwoStageDeepScanner):
             "exchgubun": self.active_exchgubun,
             "universe": int(len(runtime)),
             "clusters": int(len(clusters)),
+            "expected_clusters": max(1, env_int("ENERGY_EXPECTED_CLUSTERS", 30)),
+            "cluster_count_ok": int(len(clusters)) == max(1, env_int("ENERGY_EXPECTED_CLUSTERS", 30)),
+            "anchor_sensors": anchor_sensors,
             "stage1_valid": int((stage1["stage1_state"] != "ERROR").sum()) if not stage1.empty else 0,
             "stage2_count": int(len(stage2)),
             "deep_count": int(len(deep)),
             "final_count": int(len(final)),
             "index": {m: {k: v for k, v in z.items() if k != "error"} for m, z in current_index.items()},
             "files": {k: str(v) for k, v in files.items()} if save_full else {},
-            "sector_energy": sector_rows[:30],
+            "sector_energy": sector_rows,
             "top_clusters": sector_rows[:15],
             "top_final": top_final,
             "top_watch": top_watch,
             "sector_live_pool": sector_live_pool,
+            # 가격·거래량 독립레이더는 500종목 전체를 추적하므로,
+            # sector_live_pool 포함 여부와 무관하게 code→종목명 매핑을 항상 제공한다.
+            "symbol_name_map": {
+                str(r.get("code", "")).zfill(6): str(r.get("name", r.get("종목명", r.get("code", ""))))
+                for _, r in runtime.iterrows()
+                if str(r.get("code", "")).zfill(6).isdigit()
+            },
             "live_pool": live_pool,
             "live_pool_strict_count": sum(1 for r in live_pool if r.get("live_pool_class") == "STRICT"),
             "live_pool_near_count": sum(1 for r in live_pool if r.get("live_pool_class") == "NEAR"),
@@ -1518,6 +1724,7 @@ class Alpha500Integrated(TwoStageDeepScanner):
         stage1, data_cache, _ = self.run_stage1_fast(runtime, bootstrap_missing=bootstrap_missing)
         stage1, index_ctx = self.attach_market_rs(stage1, data_cache)
         stage1, clusters = self.calculate_cluster_energy(stage1, data_cache)
+        stage1 = self.attach_energy_momentum(stage1, clusters)
         stage1 = self.attach_integrated_score(stage1)
         stage2 = self.select_stage2(stage1)
         deep30 = self.select_deep30(stage2)
@@ -2927,7 +3134,7 @@ from urllib.parse import urlparse
 from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import Alpha500Integrated, market_session_now
 from 거래량가속_완만상승_LS브리지_V2 import LSVolumeDirectionBridge
 
-ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_23_VD_SIGNAL_ACTION_PRICE"
+ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_29_CLOSE_MICRO_FULLPOOL"
 VERSION = ENGINE_VERSION
 PORT = int(os.getenv("PORT", "10000"))
 MASTER = os.getenv("UNIVERSE_MASTER", "섹터마스터_500종목_V3.csv")
@@ -3796,6 +4003,14 @@ def _enrich_volume_direction_and_sector_reps(out, qmap, meta):
     # 같은 venue만 사용. venue가 누락된 오래된 행도 현재 summary venue로 생성된 행으로 간주한다.
     pool = [x for x in pool if str(x.get("venue") or venue).upper() == venue]
 
+    # 500종목 전체 code→종목명. sector_live_pool 밖에서 먼저 신호가 발생해도
+    # 6자리 종목코드가 UI에 노출되지 않도록 summary의 전체 유니버스 매핑을 최우선 사용한다.
+    full_name_map = {
+        str(k).zfill(6): str(v)
+        for k, v in (out.get("symbol_name_map") or {}).items()
+        if str(k).zfill(6).isdigit() and str(v or "").strip()
+    }
+
     by_code = {}
     groups = {}
     for x in pool:
@@ -3813,6 +4028,10 @@ def _enrich_volume_direction_and_sector_reps(out, qmap, meta):
             row["current_price"] = px
         if ch is not None:
             row["change_pct"] = ch
+        # sector_live_pool의 이름도 전체 매핑에 병합한다.
+        nm = str(row.get("name") or "").strip()
+        if nm and nm != code:
+            full_name_map[code] = nm
         by_code[code] = row
         cluster = str(row.get("ENERGY_CLUSTER") or "")
         if cluster:
@@ -3905,7 +4124,12 @@ def _enrich_volume_direction_and_sector_reps(out, qmap, meta):
             q = {}
         px = _quote_price(q)
         ch = _quote_pct(q)
-        r["name"] = str(base.get("name") or r.get("name") or code)
+        q_name = str(q.get("hname") or q.get("name") or "").strip() if isinstance(q, dict) else ""
+        existing_name = str(r.get("name") or "").strip()
+        if existing_name == code or (existing_name.isdigit() and len(existing_name) == 6):
+            existing_name = ""
+        resolved_name = str(base.get("name") or full_name_map.get(code) or q_name or existing_name or "종목명확인중")
+        r["name"] = resolved_name
         r["current_price"] = px if px is not None else base.get("current_price", 0)
         r["change_pct"] = ch if ch is not None else base.get("change_pct", 0)
         r["ENERGY_CLUSTER"] = str(base.get("ENERGY_CLUSTER") or "")
@@ -3917,7 +4141,10 @@ def _enrich_volume_direction_and_sector_reps(out, qmap, meta):
             continue
         code = str(r.get("symbol") or "").zfill(6)
         base = by_code.get(code, {})
-        r["name"] = str(base.get("name") or r.get("name") or code)
+        existing_name = str(r.get("name") or "").strip()
+        if existing_name == code or (existing_name.isdigit() and len(existing_name) == 6):
+            existing_name = ""
+        r["name"] = str(base.get("name") or full_name_map.get(code) or existing_name or "종목명확인중")
         r["ENERGY_CLUSTER"] = str(base.get("ENERGY_CLUSTER") or r.get("ENERGY_CLUSTER") or "")
         r["MEGA_SECTOR"] = str(base.get("MEGA_SECTOR") or r.get("MEGA_SECTOR") or "")
 
@@ -3935,7 +4162,7 @@ def _apply_live_overlay(summary):
         meta = {k: dict(v) for k, v in LIVE_QUOTE_META.items()}
         updated = LIVE_UPDATED_KST
     sources = set()
-    for key in ("live_pool", "top_final", "top_watch", "selection_history"):
+    for key in ("live_pool", "top_final", "top_watch", "selection_history", "anchor_sensors"):
         for r in out.get(key) or []:
             if str(r.get("venue") or out.get("venue") or "").upper() != str(out.get("venue") or "").upper():
                 continue
@@ -3997,16 +4224,16 @@ def _apply_live_overlay(summary):
         out["sector_display_venue"] = str(out.get("venue") or "").upper()
         out["sector_display_source"] = ss.get("source") or "LIVE"
         out["sector_display_updated_kst"] = ss.get("updated_kst") or out.get("timestamp_kst")
-        out["sector_display_note"] = f"{out['sector_display_venue']} 실시간 섹터에너지 · {out['sector_display_source']} · KRX/NXT 분리"
+        out["sector_display_note"] = f"{out['sector_display_venue']} 실시간 · 실제 30개 에너지군 전체순위 · {out['sector_display_source']} · KRX/NXT 분리"
     else:
         _sv = str(out.get("venue") or "").upper()
         out["sector_display_venue"] = _sv
         out["sector_display_source"] = "SCAN_SNAPSHOT"
         out["sector_display_updated_kst"] = out.get("timestamp_kst")
         if _sv == "NXT":
-            out["sector_display_note"] = "NXT 스냅샷 · NXT 500종목 실시간 섹터 재계산은 기본 OFF · KRX 데이터와 혼합하지 않음"
+            out["sector_display_note"] = "NXT 스냅샷 · 실제 30개 에너지군 · NXT 500종목 실시간 재계산은 기본 OFF · KRX와 혼합하지 않음"
         else:
-            out["sector_display_note"] = "KRX 판정 스냅샷 · 다음 LIVE 500 갱신 전까지 보존 · NXT 데이터와 혼합하지 않음"
+            out["sector_display_note"] = "KRX 판정 스냅샷 · 실제 30개 에너지군 전체순위 보존 · 다음 LIVE 500 갱신 전까지 유지 · NXT와 혼합하지 않음"
 
     with LOCK:
         out["ws_status"] = STATE.get("ws_status")
@@ -4350,8 +4577,8 @@ def _sector_norm(v, lo, hi):
 def _live_sector_rows(summary, qmap, index_returns, previous_rows, rep_n=5):
     """500종목 현재 스냅샷으로 섹터 에너지 재계산.
 
-    1~2종목짜리 군집은 동일 MEGA_SECTOR의 유동성 대표주로 최대 5개까지 보강하고,
-    보강주에는 0.55 가중치를 적용한다. 보강 후 3개 미만이면 S?로 둔다.
+    실제 30개 에너지군을 전부 추적한다. 1~2종목 표본이 발생하면
+    MICRO → SECTOR → MEGA 순으로 최대 5개까지 보강하고, 보강주는 0.55 가중치만 적용한다.
     """
     rows = json.loads(json.dumps(summary.get("sector_live_pool") or [], ensure_ascii=False, default=str))
     venue = str(summary.get("venue") or "").upper()
@@ -4394,6 +4621,8 @@ def _live_sector_rows(summary, qmap, index_returns, previous_rows, rep_n=5):
     target_members = max(min_members, min(5, int(os.getenv("ENERGY_TARGET_MEMBERS", "5"))))
     prev_map = {str(x.get("ENERGY_CLUSTER")): x for x in (previous_rows or []) if isinstance(x, dict)}
     calculated = []
+    supplement_usage = defaultdict(int)
+    supplement_max_uses = max(1, int(os.getenv("ENERGY_SUPPLEMENT_MAX_USES", "2")))
 
     def mode_text(vals):
         vals = [str(v) for v in vals if str(v or "")]
@@ -4403,20 +4632,35 @@ def _live_sector_rows(summary, qmap, index_returns, previous_rows, rep_n=5):
         # 보강 표본은 강한 종목 추격이 아니라 대표성: 시총/기존 구조점수/거래대금 스냅샷 우선.
         return (float(x.get("market_cap_100m") or 0.0), float(x.get("integrated_score") or 0.0), float(x.get("turnover_snapshot") or 0.0))
 
-    for cluster, direct_g in groups.items():
+    group_items = sorted(groups.items(), key=lambda kv: (len(kv[1]), str(kv[0])))
+    for cluster, direct_g in group_items:
         direct = [dict(x) for x in direct_g]
         for x in direct: x["_energy_supplemented"] = False
         used = {str(x.get("symbol") or "").zfill(6) for x in direct}
         analysis = list(direct)
+        anchor_micro = mode_text([x.get("MICRO_CLUSTER") for x in direct])
+        anchor_sector = mode_text([x.get("SECTOR") for x in direct])
         anchor_mega = mode_text([x.get("MEGA_SECTOR") for x in direct])
-        if len(analysis) < target_members and anchor_mega:
-            peers = [dict(x) for x in enriched if str(x.get("MEGA_SECTOR") or "") == anchor_mega and str(x.get("symbol") or "").zfill(6) not in used]
-            peers.sort(key=representative_sort, reverse=True)
+        tiers = []
+        if anchor_micro:
+            tiers.append([x for x in enriched if str(x.get("MICRO_CLUSTER") or "") == anchor_micro])
+        if anchor_sector:
+            tiers.append([x for x in enriched if str(x.get("SECTOR") or "") == anchor_sector])
+        if anchor_mega:
+            tiers.append([x for x in enriched if str(x.get("MEGA_SECTOR") or "") == anchor_mega])
+        for peers in tiers:
+            if len(analysis) >= target_members:
+                break
+            peers = [dict(x) for x in peers if str(x.get("symbol") or "").zfill(6) not in used and supplement_usage[str(x.get("symbol") or "").zfill(6)] < supplement_max_uses]
+            peers.sort(key=lambda x: (supplement_usage[str(x.get("symbol") or "").zfill(6)],) + tuple(-v for v in representative_sort(x)))
             for x in peers:
                 if len(analysis) >= target_members: break
+                code = str(x.get("symbol") or "").zfill(6)
+                if code in used: continue
                 x["_energy_supplemented"] = True
                 analysis.append(x)
-                used.add(str(x.get("symbol") or "").zfill(6))
+                used.add(code)
+                supplement_usage[code] += 1
 
         direct_n = len(direct)
         analysis_n = len(analysis)
@@ -4462,6 +4706,9 @@ def _live_sector_rows(summary, qmap, index_returns, previous_rows, rep_n=5):
             elif energy >= 58: state="S2"
             elif energy >= 45: state="S1"
             else: state="S0"
+        if sufficient and state not in {"S5", "S?"}:
+            if direct_n <= 1 and state in {"S3", "S4"}: state="S2"
+            elif direct_n == 2 and state == "S4": state="S3"
 
         # 대표주는 직접 구성원을 먼저 표시하고 나머지는 보강주로 채움.
         direct_sorted=sorted(direct,key=representative_sort,reverse=True)
@@ -4565,7 +4812,7 @@ def live_sector_loop():
             source = "LIVE:t8407_500" if venue == "KRX" else "LIVE:t8450_NXT"
             with LIVE_SECTOR_LOCK:
                 LIVE_SECTOR_SNAPSHOT["venue"] = venue
-                LIVE_SECTOR_SNAPSHOT["sector_energy"] = sector_rows[:30]
+                LIVE_SECTOR_SNAPSHOT["sector_energy"] = sector_rows
                 LIVE_SECTOR_SNAPSHOT["top_clusters"] = sector_rows[:15]
                 LIVE_SECTOR_SNAPSHOT["updated_kst"] = stamp
                 LIVE_SECTOR_SNAPSHOT["source"] = source
@@ -4661,6 +4908,82 @@ def save_nxt_eod_hold():
     return snap
 
 
+
+def _cb_num(v, default=0.0):
+    try:
+        x = float(v)
+        return x if math.isfinite(x) else float(default)
+    except Exception:
+        return float(default)
+
+
+def _micro_flow_key(r):
+    cluster = str(r.get("ENERGY_CLUSTER") or "").strip()
+    micro = str(r.get("MICRO_CLUSTER") or r.get("ENERGY_DETAIL") or r.get("SECTOR") or "미분류").strip()
+    return f"{cluster}||{micro}", cluster, micro
+
+
+def _micro_flow_map(rows):
+    """Decision-only MICRO flow from already received same-venue rows."""
+    clean = [dict(r) for r in (rows or []) if isinstance(r, dict) and str(r.get("ENERGY_CLUSTER") or "").strip()]
+    if not clean:
+        return {}
+    parents = {}
+    for r in clean:
+        _, cluster, _ = _micro_flow_key(r)
+        parents.setdefault(cluster, []).append(r)
+    parent_avg = {c: sum(_cb_num(x.get("change_pct"),0.0) for x in xs)/max(1,len(xs)) for c,xs in parents.items()}
+    groups = {}
+    for r in clean:
+        key, cluster, micro = _micro_flow_key(r)
+        groups.setdefault(key,{"cluster":cluster,"micro":micro,"rows":[]})["rows"].append(r)
+    out = {}
+    for key,g in groups.items():
+        xs=g["rows"]; n=len(xs); cluster=g["cluster"]; pavg=_cb_num(parent_avg.get(cluster),0.0)
+        rets=[_cb_num(x.get("change_pct"),0.0) for x in xs]
+        mrs=[_cb_num(x.get("market_rs"),0.0) for x in xs]
+        turns=[_cb_num(x.get("turnover_accel_live",x.get("turnover_accel")),1.0) for x in xs]
+        holds=[1.0 if bool(x.get("stage1_above_vwap")) and bool(x.get("stage1_ema20_hold")) else 0.0 for x in xs]
+        avg_ret=sum(rets)/max(1,n); avg_mrs=sum(mrs)/max(1,n); avg_turn=sum(turns)/max(1,n); hold=sum(holds)/max(1,n)
+        rel=avg_ret-pavg; breadth=sum(v>0 for v in mrs)/max(1,n); outperform=sum(v>pavg for v in rets)/max(1,n)
+        raw=(30*_sector_norm(rel,-1.5,1.5)+20*outperform+15*breadth+15*_sector_norm(avg_mrs,-1.5,2.0)+10*_sector_norm(avg_turn,0.70,1.80)+10*hold)
+        confidence=min(1.0,n/3.0)
+        score=max(0.0,min(100.0,50.0+(raw-50.0)*confidence))
+        out[key]={
+            "micro_flow_key":key,"ENERGY_CLUSTER":cluster,"MICRO_CLUSTER":g["micro"],
+            "micro_members":n,"micro_parent_members":len(parents.get(cluster,[])),
+            "micro_avg_return":round(avg_ret,4),"micro_parent_avg_return":round(pavg,4),"micro_rel_return":round(rel,4),
+            "micro_breadth":round(breadth,4),"micro_outperform_ratio":round(outperform,4),"micro_market_rs":round(avg_mrs,4),
+            "micro_turnover_accel":round(avg_turn,4),"micro_hold_ratio":round(hold,4),"micro_confidence":round(confidence,3),
+            "micro_flow_score":round(score,2),
+        }
+    return out
+
+
+def _attach_micro_flow(rows, previous_map=None):
+    previous_map=previous_map or {}; current=_micro_flow_map(rows)
+    accel_min=_cb_num(os.getenv("CLOSE_BET_MICRO_ACCEL_DELTA","2.0"),2.0)
+    score_min=_cb_num(os.getenv("CLOSE_BET_MICRO_SCORE_MIN","52.0"),52.0)
+    flow=[]
+    for key,z0 in current.items():
+        z=dict(z0); prev=previous_map.get(key) or {}; prev_score=prev.get("micro_flow_score")
+        delta=0.0 if prev_score is None else _cb_num(z.get("micro_flow_score"))- _cb_num(prev_score)
+        score=_cb_num(z.get("micro_flow_score"),50.0)
+        if score>=max(score_min+5,57.0) and delta>=accel_min: state="ACCEL"
+        elif score>=max(score_min+3,55.0) and delta>=0: state="RISING"
+        elif score>=score_min: state="POSITIVE"
+        elif delta<=-max(2.0,accel_min) or score<45.0: state="FALLING"
+        else: state="FLAT"
+        z["micro_flow_delta"]=round(delta,2); z["micro_flow_state"]=state; current[key]=z; flow.append(z)
+    enriched=[]
+    for r0 in rows or []:
+        r=dict(r0); key,_,_=_micro_flow_key(r); z=current.get(key) or {}
+        for k,v in z.items():
+            if k.startswith("micro_") or k=="MICRO_CLUSTER": r[k]=v
+        enriched.append(r)
+    flow.sort(key=lambda z:(_cb_num(z.get("micro_flow_score")),_cb_num(z.get("micro_flow_delta"))),reverse=True)
+    return enriched,flow
+
 def _preclose_score_row(r, cluster_avg):
     try: change = float(r.get("change_pct") or 0.0)
     except Exception: change = 0.0
@@ -4696,6 +5019,7 @@ def build_preclose_rescan(venue, trigger_label):
         rows = [dict(x) for x in (summary.get("sector_live_pool") or []) if isinstance(x, dict)]
         if not rows:
             rows = _candidate_union(summary)
+        micro_before = _micro_flow_map(rows)
         codes = [str(r.get("symbol", "")).zfill(6) for r in rows]
         qmap = get_rest_history(venue).multi_quotes(codes) if codes else {}
         refreshed = []
@@ -4707,6 +5031,7 @@ def build_preclose_rescan(venue, trigger_label):
             if pct is not None: r["change_pct"] = pct
             r["close_bet_quote_source"] = "REST:t8450" if venue == "NXT" else "REST:t8407"
             refreshed.append(r)
+        refreshed, micro_flow_rows = _attach_micro_flow(refreshed, micro_before)
         cluster_vals = {}
         for r in refreshed:
             c = str(r.get("ENERGY_CLUSTER") or "")
@@ -4726,7 +5051,7 @@ def build_preclose_rescan(venue, trigger_label):
         snap = {
             "captured_at_kst": now_kst_iso(), "venue": venue, "trigger": trigger_label,
             "universe_checked": len(rows), "priced_count": len(qmap), "candidate_count": min(len(scored), top_n),
-            "data_status": "REST_REFRESH", "candidates": scored[:top_n],
+            "data_status": "REST_REFRESH", "micro_flow": micro_flow_rows, "candidates": scored[:top_n],
         }
         p = _preclose_path(venue); tmp = p.with_suffix(p.suffix + ".tmp")
         tmp.write_text(json.dumps(snap, ensure_ascii=False, indent=2, default=str), encoding="utf-8"); tmp.replace(p)
@@ -4812,38 +5137,85 @@ def _close_bet_refresh(rows, venue):
     return rows
 
 
+def _close_micro_context(rows, summary, pre=None):
+    """Attach full-pool MICRO flow and 30-cluster energy direction to close-bet candidates."""
+    pre = pre or {}
+    sector = {str(x.get("ENERGY_CLUSTER") or ""):x for x in (summary.get("sector_energy") or []) if isinstance(x,dict)}
+    micro = {str(x.get("micro_flow_key") or ""):x for x in (pre.get("micro_flow") or []) if isinstance(x,dict)}
+    for r in rows:
+        group=str(r.get("ENERGY_CLUSTER") or ""); sec=sector.get(group) or {}
+        for k in ("cluster_state","cluster_energy","energy_delta","rank_move","cluster_breadth","cluster_avg_return","cluster_members","cluster_direct_members"):
+            if sec.get(k) is not None: r[k]=sec.get(k)
+        if not r.get("energy_trend"):
+            d=sec.get("energy_delta"); rm=int(_cb_num(sec.get("rank_move"),0.0))
+            if d is None: trend="UNKNOWN"
+            elif _cb_num(d)>=_cb_num(os.getenv("ENERGY_STRONG_RISING_DELTA","1.00"),1.0) and rm>0: trend="RISING_STRONG"
+            elif _cb_num(d)>=_cb_num(os.getenv("ENERGY_RISING_DELTA_MIN","0.35"),0.35) and rm>=0: trend="RISING"
+            elif _cb_num(d)>0: trend="RISING_WEAK"
+            elif _cb_num(d)<=_cb_num(os.getenv("ENERGY_FALLING_DELTA","-0.50"),-0.5) or rm<0: trend="FALLING"
+            else: trend="FLAT"
+            r["energy_trend"]=trend
+        key,_,_=_micro_flow_key(r); mz=micro.get(key) or {}
+        for k,v in mz.items():
+            if k.startswith("micro_") or k=="MICRO_CLUSTER": r[k]=v
+        r["close_sector_delta"]=r.get("energy_delta"); r["close_sector_rank_move"]=r.get("rank_move"); r["close_sector_breadth"]=r.get("cluster_breadth")
+    return rows
+
+
 def _close_bet_score(r, venue, krx_close_map=None):
-    try: change = float(r.get("change_pct") or 0.0)
-    except Exception: change = 0.0
-    if not (float(os.getenv("CLOSE_BET_MIN_RETURN_PCT", "-3.0")) <= change <= float(os.getenv("CLOSE_BET_MAX_RETURN_PCT", "7.0"))):
-        return None
-    state, asym = str(r.get("cluster_state") or ""), str(r.get("asym_rs_class") or "")
-    if state not in {"S2", "S3"} and asym not in {"SUPER", "STRONG"}: return None
-    stage = str(r.get("stage1_state") or "")
-    if stage and stage not in {"UP_START", "REVERSAL_ARMED", "DOWN_WEAKEN", "UP_TREND"}: return None
-    deep=float(r.get("deep_score") or 0.0); integ=float(r.get("integrated_score") or r.get("stage1_score") or 0.0)
-    energy=float(r.get("cluster_energy") or 0.0); mrs=float(r.get("market_rs_score") or 50.0); strength=float(r.get("trade_strength") or 100.0)
-    grade=str(r.get("deep_grade") or ""); grade_bonus={"S":8.0,"A":6.0,"B":3.5,"WATCH":0.0}.get(grade,-3.0)
-    score=0.38*deep+0.25*integ+0.17*energy+0.10*mrs+0.10*min(100.0,max(0.0,strength-60.0))+grade_bonus
-    if change>5.5: score-=(change-5.5)*4.0
-    if state=="S3": score+=3.0
-    if bool(r.get("deep_verified",False)): score+=2.0
+    try: change=float(r.get("change_pct") or 0.0)
+    except Exception: change=0.0
+    if not (float(os.getenv("CLOSE_BET_MIN_RETURN_PCT","-3.0"))<=change<=float(os.getenv("CLOSE_BET_MAX_RETURN_PCT","7.0"))): return None
+    state,asym=str(r.get("cluster_state") or ""),str(r.get("asym_rs_class") or "")
+    stage=str(r.get("stage1_state") or "")
+    if stage and stage not in {"UP_START","REVERSAL_ARMED","DOWN_WEAKEN","UP_TREND"}: return None
+    deep=_cb_num(r.get("deep_score")); integ=_cb_num(r.get("integrated_score",r.get("stage1_score"))); energy=_cb_num(r.get("cluster_energy")); mrs=_cb_num(r.get("market_rs_score"),50); strength=_cb_num(r.get("trade_strength"),100)
+    grade=str(r.get("deep_grade") or ""); delta=_cb_num(r.get("energy_delta"),0); rank=int(_cb_num(r.get("rank_move"),0)); breadth=_cb_num(r.get("cluster_breadth"),0); trend=str(r.get("energy_trend") or "UNKNOWN")
+    micro_state=str(r.get("micro_flow_state") or ""); micro_score=_cb_num(r.get("micro_flow_score"),50); micro_delta=_cb_num(r.get("micro_flow_delta"),0); parent_n=int(_cb_num(r.get("micro_parent_members"),r.get("cluster_direct_members") or r.get("cluster_members") or 0))
+    rising_min=_cb_num(os.getenv("CLOSE_BET_ENERGY_DELTA_MIN","0.35"),0.35); breadth_min=_cb_num(os.getenv("CLOSE_BET_BREADTH_MIN","0.55"),0.55); large_min=max(3,int(os.getenv("CLOSE_BET_MICRO_LARGE_CLUSTER_MIN","12"))); micro_min=_cb_num(os.getenv("CLOSE_BET_MICRO_SCORE_MIN","52.0"),52)
+    rising=(delta>=rising_min and rank>=0) or (trend in {"RISING","RISING_STRONG"} and delta>0)
+    breadth_ok=(breadth>=breadth_min) if breadth>0 else True
+    micro_required=os.getenv("CLOSE_BET_MICRO_ENABLED","true").lower() in {"1","true","yes","y","on"} and parent_n>=large_min
+    micro_ok=(not micro_required) or (micro_score>=micro_min and micro_state!="FALLING")
+    main_ok=state in {"S2","S3"} and rising and breadth_ok and micro_ok
+    vd_state=str(r.get("volume_direction_state") or ""); vd_ok=vd_state in {"RE_ACCEL","STEADY_REACCEL"}
+    independent=asym in {"SUPER","STRONG"} and deep>=72 and mrs>=62 and bool(r.get("deep_verified",False))
+    exceptional=deep>=80 and integ>=70 and mrs>=68
+    rescue_ok=(not main_ok) and not (trend=="FALLING" and delta<=-2.0) and state!="S5" and independent and (vd_ok or exceptional)
+    if not main_ok and not rescue_ok: return None
+    grade_bonus={"S":8.0,"A":6.0,"B":3.5,"WATCH":0.0}.get(grade,-3.0)
+    score=0.38*deep+0.25*integ+0.17*energy+0.10*mrs+0.10*min(100,max(0,strength-60))+grade_bonus
+    if change>5.5: score-=(change-5.5)*4
+    if state=="S3": score+=3
+    if bool(r.get("deep_verified",False)): score+=2
+    score+=max(-7,min(7,delta*1.8))+max(-4,min(4,rank*0.8))
+    if breadth>0: score+=max(-4,min(4,(breadth-0.5)*12))
+    if micro_required:
+        score+=max(-8,min(8,(micro_score-50)*0.25+micro_delta*0.45))
+        if micro_state=="ACCEL": score+=2
+        elif micro_state=="FALLING": score-=3
+    if main_ok: score+=4
     premium=None
     if str(venue).upper()=="NXT" and krx_close_map:
         ref=krx_close_map.get(str(r.get("symbol","")).zfill(6))
         try:
-            ref_px=float((ref or {}).get("current_price") or 0.0); cur_px=float(r.get("current_price") or 0.0)
+            ref_px=float((ref or {}).get("current_price") or 0); cur_px=float(r.get("current_price") or 0)
             if ref_px>0 and cur_px>0:
-                premium=(cur_px/ref_px-1.0)*100.0
-                if premium>2.0: score-=min(8.0,(premium-2.0)*2.5)
+                premium=(cur_px/ref_px-1)*100
+                if premium>2: score-=min(8,(premium-2)*2.5)
         except Exception: premium=None
-    reasons=[]
+    lane="RISING_SECTOR" if main_ok else "INDEPENDENT_LEADER"; r["close_bet_lane"]=lane; r["close_micro_confirmed"]=bool((not micro_required) or (micro_score>=micro_min and micro_state in {"ACCEL","RISING","POSITIVE"}))
+    reasons=["상승에너지 주력" if main_ok else "독립강세 예외",f"ΔE {delta:+.1f}"]
+    if rank: reasons.append(f"순위 {'↑' if rank>0 else '↓'}{abs(rank)}")
+    if breadth>0: reasons.append(f"Breadth {breadth*100:.0f}%")
+    if micro_required: reasons.append(f"{str(r.get('MICRO_CLUSTER') or r.get('ENERGY_DETAIL') or 'MICRO')} {micro_state} {micro_score:.0f}/{micro_delta:+.1f}")
     if state in {"S2","S3"}: reasons.append(state)
     if deep>=72: reasons.append(f"DEEP {deep:.1f}")
     if integ>=60: reasons.append(f"통합 {integ:.1f}")
     if strength>=120: reasons.append(f"체결강도 {strength:.0f}")
     if asym in {"SUPER","STRONG"}: reasons.append(f"비대칭RS {asym}")
-    return round(score,2), premium, reasons
+    if vd_ok: reasons.append(f"가격거래량 {vd_state}")
+    return round(score,2),premium,reasons
 
 
 def build_close_bet(venue, trigger_label):
@@ -4859,7 +5231,11 @@ def build_close_bet(venue, trigger_label):
             x=dict(r); x.update({k:v for k,v in merged[code].items() if k not in x or x.get(k) in (None,"")}); merged[code]=x
         else:
             merged[code]=dict(r)
+    vd_map={str(x.get("symbol") or "").zfill(6):x for x in (summary.get("volume_direction_top") or (summary.get("volume_direction") or {}).get("top") or []) if isinstance(x,dict)}
+    for code,r in merged.items():
+        vz=vd_map.get(code) or {}; r["volume_direction_state"]=str(vz.get("combined_state") or r.get("volume_direction_state") or "")
     rows=_close_bet_refresh(list(merged.values()),venue)
+    rows=_close_micro_context(rows,summary,pre)
     krx_close=_read_close_bet("KRX") if venue=="NXT" else None
     krx_close_map={str(x.get("symbol","")).zfill(6):x for x in ((krx_close or {}).get("candidates") or [])}
     scored=[]
@@ -4868,10 +5244,24 @@ def build_close_bet(venue, trigger_label):
         if z is None: continue
         score,premium,reasons=z; o=dict(r); o["close_bet_score"]=score; o["nxt_vs_krx_close_pct"]=None if premium is None else round(premium,3); o["close_bet_reasons"]=reasons; o["selection_type"]=f"{venue}_CLOSE_BET"; scored.append(o)
     scored.sort(key=lambda x:(float(x.get("close_bet_score") or 0.0),float(x.get("deep_score") or 0.0)),reverse=True)
-    candidates=scored[:max(1,int(os.getenv("CLOSE_BET_TOP_N","5")))]
+    max_n=max(1,int(os.getenv("CLOSE_BET_TOP_N","5")))
+    ratio=max(0.5,min(1.0,_cb_num(os.getenv("CLOSE_BET_RISING_MAIN_RATIO","0.80"),0.80)))
+    main_slots=max(1,min(max_n,int(round(max_n*ratio))))
+    rescue_max=max(0,min(max_n-main_slots if max_n>1 else 0,int(os.getenv("CLOSE_BET_EXCEPTION_MAX","1"))))
+    main=[r for r in scored if r.get("close_bet_lane")=="RISING_SECTOR"]
+    rescue=[r for r in scored if r.get("close_bet_lane")=="INDEPENDENT_LEADER"]
+    candidates=list(main[:main_slots]); seen={str(x.get("symbol") or "").zfill(6) for x in candidates}
+    for x in rescue[:rescue_max]:
+        code=str(x.get("symbol") or "").zfill(6)
+        if code not in seen: candidates.append(x); seen.add(code)
+    for x in main[main_slots:]:
+        if len(candidates)>=max_n: break
+        code=str(x.get("symbol") or "").zfill(6)
+        if code not in seen: candidates.append(x); seen.add(code)
+    candidates=sorted(candidates,key=lambda x:(float(x.get("close_bet_score") or 0),float(x.get("deep_score") or 0)),reverse=True)[:max_n]
     sources=sorted({str(x.get("close_bet_quote_source") or "SNAPSHOT") for x in candidates})
     data_status="WS_CONFIRMED" if candidates and all(x.startswith("WS:") for x in sources) else ("REST_FALLBACK" if any(x.startswith("REST:") for x in sources) else "SNAPSHOT")
-    snap={"captured_at_kst":now_kst_iso(),"trade_date":now_kst().strftime("%Y-%m-%d"),"venue":venue,"trigger":trigger_label,"source_summary_kst":summary.get("timestamp_kst"),"preclose_rescan_kst":(pre or {}).get("captured_at_kst"),"preclose_universe_checked":int((pre or {}).get("universe_checked") or 0),"candidate_count":len(candidates),"data_status":data_status,"quote_sources":sources,"no_force_fill":True,"candidates":candidates}
+    snap={"captured_at_kst":now_kst_iso(),"trade_date":now_kst().strftime("%Y-%m-%d"),"venue":venue,"trigger":trigger_label,"source_summary_kst":summary.get("timestamp_kst"),"preclose_rescan_kst":(pre or {}).get("captured_at_kst"),"preclose_universe_checked":int((pre or {}).get("universe_checked") or 0),"candidate_count":len(candidates),"main_track_count":sum(1 for x in candidates if x.get("close_bet_lane")=="RISING_SECTOR"),"exception_track_count":sum(1 for x in candidates if x.get("close_bet_lane")=="INDEPENDENT_LEADER"),"data_status":data_status,"quote_sources":sources,"no_force_fill":True,"candidates":candidates}
     for p in (_close_bet_path(venue),_close_bet_path(venue,latest=False,ymd=now_kst().strftime("%Y%m%d"))):
         tmp=p.with_suffix(p.suffix+".tmp"); tmp.write_text(json.dumps(snap,ensure_ascii=False,indent=2,default=str),encoding="utf-8"); tmp.replace(p)
     with LOCK:
@@ -5078,7 +5468,7 @@ class Handler(BaseHTTPRequestHandler):
 <title>ALPHA500 LS Cluster Radar</title>
 <style>
 :root{color-scheme:dark;--bg:#07111f;--card:#0e1b2d;--line:#20324a;--txt:#eef5ff;--muted:#92a9c5;--ok:#36d399;--warn:#fbbf24;--bad:#fb7185;--accent:#60a5fa;--cyan:#67e8f9}
-*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#07111f,#091525);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1400px;margin:auto;padding:16px}.top{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}.title{font-size:22px;font-weight:850}.sub{color:var(--muted);font-size:12px;margin-top:4px}.grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:9px;margin:14px 0}.card{background:rgba(14,27,45,.94);border:1px solid var(--line);border-radius:14px;padding:12px}.k{color:var(--muted);font-size:11px}.v{font-size:17px;font-weight:850;margin-top:6px;word-break:break-word}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.cyan{color:var(--cyan)}button{background:var(--accent);border:0;border-radius:10px;padding:10px 14px;font-weight:850;color:#06111f}.progress{height:10px;background:#14233a;border-radius:999px;overflow:hidden;margin-top:8px}.bar{height:100%;width:0;background:linear-gradient(90deg,#60a5fa,#36d399);transition:width .3s}.phase{font-size:13px;color:var(--muted);margin-top:7px}.section{margin-top:16px}.section h2{font-size:17px;margin:0 0 8px}.note{font-size:12px;color:var(--muted);margin:6px 0}.tablebox{border:1px solid var(--line);border-radius:12px;overflow:auto;background:#07101d}.historybox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}table{width:100%;border-collapse:collapse;min-width:1000px;font-size:12px}th{position:sticky;top:0;background:#122139;color:#b9cbe1;z-index:2;text-align:right;padding:9px 8px;border-bottom:1px solid var(--line);white-space:nowrap}td{text-align:right;padding:9px 8px;border-bottom:1px solid #13233a;white-space:nowrap}th.left,td.left{text-align:left}tr:hover td{background:#0c1b2e}.pos{color:#fb7185}.neg{color:#60a5fa}.up{color:#36d399;font-weight:800}.down{color:#fb7185;font-weight:800}.badge{padding:3px 7px;border-radius:999px;background:#162843}.empty{padding:18px;color:var(--muted)}.sectorMain td{border-bottom:0}.sectorReps td{padding:2px 8px 6px;border-bottom:1px solid #13233a;background:#081421}.sectorRepList{display:flex;gap:10px;align-items:center;overflow:hidden;white-space:nowrap;font-size:8px;line-height:1.15;color:#7f98b8;font-variant-numeric:tabular-nums}.sectorRepItem{display:inline-flex;gap:3px;align-items:center;min-width:0}.sectorRepName{color:#a9bdd5;font-weight:700}.sectorRepPrice{color:#7891b0}.summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.sbox{background:#0b1727;border:1px solid var(--line);border-radius:10px;padding:10px}.snum{font-weight:850;font-size:18px}.foot{color:var(--muted);font-size:11px;margin-top:14px}.stickytime{font-variant-numeric:tabular-nums}.livecard{grid-column:span 3;min-width:0}.livecols,.candidateNoteGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;min-width:0}.livecols{margin-top:6px;min-height:42px}.livecell,.noteCell{min-width:0;border:1px solid #1a2b43;background:#0a1727;border-radius:8px;padding:6px 8px;overflow:hidden}.liveLabel,.noteLabel{display:block;color:var(--muted);font-size:10px;margin-bottom:2px}.liveValue,.noteValue{display:block;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.counterCard .v{font-variant-numeric:tabular-nums;font-size:20px}.historyMeta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin:6px 0}.historyMeta b{color:#cbd8e8}.candidateNoteGrid{min-height:48px;margin:6px 0}.candidateNoteGrid .noteValue{font-size:11px;color:#cbd8e8}#candidateTable{table-layout:fixed;min-width:1135px}#candidateTable td{overflow:hidden;text-overflow:ellipsis}#candidateTable th:nth-child(1){width:70px}#candidateTable th:nth-child(2){width:130px}#candidateTable th:nth-child(3){width:90px}#candidateTable th:nth-child(4){width:80px}#candidateTable th:nth-child(5){width:90px}#candidateTable th:nth-child(6){width:80px}#candidateTable th:nth-child(7){width:75px}#candidateTable th:nth-child(8){width:70px}#candidateTable th:nth-child(9){width:130px}#candidateTable th:nth-child(10){width:150px}#candidateTable th:nth-child(11){width:80px}#candidateTable th:nth-child(12){width:90px}.vdMeta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin:6px 0}.vdState{display:inline-block;padding:3px 7px;border-radius:999px;background:#162843;font-weight:800}.vdHot{color:#36d399}.vdWarm{color:#67e8f9}.vdPause{color:#fbbf24}.vdBad{color:#fb7185}.vdAction{display:inline-block;padding:3px 7px;border-radius:999px;background:#162843;font-weight:800}.vdActionEntry{color:#36d399}.vdActionWait{color:#fbbf24}.vdActionExit{color:#fb7185}.vdComment{white-space:normal;min-width:330px;max-width:520px;line-height:1.35;color:#cbd8e8}#vdTable{min-width:1320px}#vdHistoryTable{min-width:1650px}.vdHistoryBox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}.repSupplement{color:#fbbf24;font-size:9px;margin-left:2px}.evidenceSup{color:#fbbf24}.evidenceBad{color:#fb7185}.sectorSourceStrong{color:#cbd8e8;font-weight:700}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#07111f,#091525);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1400px;margin:auto;padding:16px}.top{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}.title{font-size:22px;font-weight:850}.sub{color:var(--muted);font-size:12px;margin-top:4px}.grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:9px;margin:14px 0}.card{background:rgba(14,27,45,.94);border:1px solid var(--line);border-radius:14px;padding:12px}.k{color:var(--muted);font-size:11px}.v{font-size:17px;font-weight:850;margin-top:6px;word-break:break-word}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.cyan{color:var(--cyan)}button{background:var(--accent);border:0;border-radius:10px;padding:10px 14px;font-weight:850;color:#06111f}.progress{height:10px;background:#14233a;border-radius:999px;overflow:hidden;margin-top:8px}.bar{height:100%;width:0;background:linear-gradient(90deg,#60a5fa,#36d399);transition:width .3s}.phase{font-size:13px;color:var(--muted);margin-top:7px}.section{margin-top:16px}.section h2{font-size:17px;margin:0 0 8px}.note{font-size:12px;color:var(--muted);margin:6px 0}.tablebox{border:1px solid var(--line);border-radius:12px;overflow:auto;background:#07101d}.historybox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}table{width:100%;border-collapse:collapse;min-width:1000px;font-size:12px}th{position:sticky;top:0;background:#122139;color:#b9cbe1;z-index:2;text-align:right;padding:9px 8px;border-bottom:1px solid var(--line);white-space:nowrap}td{text-align:right;padding:9px 8px;border-bottom:1px solid #13233a;white-space:nowrap}th.left,td.left{text-align:left}tr:hover td{background:#0c1b2e}.pos{color:#fb7185}.neg{color:#60a5fa}.up{color:#36d399;font-weight:800}.down{color:#fb7185;font-weight:800}.badge{padding:3px 7px;border-radius:999px;background:#162843}.empty{padding:18px;color:var(--muted)}.sectorMain td{border-bottom:0}.sectorReps td{padding:2px 8px 6px;border-bottom:1px solid #13233a;background:#081421}.sectorRepList{display:flex;gap:10px;align-items:center;overflow:hidden;white-space:nowrap;font-size:8px;line-height:1.15;color:#7f98b8;font-variant-numeric:tabular-nums}.sectorRepItem{display:inline-flex;gap:3px;align-items:center;min-width:0}.sectorRepName{color:#a9bdd5;font-weight:700}.sectorRepPrice{color:#7891b0}.summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.sbox{background:#0b1727;border:1px solid var(--line);border-radius:10px;padding:10px}.snum{font-weight:850;font-size:18px}.foot{color:var(--muted);font-size:11px;margin-top:14px}.stickytime{font-variant-numeric:tabular-nums}.livecard{grid-column:span 3;min-width:0}.livecols,.candidateNoteGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;min-width:0}.livecols{margin-top:6px;min-height:42px}.livecell,.noteCell{min-width:0;border:1px solid #1a2b43;background:#0a1727;border-radius:8px;padding:6px 8px;overflow:hidden}.liveLabel,.noteLabel{display:block;color:var(--muted);font-size:10px;margin-bottom:2px}.liveValue,.noteValue{display:block;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.counterCard .v{font-variant-numeric:tabular-nums;font-size:20px}.historyMeta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin:6px 0}.historyMeta b{color:#cbd8e8}.candidateNoteGrid{min-height:48px;margin:6px 0}.candidateNoteGrid .noteValue{font-size:11px;color:#cbd8e8}#candidateTable{min-width:1480px}#candidateTable td{overflow:hidden;text-overflow:ellipsis}#candidateTable th:nth-child(1){width:70px}#candidateTable th:nth-child(2){width:130px}#candidateTable th:nth-child(3){width:90px}#candidateTable th:nth-child(4){width:80px}#candidateTable th:nth-child(5){width:90px}#candidateTable th:nth-child(6){width:80px}#candidateTable th:nth-child(7){width:75px}#candidateTable th:nth-child(8){width:70px}#candidateTable th:nth-child(9){width:130px}#candidateTable th:nth-child(10){width:150px}#candidateTable th:nth-child(11){width:80px}#candidateTable th:nth-child(12){width:90px}.vdMeta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin:6px 0}.vdState{display:inline-block;padding:3px 7px;border-radius:999px;background:#162843;font-weight:800}.vdHot{color:#36d399}.vdWarm{color:#67e8f9}.vdPause{color:#fbbf24}.vdBad{color:#fb7185}.vdAction{display:inline-block;padding:3px 7px;border-radius:999px;background:#162843;font-weight:800}.vdActionEntry{color:#36d399}.vdActionWait{color:#fbbf24}.vdActionExit{color:#fb7185}.vdComment{white-space:normal;min-width:330px;max-width:520px;line-height:1.35;color:#cbd8e8}#vdTable{min-width:1320px}#vdHistoryTable{min-width:1650px}.vdHistoryBox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}.repSupplement{color:#fbbf24;font-size:9px;margin-left:2px}.evidenceSup{color:#fbbf24}.evidenceBad{color:#fb7185}.sectorSourceStrong{color:#cbd8e8;font-weight:700}
 @media(max-width:900px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.livecard{grid-column:1/-1}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.v{font-size:15px}.wrap{padding:12px}.historybox{height:620px;max-height:620px}.vdHistoryBox{height:620px;max-height:620px}}
 </style></head>
 <body><div class="wrap">
@@ -5099,11 +5489,12 @@ class Handler(BaseHTTPRequestHandler):
 <div class="card"><div id="progressText" class="v" style="font-size:15px">-</div><div class="progress"><div id="bar" class="bar"></div></div><div id="progressMsg" class="phase">-</div></div>
 
 <div class="section"><h2>판정 요약</h2><div id="summary" class="summary"></div></div>
-<div class="section"><h2>현재 후보 · 실시간 현재가/등락률/진입가</h2><div id="candidateNote" class="note candidateNoteGrid"><div class="noteCell"><span class="noteLabel">후보상태</span><span id="candidateStatus" class="noteValue">-</span></div><div class="noteCell"><span class="noteLabel">현재가 갱신</span><span id="candidateLive" class="noteValue">-</span></div><div class="noteCell"><span class="noteLabel">실시간 재선정</span><span id="candidateRank" class="noteValue">-</span></div></div><div class="tablebox"><table id="candidateTable"><colgroup><col style="width:70px"><col style="width:130px"><col style="width:90px"><col style="width:80px"><col style="width:90px"><col style="width:80px"><col style="width:75px"><col style="width:70px"><col style="width:130px"><col style="width:150px"><col style="width:80px"><col style="width:90px"></colgroup><thead><tr><th>실시간순위</th><th class="left">종목</th><th>현재가</th><th>등락률</th><th>진입가</th><th>통합점수</th><th>딥점수</th><th>등급</th><th class="left">메가섹터</th><th class="left">에너지군</th><th>에너지</th><th>상태</th></tr></thead><tbody id="candidates"></tbody></table></div></div>
+<div class="section"><h2>현재 후보 · 실시간 현재가/등락률/진입가</h2><div id="candidateNote" class="note candidateNoteGrid"><div class="noteCell"><span class="noteLabel">후보상태</span><span id="candidateStatus" class="noteValue">-</span></div><div class="noteCell"><span class="noteLabel">현재가 갱신</span><span id="candidateLive" class="noteValue">-</span></div><div class="noteCell"><span class="noteLabel">실시간 재선정</span><span id="candidateRank" class="noteValue">-</span></div></div><div class="tablebox"><table id="candidateTable"><thead><tr><th>실시간순위</th><th class="left">종목</th><th>현재가</th><th>등락률</th><th>진입가</th><th>추천점수</th><th>통합점수</th><th>딥점수</th><th>등급</th><th class="left">에너지군</th><th>에너지</th><th>Δ에너지</th><th>순위이동</th><th>에너지방향</th><th>상태</th></tr></thead><tbody id="candidates"></tbody></table></div></div>
 <div class="section"><h2>가격·거래량 독립 레이더 <span id="vdStamp" class="sub"></span></h2><div class="note">외국인·기관·뉴스·섹터점수 없이 LS 가격·거래량만 사용합니다. STEADY_REACCEL &gt; RE_ACCEL &gt; STEADY_UP &gt; ACCEL 순으로 표시합니다. 신호가는 같은 상태가 유지되는 동안 최초 발생가로 고정됩니다.</div><div class="vdMeta"><div class="noteCell"><span class="noteLabel">추적</span><span id="vdTracked" class="noteValue">0</span></div><div class="noteCell"><span class="noteLabel">활성</span><span id="vdActive" class="noteValue">0</span></div><div class="noteCell"><span class="noteLabel">진입후보</span><span id="vdEntry" class="noteValue">0</span></div><div class="noteCell"><span class="noteLabel">상태</span><span id="vdStatus" class="noteValue">대기</span></div></div><div class="tablebox"><table id="vdTable"><thead><tr><th>순위</th><th>상태</th><th class="left">종목</th><th>신호가</th><th>현재가</th><th>등락률</th><th>점수</th><th>VOLx</th><th>IVOLx</th><th>거래가속</th><th>가격속도</th><th>완만상승</th><th>30분기울기</th><th>1분봉수</th><th>판정</th><th class="left">에너지군</th></tr></thead><tbody id="volumeDirection"></tbody></table></div></div>
 <div class="section"><h2>가격·거래량 독립레이더 발생기록부 <span id="vdHistCount" class="note"></span></h2><div class="historyMeta"><span><b>최근 20행 높이 고정</b> · 최대 200건 서버 영구기록 · 상태 전환 시 신호발생가/행동판정 고정 · 나머지 내부 스크롤</span><span id="vdHistPersist">서버기록 대기</span></div><div class="vdHistoryBox"><table id="vdHistoryTable"><thead><tr><th class="left">발생시각 KST</th><th>거래소</th><th>횟수</th><th>상태</th><th class="left">종목</th><th>신호발생가</th><th>발생등락률</th><th>점수</th><th>VOLx</th><th>IVOLx</th><th>거래가속</th><th>가격속도</th><th>완만점수</th><th>판정</th><th class="left">코멘트</th><th class="left">에너지군</th></tr></thead><tbody id="vdHistory"></tbody></table></div></div>
-<div class="section"><h2>섹터 에너지 변화 · 자금 이동도 <span id="sectorLiveStamp" class="sub"></span></h2><div id="sectorSourceNote" class="note"><span class="sectorSourceStrong">최소 3개·목표 5개 표본</span> · 1~2종목 군집은 동일 MEGA_SECTOR 대표주로 보강하며 보강주는 0.55 가중치 · KRX/NXT는 절대 혼합하지 않습니다.</div><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">에너지 군집</th><th>상태</th><th>에너지</th><th>Δ에너지</th><th>순위이동</th><th>Breadth</th><th>평균등락</th><th>시장RS</th><th>거래가속</th><th>판정표본</th></tr></thead><tbody id="sectors"></tbody></table></div></div>
-<div class="section"><h2>종가배팅 · 15:30 KRX / 19:30 NXT</h2><div class="note">강제충원 없음 · NXT WS 장애 시 REST_FALLBACK 명시 · NXT 프리미엄은 15:30 KRX 스냅샷 대비</div><h3>15:30 KRX CLOSE-BET <span id="krxCloseBetStamp" class="sub"></span></h3><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">종목</th><th>가격</th><th>등락률</th><th>점수</th><th>딥</th><th>에너지</th><th>체결강도</th><th>데이터</th><th class="left">근거</th></tr></thead><tbody id="krxCloseBet"></tbody></table></div><h3>19:30 NXT CLOSE-BET <span id="nxtCloseBetStamp" class="sub"></span></h3><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">종목</th><th>NXT가격</th><th>등락률</th><th>점수</th><th>딥</th><th>에너지</th><th>KRX대비</th><th>데이터</th><th class="left">근거</th></tr></thead><tbody id="nxtCloseBet"></tbody></table></div></div>
+<div class="section"><h2>전략 앵커센서</h2><div class="note">에너지군 순위에는 포함하지 않고 대형주 방향 확인용으로만 사용합니다.</div><div class="tablebox"><table><thead><tr><th class="left">앵커군</th><th class="left">종목</th><th>현재가</th><th>등락률</th><th>시장RS</th><th>체결강도</th></tr></thead><tbody id="anchorSensors"></tbody></table></div></div>
+<div class="section"><h2>섹터 에너지 변화 · 자금 이동도 <span id="sectorLiveStamp" class="sub"></span></h2><div id="sectorSourceNote" class="note"><span class="sectorSourceStrong">실제 30개 에너지군 전체 추적</span> · 최소 3개·목표 5개 · 부족 시 MICRO→SECTOR→MEGA 순 보강(0.55) · 직1 최고 S2/직2 최고 S3 · KRX/NXT 절대 분리</div><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">에너지 군집</th><th>상태</th><th>에너지</th><th>Δ에너지</th><th>순위이동</th><th>Breadth</th><th>평균등락</th><th>시장RS</th><th>거래가속</th><th>판정표본</th></tr></thead><tbody id="sectors"></tbody></table></div></div>
+<div class="section"><h2>종가배팅 · 15:30 KRX / 19:30 NXT</h2><div class="note">상승에너지 주력 80% + 독립선도주 예외 최대 20% · 큰 군집은 전체 500종목 풀의 MICRO 자금가속 확인 · 강제충원 없음</div><h3>15:30 KRX CLOSE-BET <span id="krxCloseBetStamp" class="sub"></span></h3><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">종목</th><th>가격</th><th>등락률</th><th>점수</th><th>트랙</th><th>에너지</th><th>ΔE</th><th class="left">MICRO</th><th>딥</th><th>체결강도</th><th>데이터</th><th class="left">근거</th></tr></thead><tbody id="krxCloseBet"></tbody></table></div><h3>19:30 NXT CLOSE-BET <span id="nxtCloseBetStamp" class="sub"></span></h3><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">종목</th><th>NXT가격</th><th>등락률</th><th>점수</th><th>트랙</th><th>에너지</th><th>ΔE</th><th class="left">MICRO</th><th>딥</th><th>KRX대비</th><th>데이터</th><th class="left">근거</th></tr></thead><tbody id="nxtCloseBet"></tbody></table></div></div>
 <div class="section"><h2>신호 기록부 <span id="histCount" class="note"></span></h2><div class="historyMeta"><span><b>화면 20행 고정</b> · 최대 200건 내부 스크롤</span><span id="histPersist">브라우저백업 대기</span></div><div class="historybox"><table><thead><tr><th class="left">선정시각 KST</th><th>거래소</th><th>세션</th><th>횟수</th><th>구분</th><th class="left">종목</th><th>현재가</th><th>현재등락률</th><th>진입가</th><th>딥점수</th><th>등급</th><th class="left">에너지군</th><th>에너지</th><th>상태</th></tr></thead><tbody id="history"></tbody></table></div></div>
 <div class="foot">08:00 NXT PRE에서 당일 첫 판정을 시작합니다. KRX와 NXT의 가격·과거봉·섹터에너지 캐시는 서로 분리되며 통합(U) 시세는 사용하지 않습니다. 진입가는 판정 시점 신호 기준가입니다.</div>
 </div>
@@ -5127,23 +5518,27 @@ function liveRankScore(r){
  return base+0.15*dyn;
 }
 function candidateRows(rows){
- if(!rows?.length)return '<tr><td colspan="12" class="empty left">현재 표시할 후보가 없습니다.</td></tr>';
+ if(!rows?.length)return '<tr><td colspan="15" class="empty left">현재 표시할 후보가 없습니다.</td></tr>';
  const sorted=[...rows].sort((a,b)=>liveRankScore(b)-liveRankScore(a));
- return sorted.map((r,i)=>`<tr><td>${i+1}</td><td class="left"><b>${esc(r.name)}</b></td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.entry_price)}</td><td>${num(r.integrated_score,1)}</td><td>${num(r.deep_score,1)}</td><td><span class="badge">${esc(r.deep_grade)}</span></td><td class="left">${esc(r.MEGA_SECTOR)}</td><td class="left">${esc(r.ENERGY_CLUSTER)}</td><td>${num(r.cluster_energy,1)}</td><td>${esc(r.cluster_state)}</td></tr>`).join('')
+ return sorted.map((r,i)=>{const d=Number(r.energy_delta),rm=Number(r.rank_move)||0;const dt=Number.isFinite(d)?((d>0?'+':'')+d.toFixed(1)):'-';const mt=rm>0?'↑'+rm:rm<0?'↓'+Math.abs(rm):'→';const tr=String(r.energy_trend||'UNKNOWN');const tc=tr.startsWith('RISING')?'up':tr==='FALLING'?'down':'';const rec=Number(r.buy_recommendation_score)>0?r.buy_recommendation_score:r.buy_priority_score;return `<tr><td>${i+1}</td><td class="left"><b>${esc(r.name)}</b></td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.entry_price)}</td><td>${num(rec,1)}</td><td>${num(r.integrated_score,1)}</td><td>${num(r.deep_score,1)}</td><td><span class="badge">${esc(r.deep_grade)}</span></td><td class="left">${esc(r.ENERGY_CLUSTER)}</td><td>${num(r.cluster_energy,1)}</td><td class="${Number.isFinite(d)?cls(d):''}">${dt}</td><td class="${rm>0?'up':rm<0?'down':''}">${mt}</td><td class="${tc}">${esc(tr)}</td><td>${esc(r.cluster_state)}</td></tr>`}).join('')
 }
 function vdStateClass(s){s=String(s||'');if(s==='STEADY_REACCEL'||s==='RE_ACCEL')return 'vdHot';if(s==='STEADY_UP'||s==='ACCEL')return 'vdWarm';if(s==='PAUSE')return 'vdPause';if(s==='DECAY'||s==='REJECT')return 'vdBad';return ''}
 function vdActionClass(a){a=String(a||'');if(a.includes('무효')||a.includes('청산'))return 'vdActionExit';if(a.includes('진입')&&!a.includes('대기'))return 'vdActionEntry';return 'vdActionWait'}
 function volumeDirectionRows(rows){
  if(!rows?.length)return '<tr><td colspan="16" class="empty left">아직 활성 가격·거래량 신호가 없습니다. 1분봉 누적 후 자동 표시됩니다.</td></tr>';
- return rows.map((r,i)=>`<tr><td>${i+1}</td><td><span class="vdState ${vdStateClass(r.combined_state)}">${esc(r.combined_state)}</span></td><td class="left"><b>${esc(r.name||r.symbol)}</b><span class="sub"> ${esc(r.symbol||'')}</span></td><td>${num(r.signal_price)}</td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.score,1)}</td><td>${num(r.volume_ratio,2)}</td><td>${num(r.instant_volume_ratio,2)}</td><td>${num(r.volume_acceleration,2)}</td><td class="${cls(r.price_velocity_pct)}">${pct(r.price_velocity_pct)}</td><td>${num(r.steady_score,1)}</td><td class="${cls(r.steady_slope_pct_per_30m)}">${pct(r.steady_slope_pct_per_30m)}</td><td>${num(r.bars)}</td><td><span class="vdAction ${vdActionClass(r.signal_action)}">${esc(r.signal_action||'-')}</span></td><td class="left">${esc(r.ENERGY_CLUSTER||'-')}</td></tr>`).join('')
+ return rows.map((r,i)=>`<tr><td>${i+1}</td><td><span class="vdState ${vdStateClass(r.combined_state)}">${esc(r.combined_state)}</span></td><td class="left"><b>${esc(r.name||'종목명확인중')}</b></td><td>${num(r.signal_price)}</td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.score,1)}</td><td>${num(r.volume_ratio,2)}</td><td>${num(r.instant_volume_ratio,2)}</td><td>${num(r.volume_acceleration,2)}</td><td class="${cls(r.price_velocity_pct)}">${pct(r.price_velocity_pct)}</td><td>${num(r.steady_score,1)}</td><td class="${cls(r.steady_slope_pct_per_30m)}">${pct(r.steady_slope_pct_per_30m)}</td><td>${num(r.bars)}</td><td><span class="vdAction ${vdActionClass(r.signal_action)}">${esc(r.signal_action||'-')}</span></td><td class="left">${esc(r.ENERGY_CLUSTER||'-')}</td></tr>`).join('')
 }
 function volumeDirectionHistoryRows(rows){
  if(!rows?.length)return '<tr><td colspan="16" class="empty left">아직 가격·거래량 발생기록이 없습니다.</td></tr>';
- return rows.slice(0,200).map(r=>`<tr><td class="left">${esc(r.recorded_at_kst||r.minute||'-')}</td><td>${esc(r.venue||'-')}</td><td>${num(r.occurrence)}</td><td><span class="vdState ${vdStateClass(r.combined_state)}">${esc(r.combined_state)}</span></td><td class="left"><b>${esc(r.name||r.symbol)}</b><span class="sub"> ${esc(r.symbol||'')}</span></td><td>${num(r.signal_price??r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.score,1)}</td><td>${num(r.volume_ratio,2)}</td><td>${num(r.instant_volume_ratio,2)}</td><td>${num(r.volume_acceleration,2)}</td><td class="${cls(r.price_velocity_pct)}">${pct(r.price_velocity_pct)}</td><td>${num(r.steady_score,1)}</td><td><span class="vdAction ${vdActionClass(r.signal_action)}">${esc(r.signal_action||(r.entry_candidate?'진입':'관찰'))}</span></td><td class="left vdComment">${esc(r.signal_comment||r.reason||'-')}${r.reference_entry_price?` · 기준진입가 ${num(r.reference_entry_price)}`:''}</td><td class="left">${esc(r.ENERGY_CLUSTER||'-')}</td></tr>`).join('')
+ return rows.slice(0,200).map(r=>`<tr><td class="left">${esc(r.recorded_at_kst||r.minute||'-')}</td><td>${esc(r.venue||'-')}</td><td>${num(r.occurrence)}</td><td><span class="vdState ${vdStateClass(r.combined_state)}">${esc(r.combined_state)}</span></td><td class="left"><b>${esc(r.name||'종목명확인중')}</b></td><td>${num(r.signal_price??r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.score,1)}</td><td>${num(r.volume_ratio,2)}</td><td>${num(r.instant_volume_ratio,2)}</td><td>${num(r.volume_acceleration,2)}</td><td class="${cls(r.price_velocity_pct)}">${pct(r.price_velocity_pct)}</td><td>${num(r.steady_score,1)}</td><td><span class="vdAction ${vdActionClass(r.signal_action)}">${esc(r.signal_action||(r.entry_candidate?'진입':'관찰'))}</span></td><td class="left vdComment">${esc(r.signal_comment||r.reason||'-')}${r.reference_entry_price?` · 기준진입가 ${num(r.reference_entry_price)}`:''}</td><td class="left">${esc(r.ENERGY_CLUSTER||'-')}</td></tr>`).join('')
+}
+function anchorRows(rows){
+ if(!rows?.length)return '<tr><td colspan="6" class="empty left">앵커센서 데이터 준비 중</td></tr>';
+ return rows.map(r=>`<tr><td class="left"><b>${esc(r.anchor_group||'-')}</b></td><td class="left">${esc(r.name||'종목명확인중')}</td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td class="${cls(r.market_rs)}">${num(r.market_rs,2)}</td><td>${num(r.trade_strength,0)}</td></tr>`).join('')
 }
 function sectorRows(rows){
  if(!rows?.length)return '<tr><td colspan="11" class="empty left">섹터 에너지 데이터 준비 중</td></tr>';
- return rows.slice(0,30).map(r=>{
+ return rows.map(r=>{
   let mv=esc(r.movement),mc=String(r.movement||'').startsWith('↑')?'up':String(r.movement||'').startsWith('↓')?'down':'';
   const reps=(r.representatives||[]).slice(0,5).map(x=>`<span class="sectorRepItem"><span class="sectorRepName">${esc(x.name)}</span>${x.supplemented?'<span class="repSupplement">보강</span>':''}<span class="sectorRepPrice">${num(x.current_price)}</span><span class="${cls(x.change_pct)}">${pct(x.change_pct)}</span></span>`).join('');
   const dn=Number(r.cluster_direct_members??r.cluster_members??0),sn=Number(r.cluster_supplemented_members||0),an=Number(r.cluster_members||0);const eq=String(r.evidence_quality||'');const sample=`${an} (직${dn}+보${sn})`;const stateCls=eq==='INSUFFICIENT'?'evidenceBad':eq==='SUPPLEMENTED'?'evidenceSup':'';
@@ -5152,7 +5547,7 @@ function sectorRows(rows){
   return main+sub;
  }).join('')
 }
-function closeBetRows(snap,isNxt){const rows=snap?.candidates||[];if(!rows.length)return '<tr><td colspan="10" class="empty left">적격 종가배팅 후보 없음</td></tr>';return rows.map((r,i)=>`<tr><td>${i+1}</td><td class="left"><b>${esc(r.name)}</b></td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.close_bet_score,1)}</td><td>${num(r.deep_score,1)}</td><td>${num(r.cluster_energy,1)}</td><td>${isNxt?(r.nxt_vs_krx_close_pct==null?'-':pct(r.nxt_vs_krx_close_pct)):num(r.trade_strength,0)}</td><td>${esc(r.close_bet_quote_source||snap.data_status||'-')}</td><td class="left">${esc((r.close_bet_reasons||[]).join(' · '))}</td></tr>`).join('')}
+function closeBetRows(snap,isNxt){const rows=snap?.candidates||[];if(!rows.length)return '<tr><td colspan="13" class="empty left">적격 종가배팅 후보 없음</td></tr>';return rows.map((r,i)=>{const d=Number(r.energy_delta),md=Number(r.micro_flow_delta);const micro=[r.MICRO_CLUSTER||r.ENERGY_DETAIL||'-',r.micro_flow_state||'-',Number.isFinite(md)?((md>0?'+':'')+md.toFixed(1)):'' ].filter(Boolean).join(' · ');return `<tr><td>${i+1}</td><td class="left"><b>${esc(r.name)}</b></td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.close_bet_score,1)}</td><td>${esc(r.close_bet_lane||'-')}</td><td>${num(r.cluster_energy,1)}</td><td class="${Number.isFinite(d)?cls(d):''}">${Number.isFinite(d)?((d>0?'+':'')+d.toFixed(1)):'-'}</td><td class="left">${esc(micro)}</td><td>${num(r.deep_score,1)}</td><td>${isNxt?(r.nxt_vs_krx_close_pct==null?'-':pct(r.nxt_vs_krx_close_pct)):num(r.trade_strength,0)}</td><td>${esc(r.close_bet_quote_source||snap.data_status||'-')}</td><td class="left">${esc((r.close_bet_reasons||[]).join(' · '))}</td></tr>`}).join('')}
 function historyRows(rows){if(!rows?.length)return '<tr><td colspan="14" class="empty left">아직 선정 히스토리가 없습니다.</td></tr>';return rows.slice(0,200).map(r=>`<tr><td class="left">${esc(r.selected_at_kst||'-')}</td><td>${esc(r.venue||'-')}</td><td>${esc(r.session||'-')}</td><td>${num(r.occurrence)}</td><td>${esc(r.selection_type)}</td><td class="left"><b>${esc(r.name)}</b></td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.entry_price)}</td><td>${num(r.deep_score,1)}</td><td>${esc(r.deep_grade)}</td><td class="left">${esc(r.ENERGY_CLUSTER)}</td><td>${num(r.cluster_energy,1)}</td><td>${esc(r.cluster_state)}</td></tr>`).join('')}
 async function refresh(){
  try{
@@ -5169,7 +5564,7 @@ async function refresh(){
  }catch(e){document.getElementById('progressMsg').textContent='STATUS ERROR: '+e}
  try{
   const r=await fetch('/api/results?x='+Date.now(),{cache:'no-store'}).then(r=>r.json());
-  const ur=r.universe_report||{};const handoff=ur.handoff_used?`${ur.handoff_source||'KRX'} · 유지 ${num(ur.handoff_kept)} · 보충 ${num(ur.handoff_filled)}`:'-';document.getElementById('summary').innerHTML=box('거래소',r.venue||'-')+box('세션',r.session||'-')+box('판정 유니버스',num(r.universe))+box('공통500 인계',handoff)+box('NXT 거래가능',num(ur.nxt_eligible_total))+box('시총필터 후',num(ur.cap_eligible_estimate))+box('섹터군집',num(r.clusters))+box('FINAL',num(r.final_count));
+  const ur=r.universe_report||{};const handoff=ur.handoff_used?`${ur.handoff_source||'KRX'} · 유지 ${num(ur.handoff_kept)} · 보충 ${num(ur.handoff_filled)}`:'-';document.getElementById('summary').innerHTML=box('거래소',r.venue||'-')+box('세션',r.session||'-')+box('판정 유니버스',num(r.universe))+box('공통500 인계',handoff)+box('NXT 거래가능',num(ur.nxt_eligible_total))+box('시총필터 후',num(ur.cap_eligible_estimate))+box('에너지군',`${num(r.clusters)}/${num(r.expected_clusters||30)}`)+box('FINAL',num(r.final_count));
   const finalRows=r.top_final||[], liveWatch=r.live_watch10||[], watchRows=r.top_watch||[];
   const show=liveWatch.length?liveWatch:(finalRows.length?finalRows:watchRows);
   const statusTxt=liveWatch.length?`LIVE WATCH ${liveWatch.length} · FINAL ${finalRows.length}`:(finalRows.length?`FINAL ${finalRows.length}`:`FINAL 없음 · WATCH ${watchRows.length}`);
@@ -5184,6 +5579,7 @@ async function refresh(){
   const vdStatus=document.getElementById('vdStatus');vdStatus.textContent=vd.last_error?('ERROR · '+vd.last_error):(vdRows.length?'신호 수신 중':'1분봉 누적/신호 대기');vdStatus.className='noteValue '+(vd.last_error?'bad':(vdRows.length?'ok':'warn'));
   document.getElementById('vdStamp').textContent=`· ${esc(vd.venue||r.venue||'-')} · ${vd.price_volume_only?'PRICE+VOLUME ONLY':'-'}`;
   const vdHist=(r.volume_direction_history||vd.history||[]).slice(0,200);document.getElementById('vdHistory').innerHTML=volumeDirectionHistoryRows(vdHist);document.getElementById('vdHistCount').textContent=`저장 ${vdHist.length}/200`;document.getElementById('vdHistPersist').textContent=`서버 영구기록 ${vdHist.length}/200`;
+  document.getElementById('anchorSensors').innerHTML=anchorRows(r.anchor_sensors||[]);
   document.getElementById('sectors').innerHTML=sectorRows(r.sector_energy||r.top_clusters||[]);
   const sls=document.getElementById('sectorLiveStamp');if(sls)sls.textContent=`· ${r.sector_display_venue||r.venue||'-'} · ${r.sector_display_source||r.live_sector_source||'SNAPSHOT'}${r.sector_display_updated_kst?' · '+r.sector_display_updated_kst:''}`;
   const ssn=document.getElementById('sectorSourceNote');if(ssn)ssn.textContent=r.sector_display_note||'KRX/NXT 데이터 분리';
