@@ -109,7 +109,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     WS_RECONNECT_BACKOFF_SECONDS=5 \
     SAVE_FULL_CSV=false \
     ALPHA500_DATA_DIR=/data \
-    RESULT_DIR=/data/results
+    RESULT_DIR=/data/results \
+    COMMON_GATE_INDEPENDENT_ENABLED=true \
+    COMMON_GATE_POLL_SECONDS=15 \
+    COMMON_GATE_STALE_SECONDS=900 \
+    COMMON_GATE_PROFILES=HIDDEN_GEM,MONEY_GAME,INDEP_LEADER,ASYM_RS \
+    COMMON_GATE_RESULT_DIR=/data/results/common_gate \
+    COMMON_GATE_MANUAL_INPUT=/data/results/common_gate_input.json
 
 WORKDIR /app
 RUN pip install --no-cache-dir "numpy>=1.26" "pandas>=2.1" "requests>=2.31" "websocket-client>=1.8" "psycopg[binary]>=3.2"
@@ -3266,7 +3272,7 @@ from urllib.parse import urlparse
 from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import Alpha500Integrated, market_session_now
 from 거래량가속_완만상승_LS브리지_V2 import LSVolumeDirectionBridge
 
-ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_38_CLOSEBET_DURABLE"
+ENGINE_VERSION = "ALPHA500_LS_CLUSTER_HA_V1_9_40_UI_RENDER_FIX"
 VERSION = ENGINE_VERSION
 PORT = int(os.getenv("PORT", "10000"))
 MASTER = os.getenv("UNIVERSE_MASTER", "섹터마스터_500종목_V3.csv")
@@ -6428,7 +6434,7 @@ class Handler(BaseHTTPRequestHandler):
 <title>ALPHA500 LS Cluster Radar</title>
 <style>
 :root{color-scheme:dark;--bg:#07111f;--card:#0e1b2d;--line:#20324a;--txt:#eef5ff;--muted:#92a9c5;--ok:#36d399;--warn:#fbbf24;--bad:#fb7185;--accent:#60a5fa;--cyan:#67e8f9}
-*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#07111f,#091525);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1400px;margin:auto;padding:16px}.top{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}.title{font-size:22px;font-weight:850}.sub{color:var(--muted);font-size:12px;margin-top:4px}.grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:9px;margin:14px 0}.card{background:rgba(14,27,45,.94);border:1px solid var(--line);border-radius:14px;padding:12px}.k{color:var(--muted);font-size:11px}.v{font-size:17px;font-weight:850;margin-top:6px;word-break:break-word}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.cyan{color:var(--cyan)}button{background:var(--accent);border:0;border-radius:10px;padding:10px 14px;font-weight:850;color:#06111f}.progress{height:10px;background:#14233a;border-radius:999px;overflow:hidden;margin-top:8px}.bar{height:100%;width:0;background:linear-gradient(90deg,#60a5fa,#36d399);transition:width .3s}.phase{font-size:13px;color:var(--muted);margin-top:7px}.section{margin-top:16px}.section h2{font-size:17px;margin:0 0 8px}.note{font-size:12px;color:var(--muted);margin:6px 0}.tablebox{border:1px solid var(--line);border-radius:12px;overflow:auto;background:#07101d}.historybox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}table{width:100%;border-collapse:collapse;min-width:1000px;font-size:12px}th{position:sticky;top:0;background:#122139;color:#b9cbe1;z-index:2;text-align:right;padding:9px 8px;border-bottom:1px solid var(--line);white-space:nowrap}td{text-align:right;padding:9px 8px;border-bottom:1px solid #13233a;white-space:nowrap}th.left,td.left{text-align:left}tr:hover td{background:#0c1b2e}.pos{color:#fb7185}.neg{color:#60a5fa}.up{color:#36d399;font-weight:800}.down{color:#fb7185;font-weight:800}.badge{padding:3px 7px;border-radius:999px;background:#162843}.empty{padding:18px;color:var(--muted)}.sectorMain td{border-bottom:0}.sectorReps td{padding:2px 8px 6px;border-bottom:1px solid #13233a;background:#081421}.sectorRepList{display:flex;gap:10px;align-items:center;overflow:hidden;white-space:nowrap;font-size:8px;line-height:1.15;color:#7f98b8;font-variant-numeric:tabular-nums}.sectorRepItem{display:inline-flex;gap:3px;align-items:center;min-width:0}.sectorRepName{color:#a9bdd5;font-weight:700}.sectorRepPrice{color:#7891b0}.summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.sbox{background:#0b1727;border:1px solid var(--line);border-radius:10px;padding:10px}.snum{font-weight:850;font-size:18px}.foot{color:var(--muted);font-size:11px;margin-top:14px}.stickytime{font-variant-numeric:tabular-nums}.livecard{grid-column:span 3;min-width:0}.livecols,.candidateNoteGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;min-width:0}.livecols{margin-top:6px;min-height:42px}.livecell,.noteCell{min-width:0;border:1px solid #1a2b43;background:#0a1727;border-radius:8px;padding:6px 8px;overflow:hidden}.liveLabel,.noteLabel{display:block;color:var(--muted);font-size:10px;margin-bottom:2px}.liveValue,.noteValue{display:block;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.counterCard .v{font-variant-numeric:tabular-nums;font-size:20px}.historyMeta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin:6px 0}.historyMeta b{color:#cbd8e8}.candidateNoteGrid{min-height:48px;margin:6px 0}.candidateNoteGrid .noteValue{font-size:11px;color:#cbd8e8}#historyTable{min-width:860px}#historyTable th:nth-child(1),#historyTable td:nth-child(1){width:66px;min-width:66px;max-width:66px;text-align:center}#historyTable th:nth-child(2),#historyTable td:nth-child(2){width:48px;min-width:48px;max-width:48px}#historyTable th:nth-child(3),#historyTable td:nth-child(3){width:72px;min-width:72px;max-width:72px}#candidateTable{min-width:1480px}#candidateTable td{overflow:hidden;text-overflow:ellipsis}#candidateTable th:nth-child(1){width:70px}#candidateTable th:nth-child(2){width:130px}#candidateTable th:nth-child(3){width:90px}#candidateTable th:nth-child(4){width:80px}#candidateTable th:nth-child(5){width:90px}#candidateTable th:nth-child(6){width:80px}#candidateTable th:nth-child(7){width:75px}#candidateTable th:nth-child(8){width:70px}#candidateTable th:nth-child(9){width:130px}#candidateTable th:nth-child(10){width:150px}#candidateTable th:nth-child(11){width:80px}#candidateTable th:nth-child(12){width:90px}.vdMeta{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px;margin:6px 0}.vdState{display:inline-block;padding:3px 7px;border-radius:999px;background:#162843;font-weight:800}.vdHot{color:#36d399}.vdWarm{color:#67e8f9}.vdPause{color:#fbbf24}.vdBad{color:#fb7185}.vdAction{display:inline-block;padding:3px 7px;border-radius:999px;background:#162843;font-weight:800}.vdActionEntry{color:#36d399}.vdActionWait{color:#fbbf24}.vdActionExit{color:#fb7185}.vdComment{white-space:normal;min-width:330px;max-width:520px;line-height:1.35;color:#cbd8e8}#vdTable{min-width:1320px}#vdHistoryTable{min-width:1650px}.vdHistoryBox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}.scorecardbox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}#scorecardTable{min-width:1320px}.scoreWin{color:#fb7185;font-weight:800}.scoreLoss{color:#60a5fa;font-weight:800}.scoreFlat{color:#fbbf24;font-weight:800}.repSupplement{color:#fbbf24;font-size:9px;margin-left:2px}.evidenceSup{color:#fbbf24}.evidenceBad{color:#fb7185}.sectorSourceStrong{color:#cbd8e8;font-weight:700}.actionBadge{display:inline-block;padding:4px 8px;border-radius:999px;font-weight:900}.actionBuy{color:#36d399;background:#102b26}.actionClose{color:#67e8f9;background:#0d2b33}.actionException{color:#c084fc;background:#261a36}.actionWait{color:#fbbf24;background:#302710}.actionNo{color:#fb7185;background:#321621}.gatePass{color:#36d399;font-weight:800}.gateFail{color:#fb7185;font-weight:800}#independentLeaderTable{min-width:1500px}#independentLeaderHistoryTable{min-width:1850px}#independentLeaderScorecardTable{min-width:1320px}#candidateTable{min-width:1750px}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#07111f,#091525);color:var(--txt);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:1400px;margin:auto;padding:16px}.top{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}.title{font-size:22px;font-weight:850}.sub{color:var(--muted);font-size:12px;margin-top:4px}.grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:9px;margin:14px 0}.card{background:rgba(14,27,45,.94);border:1px solid var(--line);border-radius:14px;padding:12px}.k{color:var(--muted);font-size:11px}.v{font-size:17px;font-weight:850;margin-top:6px;word-break:break-word}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.cyan{color:var(--cyan)}button{background:var(--accent);border:0;border-radius:10px;padding:10px 14px;font-weight:850;color:#06111f}.progress{height:10px;background:#14233a;border-radius:999px;overflow:hidden;margin-top:8px}.bar{height:100%;width:0;background:linear-gradient(90deg,#60a5fa,#36d399);transition:width .3s}.phase{font-size:13px;color:var(--muted);margin-top:7px}.section{margin-top:16px}.section h2{font-size:17px;margin:0 0 8px}.note{font-size:12px;color:var(--muted);margin:6px 0}.tablebox{border:1px solid var(--line);border-radius:12px;overflow:auto;background:#07101d}.historybox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}table{width:100%;border-collapse:collapse;min-width:1000px;font-size:12px}th{position:sticky;top:0;background:#122139;color:#b9cbe1;z-index:2;text-align:right;padding:9px 8px;border-bottom:1px solid var(--line);white-space:nowrap}td{text-align:right;padding:9px 8px;border-bottom:1px solid #13233a;white-space:nowrap}th.left,td.left{text-align:left}tr:hover td{background:#0c1b2e}.pos{color:#fb7185}.neg{color:#60a5fa}.up{color:#36d399;font-weight:800}.down{color:#fb7185;font-weight:800}.badge{padding:3px 7px;border-radius:999px;background:#162843}.empty{padding:18px;color:var(--muted)}.sectorMain td{border-bottom:0}.sectorReps td{padding:2px 8px 6px;border-bottom:1px solid #13233a;background:#081421}.sectorRepList{display:flex;gap:10px;align-items:center;overflow:hidden;white-space:nowrap;font-size:8px;line-height:1.15;color:#7f98b8;font-variant-numeric:tabular-nums}.sectorRepItem{display:inline-flex;gap:3px;align-items:center;min-width:0}.sectorRepName{color:#a9bdd5;font-weight:700}.sectorRepPrice{color:#7891b0}.summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}.sbox{background:#0b1727;border:1px solid var(--line);border-radius:10px;padding:10px}.snum{font-weight:850;font-size:18px}.foot{color:var(--muted);font-size:11px;margin-top:14px}.stickytime{font-variant-numeric:tabular-nums}.livecard{grid-column:span 3;min-width:0}.livecols,.candidateNoteGrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;min-width:0}.livecols{margin-top:6px;min-height:42px}.livecell,.noteCell{min-width:0;border:1px solid #1a2b43;background:#0a1727;border-radius:8px;padding:6px 8px;overflow:hidden}.liveLabel,.noteLabel{display:block;color:var(--muted);font-size:10px;margin-bottom:2px}.liveValue,.noteValue{display:block;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.counterCard .v{font-variant-numeric:tabular-nums;font-size:20px}.historyMeta{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--muted);margin:6px 0}.historyMeta b{color:#cbd8e8}.candidateNoteGrid{min-height:48px;margin:6px 0}.candidateNoteGrid .noteValue{font-size:11px;color:#cbd8e8}#historyTable{min-width:860px}#historyTable th:nth-child(1),#historyTable td:nth-child(1){width:66px;min-width:66px;max-width:66px;text-align:center}#historyTable th:nth-child(2),#historyTable td:nth-child(2){width:48px;min-width:48px;max-width:48px}#historyTable th:nth-child(3),#historyTable td:nth-child(3){width:72px;min-width:72px;max-width:72px}#candidateTable{min-width:1480px}#candidateTable td{overflow:hidden;text-overflow:ellipsis}#candidateTable th:nth-child(1){width:70px}#candidateTable th:nth-child(2){width:130px}#candidateTable th:nth-child(3){width:90px}#candidateTable th:nth-child(4){width:80px}#candidateTable th:nth-child(5){width:90px}#candidateTable th:nth-child(6){width:80px}#candidateTable th:nth-child(7){width:75px}#candidateTable th:nth-child(8){width:70px}#candidateTable th:nth-child(9){width:130px}#candidateTable th:nth-child(10){width:150px}#candidateTable th:nth-child(11){width:80px}#candidateTable th:nth-child(12){width:90px}.vdMeta{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px;margin:6px 0}.vdState{display:inline-block;padding:3px 7px;border-radius:999px;background:#162843;font-weight:800}.vdHot{color:#36d399}.vdWarm{color:#67e8f9}.vdPause{color:#fbbf24}.vdBad{color:#fb7185}.vdAction{display:inline-block;padding:3px 7px;border-radius:999px;background:#162843;font-weight:800}.vdActionEntry{color:#36d399}.vdActionWait{color:#fbbf24}.vdActionExit{color:#fb7185}.vdComment{white-space:normal;min-width:330px;max-width:520px;line-height:1.35;color:#cbd8e8}#vdTable{min-width:1320px}#vdHistoryTable{min-width:1420px}#vdHistoryTable th:nth-child(1),#vdHistoryTable td:nth-child(1){width:66px;min-width:66px;max-width:66px;text-align:center}.vdHistoryBox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}.scorecardbox{height:680px;max-height:680px;overflow-y:scroll;overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;scrollbar-gutter:stable;border:1px solid var(--line);border-radius:12px;background:#07101d}#scorecardTable{min-width:1320px}.scoreWin{color:#fb7185;font-weight:800}.scoreLoss{color:#60a5fa;font-weight:800}.scoreFlat{color:#fbbf24;font-weight:800}.repSupplement{color:#fbbf24;font-size:9px;margin-left:2px}.evidenceSup{color:#fbbf24}.evidenceBad{color:#fb7185}.sectorSourceStrong{color:#cbd8e8;font-weight:700}.actionBadge{display:inline-block;padding:4px 8px;border-radius:999px;font-weight:900}.actionBuy{color:#36d399;background:#102b26}.actionClose{color:#67e8f9;background:#0d2b33}.actionException{color:#c084fc;background:#261a36}.actionWait{color:#fbbf24;background:#302710}.actionNo{color:#fb7185;background:#321621}.gatePass{color:#36d399;font-weight:800}.gateFail{color:#fb7185;font-weight:800}#independentLeaderTable{min-width:1500px}#independentLeaderHistoryTable{min-width:1850px}#independentLeaderScorecardTable{min-width:1320px}#candidateTable{min-width:1750px}
 @media(max-width:900px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.livecard{grid-column:1/-1}.summary{grid-template-columns:repeat(2,minmax(0,1fr))}.v{font-size:15px}.wrap{padding:12px}.historybox{height:620px;max-height:620px}.vdHistoryBox{height:620px;max-height:620px}.scorecardbox{height:620px;max-height:620px}}
 </style></head>
 <body><div class="wrap">
@@ -6452,7 +6458,7 @@ class Handler(BaseHTTPRequestHandler):
 <div class="section"><h2>오늘 행동 · 언제 무엇을 살지</h2><div id="actionSummary" class="summary"></div><div class="note"><b>장중 지금매수</b>: FINAL + Deep≥72 + UP_START/REVERSAL_ARMED + S2/S3 + 에너지 비하락 + RE_ACCEL/STEADY_REACCEL · <b>KRX 종가매수</b>: 15:20 사전스캔 → Full Scan 재확인 → 15:27 판정, 점수≥72 · <b>NXT 종가매수</b>: 19:20 사전스캔 → 19:30 판정, 점수≥72 · 65~71.9는 대기 · 조건 미달/DECAY/FALLING은 매수금지</div></div>
 <div class="section"><h2>현재 후보 · 실시간 현재가/등락률/진입가</h2><div id="candidateNote" class="note candidateNoteGrid"><div class="noteCell"><span class="noteLabel">후보상태</span><span id="candidateStatus" class="noteValue">-</span></div><div class="noteCell"><span class="noteLabel">현재가 갱신</span><span id="candidateLive" class="noteValue">-</span></div><div class="noteCell"><span class="noteLabel">실시간 재선정</span><span id="candidateRank" class="noteValue">-</span></div></div><div class="tablebox"><table id="candidateTable"><thead><tr><th>실시간순위</th><th>최종행동</th><th class="left">종목</th><th>현재가</th><th>등락률</th><th>진입가</th><th>추천점수</th><th>통합점수</th><th>딥점수</th><th>등급</th><th class="left">에너지군</th><th>에너지</th><th>Δ에너지</th><th>순위이동</th><th>에너지방향</th><th>상태</th><th class="left">행동근거</th></tr></thead><tbody id="candidates"></tbody></table></div></div>
 <div class="section"><h2>가격·거래량 독립 레이더 <span id="vdStamp" class="sub"></span></h2><div class="note">외국인·기관·뉴스·섹터점수 없이 LS 가격·거래량만 사용합니다. STEADY_REACCEL &gt; RE_ACCEL &gt; STEADY_UP &gt; ACCEL 순으로 표시합니다. KRX/NXT 모두 전체 유니버스 누적을 시도하며, 최소 1분봉 수가 확보되지 않은 종목은 <b>워밍업</b>으로 분리합니다.</div><div class="vdMeta"><div class="noteCell"><span class="noteLabel">추적</span><span id="vdTracked" class="noteValue">0</span></div><div class="noteCell"><span class="noteLabel">판정준비</span><span id="vdReady" class="noteValue">0</span></div><div class="noteCell"><span class="noteLabel">활성</span><span id="vdActive" class="noteValue">0</span></div><div class="noteCell"><span class="noteLabel">진입후보</span><span id="vdEntry" class="noteValue">0</span></div><div class="noteCell"><span class="noteLabel">상태</span><span id="vdStatus" class="noteValue">대기</span></div></div><div class="tablebox"><table id="vdTable"><thead><tr><th>순위</th><th>상태</th><th class="left">종목</th><th>신호가</th><th>현재가</th><th>등락률</th><th>점수</th><th>VOLx</th><th>IVOLx</th><th>거래가속</th><th>가격속도</th><th>완만상승</th><th>30분기울기</th><th>1분봉수</th><th>판정</th><th class="left">에너지군</th></tr></thead><tbody id="volumeDirection"></tbody></table></div></div>
-<div class="section"><h2>가격·거래량 독립레이더 발생기록부 <span id="vdHistCount" class="note"></span></h2><div class="historyMeta"><span><b>최근 20행 높이 고정</b> · 최대 200건 서버 영구기록 · 상태 전환 시 신호발생가/행동판정 고정 · 나머지 내부 스크롤</span><span id="vdHistPersist">서버기록 대기</span></div><div class="vdHistoryBox"><table id="vdHistoryTable"><thead><tr><th class="left">발생시각 KST</th><th>거래소</th><th>횟수</th><th>상태</th><th class="left">종목</th><th>신호발생가</th><th>발생등락률</th><th>점수</th><th>VOLx</th><th>IVOLx</th><th>거래가속</th><th>가격속도</th><th>완만점수</th><th>판정</th><th class="left">코멘트</th><th class="left">에너지군</th></tr></thead><tbody id="vdHistory"></tbody></table></div></div>
+<div class="section"><h2>가격·거래량 독립레이더 발생기록부 <span id="vdHistCount" class="note"></span></h2><div class="historyMeta"><span><b>최근 20행 높이 고정</b> · 최대 200건 서버 영구기록 · 상태 전환 시 신호발생가/행동판정 고정 · 나머지 내부 스크롤</span><span id="vdHistPersist">서버기록 대기</span></div><div class="vdHistoryBox"><table id="vdHistoryTable"><thead><tr><th>발생시간</th><th>횟수</th><th>상태</th><th class="left">종목</th><th>신호발생가</th><th>발생등락률</th><th>점수</th><th>VOLx</th><th>IVOLx</th><th>거래가속</th><th>가격속도</th><th>완만점수</th><th>판정</th><th class="left">코멘트</th><th class="left">에너지군</th></tr></thead><tbody id="vdHistory"></tbody></table></div></div>
 <div class="section"><h2>전략 앵커센서</h2><div class="note">에너지군 순위에는 포함하지 않고 대형주 방향 확인용으로만 사용합니다.</div><div class="tablebox"><table><thead><tr><th class="left">앵커군</th><th class="left">종목</th><th>현재가</th><th>등락률</th><th>시장RS</th><th>체결강도</th></tr></thead><tbody id="anchorSensors"></tbody></table></div></div>
 <div class="section"><h2>섹터 에너지 변화 · 자금 이동도 <span id="sectorLiveStamp" class="sub"></span></h2><div id="sectorSourceNote" class="note"><span class="sectorSourceStrong">실제 30개 에너지군 전체 추적</span> · 최소 3개·목표 5개 · 부족 시 MICRO→SECTOR→MEGA 순 보강(0.55) · 직1 최고 S2/직2 최고 S3 · KRX/NXT 절대 분리</div><div class="tablebox"><table><thead><tr><th>순위</th><th class="left">에너지 군집</th><th>상태</th><th>에너지</th><th>Δ에너지</th><th>순위이동</th><th>Breadth</th><th>평균등락</th><th>시장RS</th><th>거래가속</th><th>판정표본</th></tr></thead><tbody id="sectors"></tbody></table></div></div>
 <div class="section"><h2>종가배팅 · KRX 15:27 / NXT 19:30</h2><div class="note">상승에너지 주력 80% + 독립선도주 예외 최대 20% · <b>매수여부는 HARD GATE만 결정</b> · PASS만 매수 · NEAR는 대기 · 점수는 PASS/NEAR 내부 순위 전용 · Full Scan 미완료는 INVALID · 예약 자체 미실행은 NOT_RUN · <b>종가판정은 Postgres + 브라우저 이중보존</b></div><h3>15:27 KRX CLOSE-BET <span id="krxCloseBetStamp" class="sub"></span></h3><div class="tablebox"><table><thead><tr><th>순위</th><th>행동</th><th class="left">종목</th><th>가격</th><th>등락률</th><th>점수</th><th>트랙</th><th>에너지</th><th>ΔE</th><th class="left">MICRO</th><th>딥</th><th>체결강도</th><th>데이터</th><th class="left">근거/탈락사유</th></tr></thead><tbody id="krxCloseBet"></tbody></table></div><h3>19:30 NXT CLOSE-BET <span id="nxtCloseBetStamp" class="sub"></span></h3><div class="tablebox"><table><thead><tr><th>순위</th><th>행동</th><th class="left">종목</th><th>NXT가격</th><th>등락률</th><th>점수</th><th>트랙</th><th>에너지</th><th>ΔE</th><th class="left">MICRO</th><th>딥</th><th>KRX대비</th><th>데이터</th><th class="left">근거/탈락사유</th></tr></thead><tbody id="nxtCloseBet"></tbody></table></div></div>
@@ -6471,6 +6477,8 @@ const pct=v=>{const n=Number(v);return Number.isFinite(n)?((n>0?'+':'')+n.toFixe
 const cls=v=>Number(v)>0?'pos':Number(v)<0?'neg':'';
 const box=(k,v)=>`<div class="sbox"><div class="k">${esc(k)}</div><div class="snum">${esc(v)}</div></div>`;
 function actionBadge(a){const x=String(a||'대기');const c=x==='지금매수'?'actionBuy':x==='종가매수'?'actionClose':x==='예외매수'?'actionException':x==='매수금지'?'actionNo':'actionWait';return `<span class="actionBadge ${c}">${esc(x)}</span>`}
+function vdStateClass(v){const x=String(v||'').toUpperCase();if(['STEADY_REACCEL','RE_ACCEL'].includes(x))return 'vdHot';if(['STEADY_UP','ACCEL'].includes(x))return 'vdWarm';if(['DECAY','REJECT'].includes(x))return 'vdBad';return 'vdPause'}
+function vdActionClass(v){const x=String(v||'');if(x.includes('진입'))return 'vdActionEntry';if(x.includes('무효')||x.includes('청산'))return 'vdActionExit';return 'vdActionWait'}
 function mergeHistory(serverRows,venue){const key='ALPHA500_HISTORY_'+String(venue||'KRX').toUpperCase();let local=[];try{local=JSON.parse(localStorage.getItem(key)||'[]');if(!Array.isArray(local))local=[]}catch(e){local=[]}const m=new Map();[...(serverRows||[]),...local].forEach(r=>{const k=[r.selected_at_kst||'',r.symbol||'',r.selection_type||'',r.entry_price||''].join('|');if(!m.has(k))m.set(k,r)});const out=[...m.values()].sort((a,b)=>String(b.selected_at_kst||'').localeCompare(String(a.selected_at_kst||''))).slice(0,200);try{localStorage.setItem(key,JSON.stringify(out))}catch(e){}return out;}
 function clamp(v,a,b){v=Number(v)||0;return Math.max(a,Math.min(b,v))}
 function liveRankScore(r){
@@ -6494,8 +6502,8 @@ function volumeDirectionRows(rows){
  return rows.map((r,i)=>`<tr><td>${i+1}</td><td><span class="vdState ${vdStateClass(r.combined_state)}">${esc(r.combined_state)}</span></td><td class="left"><b>${esc(r.name||'종목명확인중')}</b></td><td>${num(r.signal_price)}</td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.score,1)}</td><td>${num(r.volume_ratio,2)}</td><td>${num(r.instant_volume_ratio,2)}</td><td>${num(r.volume_acceleration,2)}</td><td class="${cls(r.price_velocity_pct)}">${pct(r.price_velocity_pct)}</td><td>${num(r.steady_score,1)}</td><td class="${cls(r.steady_slope_pct_per_30m)}">${pct(r.steady_slope_pct_per_30m)}</td><td>${num(r.bars)}</td><td><span class="vdAction ${vdActionClass(r.signal_action)}">${esc(r.signal_action||'-')}</span></td><td class="left">${esc(r.ENERGY_CLUSTER||'-')}</td></tr>`).join('')
 }
 function volumeDirectionHistoryRows(rows){
- if(!rows?.length)return '<tr><td colspan="16" class="empty left">아직 가격·거래량 발생기록이 없습니다.</td></tr>';
- return rows.slice(0,200).map(r=>`<tr><td class="left">${esc(r.recorded_at_kst||r.minute||'-')}</td><td>${esc(r.venue||'-')}</td><td>${num(r.occurrence)}</td><td><span class="vdState ${vdStateClass(r.combined_state)}">${esc(r.combined_state)}</span></td><td class="left"><b>${esc(r.name||'종목명확인중')}</b></td><td>${num(r.signal_price??r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.score,1)}</td><td>${num(r.volume_ratio,2)}</td><td>${num(r.instant_volume_ratio,2)}</td><td>${num(r.volume_acceleration,2)}</td><td class="${cls(r.price_velocity_pct)}">${pct(r.price_velocity_pct)}</td><td>${num(r.steady_score,1)}</td><td><span class="vdAction ${vdActionClass(r.signal_action)}">${esc(r.signal_action||(r.entry_candidate?'진입':'관찰'))}</span></td><td class="left vdComment">${esc(r.signal_comment||r.reason||'-')}${r.reference_entry_price?` · 기준진입가 ${num(r.reference_entry_price)}`:''}</td><td class="left">${esc(r.ENERGY_CLUSTER||'-')}</td></tr>`).join('')
+ if(!rows?.length)return '<tr><td colspan="15" class="empty left">아직 가격·거래량 발생기록이 없습니다.</td></tr>';
+ return rows.slice(0,200).map(r=>`<tr><td>${esc(shortKstTime(r.recorded_at_kst||r.minute||'-'))}</td><td>${num(r.occurrence)}</td><td><span class="vdState ${vdStateClass(r.combined_state)}">${esc(r.combined_state)}</span></td><td class="left"><b>${esc(r.name||'종목명확인중')}</b></td><td>${num(r.signal_price??r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.score,1)}</td><td>${num(r.volume_ratio,2)}</td><td>${num(r.instant_volume_ratio,2)}</td><td>${num(r.volume_acceleration,2)}</td><td class="${cls(r.price_velocity_pct)}">${pct(r.price_velocity_pct)}</td><td>${num(r.steady_score,1)}</td><td><span class="vdAction ${vdActionClass(r.signal_action)}">${esc(r.signal_action||(r.entry_candidate?'진입':'관찰'))}</span></td><td class="left vdComment">${esc(r.signal_comment||r.reason||'-')}${r.reference_entry_price?` · 기준진입가 ${num(r.reference_entry_price)}`:''}</td><td class="left">${esc(r.ENERGY_CLUSTER||'-')}</td></tr>`).join('')
 }
 function anchorRows(rows){
  if(!rows?.length)return '<tr><td colspan="6" class="empty left">앵커센서 데이터 준비 중</td></tr>';
@@ -6528,11 +6536,12 @@ function closeBetResolved(v,serverSnap,meta){
  if(serverSnap){closeBetCacheSave(v,serverSnap);return serverSnap}
  return null
 }
-function closeBetStoreLabel(z){if(!z)return '';if(z.restored_from_durable)return ' · DB복원';if(z.browser_restored)return ' · 브라우저복원';if(z.durable_store==='POSTGRES')return ' · DB저장';return ' · 로컬'}
+function closeBetStoreLabel(z){if(!z)return '';if(z.restored_from_durable)return ' · DB복원';if(z.browser_restored)return ' · 브라우저복원';if(z.durable_store==='POSTGRES')return ' · DB저장';return ' · 로컬(재시작시소실가능)'}
 function closeBetRows(snap,isNxt){
  if(!snap)return '<tr><td colspan="14" class="empty left">판정 대기</td></tr>';
  if(snap.decision_status==='INVALID')return `<tr><td colspan="14" class="empty left bad">판정무효(INVALID) · ${esc(snap.invalid_reason||'데이터/스캔 준비 미완료')}</td></tr>`;
  if(snap.decision_status==='NOT_RUN')return `<tr><td colspan="14" class="empty left bad">판정 미실행(NOT_RUN) · ${esc(snap.invalid_reason||'예약시각 서비스/스케줄 미실행')}</td></tr>`;
+ if(snap.decision_status==='WAITING'||snap.data_status==='WAITING_TODAY')return '<tr><td colspan="14" class="empty left">오늘 종가판정 대기 · 전일 종가판정 보관 종료</td></tr>';
  const buys=snap.candidates||[], waits=snap.near_candidates||[], rejects=snap.rejected_top10||[];let rows=[...buys,...waits];if(!rows.length)rows=rejects.slice(0,10);
  if(!rows.length)return '<tr><td colspan="14" class="empty left">정상 판정 완료 · 적격 종가매수 없음(NO_BET)</td></tr>';
  return rows.map((r,i)=>{const d=Number(r.energy_delta),md=Number(r.micro_flow_delta);const micro=[r.MICRO_CLUSTER||r.ENERGY_DETAIL||'-',r.micro_flow_state||'-',Number.isFinite(md)?((md>0?'+':'')+md.toFixed(1)):'' ].filter(Boolean).join(' · ');const why=(r.close_bet_reasons||[]).length?(r.close_bet_reasons||[]).join(' · '):(r.action_reason||((r.close_bet_fail_reasons||[]).join(' · ')));return `<tr><td>${i+1}</td><td>${actionBadge(r.final_action||'매수금지')}</td><td class="left"><b>${esc(r.name)}</b></td><td>${num(r.current_price)}</td><td class="${cls(r.change_pct)}">${pct(r.change_pct)}</td><td>${num(r.close_bet_score,1)}</td><td>${esc(r.close_bet_lane||'-')}</td><td>${num(r.cluster_energy,1)}</td><td class="${Number.isFinite(d)?cls(d):''}">${Number.isFinite(d)?((d>0?'+':'')+d.toFixed(1)):'-'}</td><td class="left">${esc(micro)}</td><td>${num(r.deep_score,1)}</td><td>${isNxt?(r.nxt_vs_krx_close_pct==null?'-':pct(r.nxt_vs_krx_close_pct)):num(r.trade_strength,0)}</td><td>${esc(r.close_bet_quote_source||snap.data_status||'-')}</td><td class="left">${esc(why||'-')}</td></tr>`}).join('')
@@ -9927,5 +9936,1131 @@ COPY <<'ALPHA500_6D6645C0AAB0' /app/섹터마스터_500종목_V3.csv
 500,포스코DX,LIQUIDITY_POOL,IT서비스,IT서비스_산업,산업_IT서비스,IT서비스,MEGA_FALLBACK,,LIQUIDITY_POOL,0.85,Y,LS검증대기,CANDIDATE,,초기 500 유동성/시장대표 보강. 실행 시 LS t1463·rolling liquidity로 ANCHOR 여부 재판정.,
 ALPHA500_6D6645C0AAB0
 
+# independent sidecar: user-attached common gate-first framework (kept separate from ALPHA500 core)
+COPY <<'COMMON_GATE_FRAMEWORK_EOF' /app/공통_게이트우선_판정프레임워크_V1_0.py
+# -*- coding: utf-8 -*-
+"""
+공통_게이트우선_판정프레임워크_V1_0.py
+
+목적
+----
+기존 각 전략의 데이터 수집/원천 판정 로직은 그대로 유지하고,
+최종 의사결정 흐름만 아래와 같이 통일한다.
+
+DATA -> HARD GATE -> PURPOSE GATE -> STATE -> RANK
+
+핵심 원칙
+---------
+1) Hard Gate 실패는 다른 좋은 조건으로 상쇄할 수 없다.
+2) Purpose Gate 실패도 점수로 구제하지 않는다.
+3) 상태는 REJECT / WATCH / FORMING / ARMED / ENTER 로만 관리한다.
+4) 점수는 매수 여부를 결정하지 않는다.
+5) 점수/랭킹은 "같은 상태" 후보끼리 정렬할 때만 사용한다.
+6) 적격 종목이 없으면 0개를 정상 결과로 허용한다.
+7) 기존 LS/KIS/Kiwoom/WebSocket/섹터에너지/가격거래량 로직을 수정하지 않는다.
+
+지원 프로필
+-----------
+- DHANDHO        : 가치·현금·성장·비대칭
+- HIDDEN_GEM     : 상방진주/재응축
+- MONEY_GAME     : 후발주·머니게임
+- INDEP_LEADER   : 독립선도주
+- ASYM_RS        : 비대칭 상대강도
+
+사용법
+------
+result = evaluate_candidate(payload, profile="HIDDEN_GEM")
+results = evaluate_universe(list_of_payloads, profile="HIDDEN_GEM")
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict, field
+from enum import Enum
+from typing import Any, Dict, List, Callable, Tuple, Optional
+
+
+ENGINE_VERSION = "COMMON_GATE_FIRST_FRAMEWORK_V1_0"
+
+
+class State(str, Enum):
+    REJECT = "REJECT"
+    WATCH = "WATCH"
+    FORMING = "FORMING"
+    ARMED = "ARMED"
+    ENTER = "ENTER"
+
+
+STATE_ORDER = {
+    State.REJECT.value: 0,
+    State.WATCH.value: 1,
+    State.FORMING.value: 2,
+    State.ARMED.value: 3,
+    State.ENTER.value: 4,
+}
+
+
+def sf(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return default
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def b(v: Any) -> bool:
+    return bool(v)
+
+
+@dataclass
+class GateCheck:
+    name: str
+    passed: bool
+    hard: bool
+    value: Any = None
+    threshold: Any = None
+    reason: str = ""
+
+
+@dataclass
+class Evaluation:
+    engine_version: str
+    profile: str
+    ticker: str
+    name: str
+    state: str
+
+    data_gate_pass: bool
+    hard_gate_pass: bool
+    purpose_gate_pass: bool
+
+    failed_hard_gates: List[str] = field(default_factory=list)
+    failed_purpose_gates: List[str] = field(default_factory=list)
+    pending_gates: List[str] = field(default_factory=list)
+
+    data_checks: List[Dict[str, Any]] = field(default_factory=list)
+    hard_checks: List[Dict[str, Any]] = field(default_factory=list)
+    purpose_checks: List[Dict[str, Any]] = field(default_factory=list)
+
+    rank_key: Tuple = field(default_factory=tuple)
+    rank_metrics: Dict[str, float] = field(default_factory=dict)
+    comment: str = ""
+
+
+# ---------------------------------------------------------------------
+# 1. 공통 DATA GATE
+# ---------------------------------------------------------------------
+
+def common_data_gates(p: Dict[str, Any]) -> List[GateCheck]:
+    checks = []
+
+    fresh = not b(p.get("data_stale"))
+    checks.append(GateCheck(
+        "DATA_FRESH",
+        fresh,
+        True,
+        value=not fresh,
+        threshold=False,
+        reason="원천 데이터가 지연/오래됨" if not fresh else ""
+    ))
+
+    conflict = b(p.get("data_conflict"))
+    checks.append(GateCheck(
+        "DATA_CONFLICT",
+        not conflict,
+        True,
+        value=conflict,
+        threshold=False,
+        reason="동일 시점 가격/수급 원천 충돌" if conflict else ""
+    ))
+
+    session_ok = b(p.get("market_session_valid", True))
+    checks.append(GateCheck(
+        "SESSION_VALID",
+        session_ok,
+        True,
+        value=session_ok,
+        threshold=True,
+        reason="KRX/NXT 세션 구분 또는 거래세션 검증 실패" if not session_ok else ""
+    ))
+
+    price_ok = sf(p.get("current_price")) > 0
+    checks.append(GateCheck(
+        "PRICE_VALID",
+        price_ok,
+        True,
+        value=sf(p.get("current_price")),
+        threshold=">0",
+        reason="현재가 없음/0" if not price_ok else ""
+    ))
+
+    return checks
+
+
+# ---------------------------------------------------------------------
+# 2. 공통 HARD GATE
+# ---------------------------------------------------------------------
+
+EXCLUDED_ASSET_TYPES = {"ETF", "ETN", "PREFERRED", "우선주", "SPAC", "스팩", "REIT", "리츠"}
+
+def common_hard_gates(p: Dict[str, Any]) -> List[GateCheck]:
+    checks = []
+
+    asset_type = str(p.get("asset_type", "COMMON")).upper()
+    checks.append(GateCheck(
+        "ASSET_TYPE",
+        asset_type not in EXCLUDED_ASSET_TYPES,
+        True,
+        value=asset_type,
+        threshold="COMMON",
+        reason=f"제외 자산유형: {asset_type}" if asset_type in EXCLUDED_ASSET_TYPES else ""
+    ))
+
+    mcap = sf(p.get("market_cap_krw"))
+    min_mcap = sf(p.get("min_market_cap_krw"), 100_000_000_000)
+    mcap_pass = (mcap == 0) or (mcap >= min_mcap)
+    checks.append(GateCheck(
+        "MARKET_CAP",
+        mcap_pass,
+        True,
+        value=mcap,
+        threshold=min_mcap,
+        reason="시가총액 하한 미달" if not mcap_pass else ""
+    ))
+
+    adv = sf(p.get("avg_trading_value_20d"))
+    min_adv = sf(p.get("min_avg_trading_value_20d"), 1_000_000_000)
+
+    planned = sf(p.get("planned_position_value_krw"))
+    max_ratio = sf(p.get("position_adv_ratio_cap"), 0.02)
+    dynamic_adv = planned / max_ratio if planned > 0 and max_ratio > 0 else 0
+    required_adv = max(min_adv, dynamic_adv)
+
+    adv_pass = (adv == 0) or (adv >= required_adv)
+    checks.append(GateCheck(
+        "LIQUIDITY",
+        adv_pass,
+        True,
+        value=adv,
+        threshold=required_adv,
+        reason="계획 포지션 대비 평균거래대금 부족" if not adv_pass else ""
+    ))
+
+    halt = b(p.get("trading_halt"))
+    checks.append(GateCheck(
+        "TRADING_HALT",
+        not halt,
+        True,
+        value=halt,
+        threshold=False,
+        reason="거래정지" if halt else ""
+    ))
+
+    mgmt = b(p.get("management_issue"))
+    checks.append(GateCheck(
+        "MANAGEMENT_ISSUE",
+        not mgmt,
+        True,
+        value=mgmt,
+        threshold=False,
+        reason="관리종목/거래소 중대 리스크" if mgmt else ""
+    ))
+
+    audit = b(p.get("audit_issue"))
+    checks.append(GateCheck(
+        "AUDIT",
+        not audit,
+        True,
+        value=audit,
+        threshold=False,
+        reason="감사의견/회계 신뢰성 문제" if audit else ""
+    ))
+
+    return checks
+
+
+# ---------------------------------------------------------------------
+# 3. 프로필별 PURPOSE GATE
+# ---------------------------------------------------------------------
+
+def dhandho_gates(p: Dict[str, Any]) -> List[GateCheck]:
+    checks = []
+
+    # 생존
+    impairment = sf(p.get("impairment_score"))
+    checks.append(GateCheck(
+        "IMPAIRMENT",
+        impairment < 60,
+        True,
+        impairment,
+        "<60",
+        "가치훼손 위험" if impairment >= 60 else ""
+    ))
+
+    dilution = sf(p.get("dilution_3y_pct"))
+    checks.append(GateCheck(
+        "DILUTION",
+        dilution < 20,
+        True,
+        dilution,
+        "<20%",
+        "반복 증자/CB/BW 희석 위험" if dilution >= 20 else ""
+    ))
+
+    # 현금창출
+    ocf_ttm = sf(p.get("ocf_ttm"))
+    fcf_ttm = sf(p.get("fcf_ttm"))
+    cash_conv = sf(p.get("ocf_to_net_income"), 1.0)
+    cash_ok = ocf_ttm > 0 and (fcf_ttm > 0 or b(p.get("fcf_inflection"))) and cash_conv >= 0.7
+    checks.append(GateCheck(
+        "CASH_GENERATION",
+        cash_ok,
+        True,
+        {"ocf_ttm": ocf_ttm, "fcf_ttm": fcf_ttm, "ocf_to_net_income": cash_conv},
+        "OCF>0, FCF>0 or inflection, OCF/NI>=0.7",
+        "현금창출 조건 미달" if not cash_ok else ""
+    ))
+
+    # 성장: Quality Growth 또는 Turnaround 중 하나
+    rev_g = sf(p.get("revenue_growth_pct"))
+    op_g = sf(p.get("operating_profit_growth_pct"))
+    fcf_g = sf(p.get("fcf_growth_pct"))
+    margin_exp = b(p.get("margin_expanding"))
+    quality_growth = rev_g >= 5 and op_g >= 8 and (fcf_g >= 8 or b(p.get("fcf_inflection")))
+    turnaround = b(p.get("turnaround_confirmed")) and ocf_ttm > 0
+    growth_ok = quality_growth or turnaround
+    checks.append(GateCheck(
+        "GROWTH_QUALITY",
+        growth_ok,
+        True,
+        {"revenue": rev_g, "op": op_g, "fcf": fcf_g, "turnaround": turnaround},
+        "QualityGrowth OR Turnaround",
+        "성장/턴어라운드 확인 부족" if not growth_ok else ""
+    ))
+
+    # 자본효율
+    roic = sf(p.get("roic_pct"))
+    inc_roic = sf(p.get("incremental_roic_pct"), roic)
+    capital_eff_ok = roic >= 8 and inc_roic >= 8
+    checks.append(GateCheck(
+        "CAPITAL_EFFICIENCY",
+        capital_eff_ok,
+        True,
+        {"roic": roic, "incremental_roic": inc_roic},
+        ">=8%",
+        "ROIC/증분 ROIC 부족" if not capital_eff_ok else ""
+    ))
+
+    # 가치
+    mos = sf(p.get("mos_pct"), -999)
+    checks.append(GateCheck(
+        "MARGIN_OF_SAFETY",
+        mos >= 25,
+        True,
+        mos,
+        ">=25%",
+        "안전마진 부족" if mos < 25 else ""
+    ))
+
+    # 비대칭
+    ar = sf(p.get("asymmetry_ratio"))
+    ev = sf(p.get("expected_value_pct"))
+    asym_ok = ar >= 2.0 and ev > 0
+    checks.append(GateCheck(
+        "ASYMMETRY",
+        asym_ok,
+        True,
+        {"AR": ar, "EV": ev},
+        "AR>=2 and EV>0",
+        "비대칭 구조 부족" if not asym_ok else ""
+    ))
+
+    return checks
+
+
+def hidden_gem_gates(p: Dict[str, Any]) -> List[GateCheck]:
+    checks = []
+
+    checks.append(GateCheck(
+        "PRICE_HOLD",
+        b(p.get("price_hold")),
+        True,
+        b(p.get("price_hold")),
+        True,
+        "PRICE HOLD 실패" if not b(p.get("price_hold")) else ""
+    ))
+
+    checks.append(GateCheck(
+        "SUPPLY_DECAY",
+        b(p.get("supply_decay")),
+        True,
+        b(p.get("supply_decay")),
+        True,
+        "매도압력 감소 미확인" if not b(p.get("supply_decay")) else ""
+    ))
+
+    absorb = sf(p.get("absorption_score"))
+    checks.append(GateCheck(
+        "ABSORPTION",
+        absorb >= 0.7,
+        True,
+        absorb,
+        ">=0.7",
+        "흡수 강도 부족" if absorb < 0.7 else ""
+    ))
+
+    rvol = sf(p.get("rvol"))
+    checks.append(GateCheck(
+        "TURNOVER",
+        rvol >= 1.3,
+        True,
+        rvol,
+        "RVOL>=1.3",
+        "거래량 확장 부족" if rvol < 1.3 else ""
+    ))
+
+    checks.append(GateCheck(
+        "RS_POSITIVE",
+        b(p.get("rs_positive")),
+        True,
+        b(p.get("rs_positive")),
+        True,
+        "RS 양전 실패" if not b(p.get("rs_positive")) else ""
+    ))
+
+    checks.append(GateCheck(
+        "BREADTH",
+        b(p.get("breadth_expanding")),
+        True,
+        b(p.get("breadth_expanding")),
+        True,
+        "섹터 breadth 확산 없음" if not b(p.get("breadth_expanding")) else ""
+    ))
+
+    day = sf(p.get("day_change_pct"))
+    reacc = b(p.get("reaccumulation_after_spike"))
+    new_entry_ok = day <= 5 or (3 <= day <= 7 and reacc)
+    checks.append(GateCheck(
+        "CHASE_LIMIT",
+        new_entry_ok,
+        True,
+        day,
+        "<=5% or B-type reaccumulation",
+        "이미 발산/추격구간" if not new_entry_ok else ""
+    ))
+
+    return checks
+
+
+def money_game_gates(p: Dict[str, Any]) -> List[GateCheck]:
+    checks = []
+
+    checks.append(GateCheck(
+        "LAGGARD_NOT_LEADER",
+        not b(p.get("sector_leader")),
+        True,
+        b(p.get("sector_leader")),
+        False,
+        "대장주 제외" if b(p.get("sector_leader")) else ""
+    ))
+
+    share_rising = b(p.get("turnover_share_rising"))
+    checks.append(GateCheck(
+        "TURNOVER_SHARE_RISING",
+        share_rising,
+        True,
+        share_rising,
+        True,
+        "후발주 거래대금 점유율 상승 미확인" if not share_rising else ""
+    ))
+
+    checks.append(GateCheck(
+        "PRICE_HOLD",
+        b(p.get("price_hold")),
+        True,
+        b(p.get("price_hold")),
+        True,
+        "PRICE HOLD 실패" if not b(p.get("price_hold")) else ""
+    ))
+
+    checks.append(GateCheck(
+        "REACCUMULATION",
+        b(p.get("reaccumulation")),
+        True,
+        b(p.get("reaccumulation")),
+        True,
+        "재응축 미확인" if not b(p.get("reaccumulation")) else ""
+    ))
+
+    checks.append(GateCheck(
+        "THEME_BREADTH",
+        b(p.get("breadth_expanding")),
+        True,
+        b(p.get("breadth_expanding")),
+        True,
+        "테마 확산 없음" if not b(p.get("breadth_expanding")) else ""
+    ))
+
+    checks.append(GateCheck(
+        "SUPPLY_ABSORPTION",
+        b(p.get("supply_decay")) and sf(p.get("absorption_score")) >= 0.7,
+        True,
+        {"supply_decay": b(p.get("supply_decay")), "absorption": sf(p.get("absorption_score"))},
+        "supply_decay=True & absorption>=0.7",
+        "매도물량 흡수 미확인"
+    ))
+
+    return checks
+
+
+def indep_leader_gates(p: Dict[str, Any]) -> List[GateCheck]:
+    checks = []
+
+    checks.append(GateCheck(
+        "SECTOR_WEAK_STOCK_STRONG",
+        b(p.get("sector_weak_stock_strong")),
+        True,
+        b(p.get("sector_weak_stock_strong")),
+        True,
+        "섹터 대비 독립강도 부족" if not b(p.get("sector_weak_stock_strong")) else ""
+    ))
+
+    checks.append(GateCheck(
+        "RS_POSITIVE",
+        b(p.get("rs_positive")),
+        True,
+        b(p.get("rs_positive")),
+        True,
+        "RS 양전 실패" if not b(p.get("rs_positive")) else ""
+    ))
+
+    checks.append(GateCheck(
+        "PRICE_HOLD",
+        b(p.get("price_hold")),
+        True,
+        b(p.get("price_hold")),
+        True,
+        "가격 유지 실패" if not b(p.get("price_hold")) else ""
+    ))
+
+    flow_ok = b(p.get("foreign_inst_flow_positive")) or b(p.get("personal_sell_absorbed"))
+    checks.append(GateCheck(
+        "FLOW_OR_ABSORPTION",
+        flow_ok,
+        True,
+        flow_ok,
+        True,
+        "수급/개인매도 흡수 근거 부족" if not flow_ok else ""
+    ))
+
+    checks.append(GateCheck(
+        "TURNOVER",
+        sf(p.get("rvol")) >= 1.2,
+        True,
+        sf(p.get("rvol")),
+        ">=1.2",
+        "거래량 부족"
+    ))
+
+    return checks
+
+
+def asym_rs_gates(p: Dict[str, Any]) -> List[GateCheck]:
+    checks = []
+
+    up_beta = sf(p.get("up_capture_ratio"))
+    down_beta = sf(p.get("down_capture_ratio"))
+    checks.append(GateCheck(
+        "ASYMMETRIC_RS",
+        up_beta >= 1.5 and down_beta <= 0.7,
+        True,
+        {"up_capture": up_beta, "down_capture": down_beta},
+        "up>=1.5, down<=0.7",
+        "비대칭 RS 조건 미달"
+    ))
+
+    checks.append(GateCheck(
+        "RS_5D_POSITIVE",
+        sf(p.get("rs_5d")) > 0,
+        True,
+        sf(p.get("rs_5d")),
+        ">0",
+        "5일 RS 음수"
+    ))
+
+    checks.append(GateCheck(
+        "RS_20D_NONNEG",
+        sf(p.get("rs_20d")) >= 0,
+        True,
+        sf(p.get("rs_20d")),
+        ">=0",
+        "20일 RS 음수"
+    ))
+
+    checks.append(GateCheck(
+        "PRICE_HOLD",
+        b(p.get("price_hold")),
+        True,
+        b(p.get("price_hold")),
+        True,
+        "PRICE HOLD 실패"
+    ))
+
+    return checks
+
+
+PROFILE_GATES: Dict[str, Callable[[Dict[str, Any]], List[GateCheck]]] = {
+    "DHANDHO": dhandho_gates,
+    "HIDDEN_GEM": hidden_gem_gates,
+    "MONEY_GAME": money_game_gates,
+    "INDEP_LEADER": indep_leader_gates,
+    "ASYM_RS": asym_rs_gates,
+}
+
+
+# ---------------------------------------------------------------------
+# 4. STATE 결정
+# ---------------------------------------------------------------------
+
+def tactical_state(p: Dict[str, Any], purpose_pass: bool, profile: str) -> Tuple[str, List[str]]:
+    """
+    Purpose Gate를 모두 통과했다고 바로 ENTER로 올리지 않는다.
+    실행 상태는 공통 전술 신호에서 결정한다.
+
+    ENTER 핵심:
+    - PRICE
+    - VOLUME
+    - SUPPLY
+    - FLOW
+    - SECTOR
+    5축 중 4축 이상 활성화
+    """
+    reasons: List[str] = []
+
+    price = b(p.get("above_vwap")) and b(p.get("price_hold"))
+    volume = sf(p.get("rvol")) >= 1.3 and sf(p.get("execution_strength")) >= 120
+    supply = b(p.get("supply_decay")) and sf(p.get("absorption_score")) >= 0.7
+    flow = b(p.get("foreign_inst_flow_positive")) or b(p.get("program_flow_positive"))
+    sector = b(p.get("sector_energy_rising")) and b(p.get("breadth_expanding"))
+
+    axes = {
+        "PRICE": price,
+        "VOLUME": volume,
+        "SUPPLY": supply,
+        "FLOW": flow,
+        "SECTOR": sector,
+    }
+    active = [k for k, v in axes.items() if v]
+
+    if not purpose_pass:
+        # 목적 게이트 일부 미통과라도 치명적 Hard Fail이 아니라면 WATCH
+        return State.WATCH.value, [f"목적 게이트 미통과: 전술축 {len(active)}/5"]
+
+    # 프로필별 특성상 sector가 필수인 경우
+    if profile in {"HIDDEN_GEM", "MONEY_GAME"} and not sector:
+        return State.FORMING.value, ["섹터 확산/에너지 미확정"]
+
+    if len(active) >= 4 and price and supply:
+        return State.ENTER.value, [f"전술축 {len(active)}/5 활성 + PRICE/SUPPLY 확인"]
+
+    if len(active) >= 3 and price:
+        return State.ARMED.value, [f"전술축 {len(active)}/5 활성, ENTER 직전"]
+
+    if len(active) >= 2:
+        return State.FORMING.value, [f"전술축 {len(active)}/5 형성 중"]
+
+    return State.WATCH.value, [f"전술축 {len(active)}/5, 대기"]
+
+
+# ---------------------------------------------------------------------
+# 5. RANK — 같은 상태 안에서만 사용
+# ---------------------------------------------------------------------
+
+def rank_metrics(p: Dict[str, Any], profile: str) -> Dict[str, float]:
+    """
+    이 숫자는 '매수 여부'를 결정하지 않는다.
+    같은 상태 후보들끼리 우선순위 정렬만 한다.
+    """
+    common = {
+        "liquidity": sf(p.get("avg_trading_value_20d")),
+        "rvol": sf(p.get("rvol")),
+        "rs": sf(p.get("rs_value"), sf(p.get("rs_5d"))),
+        "execution_strength": sf(p.get("execution_strength")),
+    }
+
+    if profile == "DHANDHO":
+        common.update({
+            "mos": sf(p.get("mos_pct")),
+            "fcf_growth": sf(p.get("fcf_growth_pct")),
+            "roic": sf(p.get("roic_pct")),
+            "asymmetry": sf(p.get("asymmetry_ratio")),
+        })
+    elif profile == "HIDDEN_GEM":
+        common.update({
+            "absorption": sf(p.get("absorption_score")),
+            "sector_energy": sf(p.get("sector_energy_score")),
+        })
+    elif profile == "MONEY_GAME":
+        common.update({
+            "turnover_share_delta": sf(p.get("turnover_share_delta")),
+            "theme_breadth": sf(p.get("theme_breadth_score")),
+        })
+    elif profile == "INDEP_LEADER":
+        common.update({
+            "sector_relative_strength": sf(p.get("sector_relative_strength")),
+        })
+    elif profile == "ASYM_RS":
+        common.update({
+            "up_capture": sf(p.get("up_capture_ratio")),
+            "down_capture": sf(p.get("down_capture_ratio")),
+        })
+
+    return common
+
+
+def build_rank_key(metrics: Dict[str, float], profile: str) -> Tuple:
+    # 상태가 동일할 때만 쓰므로 간단하고 투명한 lexicographic ranking 사용
+    if profile == "DHANDHO":
+        return (
+            metrics.get("fcf_growth", 0),
+            metrics.get("roic", 0),
+            metrics.get("mos", 0),
+            metrics.get("asymmetry", 0),
+            metrics.get("liquidity", 0),
+        )
+    if profile == "HIDDEN_GEM":
+        return (
+            metrics.get("sector_energy", 0),
+            metrics.get("absorption", 0),
+            metrics.get("rvol", 0),
+            metrics.get("execution_strength", 0),
+        )
+    if profile == "MONEY_GAME":
+        return (
+            metrics.get("turnover_share_delta", 0),
+            metrics.get("theme_breadth", 0),
+            metrics.get("rvol", 0),
+        )
+    if profile == "INDEP_LEADER":
+        return (
+            metrics.get("sector_relative_strength", 0),
+            metrics.get("rs", 0),
+            metrics.get("liquidity", 0),
+        )
+    if profile == "ASYM_RS":
+        return (
+            metrics.get("up_capture", 0),
+            -metrics.get("down_capture", 0),
+            metrics.get("rs", 0),
+        )
+    return tuple(metrics.values())
+
+
+# ---------------------------------------------------------------------
+# 6. 통합 평가
+# ---------------------------------------------------------------------
+
+def _fails(checks: List[GateCheck]) -> List[str]:
+    return [c.name for c in checks if not c.passed and c.hard]
+
+def _to_dicts(checks: List[GateCheck]) -> List[Dict[str, Any]]:
+    return [asdict(c) for c in checks]
+
+def evaluate_candidate(p: Dict[str, Any], profile: str) -> Dict[str, Any]:
+    profile = profile.upper()
+    if profile not in PROFILE_GATES:
+        raise ValueError(f"Unsupported profile: {profile}")
+
+    data = common_data_gates(p)
+    data_fail = _fails(data)
+    if data_fail:
+        return asdict(Evaluation(
+            engine_version=ENGINE_VERSION,
+            profile=profile,
+            ticker=str(p.get("ticker", "")),
+            name=str(p.get("name", "")),
+            state=State.REJECT.value,
+            data_gate_pass=False,
+            hard_gate_pass=False,
+            purpose_gate_pass=False,
+            failed_hard_gates=data_fail,
+            data_checks=_to_dicts(data),
+            comment="DATA GATE 실패: 이후 판정 중단",
+        ))
+
+    hard = common_hard_gates(p)
+    hard_fail = _fails(hard)
+    if hard_fail:
+        return asdict(Evaluation(
+            engine_version=ENGINE_VERSION,
+            profile=profile,
+            ticker=str(p.get("ticker", "")),
+            name=str(p.get("name", "")),
+            state=State.REJECT.value,
+            data_gate_pass=True,
+            hard_gate_pass=False,
+            purpose_gate_pass=False,
+            failed_hard_gates=hard_fail,
+            data_checks=_to_dicts(data),
+            hard_checks=_to_dicts(hard),
+            comment="COMMON HARD GATE 실패: 이후 판정 중단",
+        ))
+
+    purpose = PROFILE_GATES[profile](p)
+    purpose_fail = _fails(purpose)
+    purpose_pass = len(purpose_fail) == 0
+
+    state, pending = tactical_state(p, purpose_pass, profile)
+
+    metrics = rank_metrics(p, profile)
+    key = build_rank_key(metrics, profile)
+
+    return asdict(Evaluation(
+        engine_version=ENGINE_VERSION,
+        profile=profile,
+        ticker=str(p.get("ticker", "")),
+        name=str(p.get("name", "")),
+        state=state,
+        data_gate_pass=True,
+        hard_gate_pass=True,
+        purpose_gate_pass=purpose_pass,
+        failed_hard_gates=[],
+        failed_purpose_gates=purpose_fail,
+        pending_gates=pending,
+        data_checks=_to_dicts(data),
+        hard_checks=_to_dicts(hard),
+        purpose_checks=_to_dicts(purpose),
+        rank_key=key,
+        rank_metrics=metrics,
+        comment="게이트 통과 여부로 상태 결정. 랭킹은 동일 상태 내 정렬용.",
+    ))
+
+
+def evaluate_universe(rows: List[Dict[str, Any]], profile: str) -> List[Dict[str, Any]]:
+    results = [evaluate_candidate(x, profile) for x in rows]
+
+    # 상태 우선, 같은 상태 안에서 rank_key 내림차순
+    results.sort(
+        key=lambda r: (
+            STATE_ORDER.get(r["state"], -1),
+            tuple(r.get("rank_key") or ()),
+        ),
+        reverse=True,
+    )
+    return results
+
+
+# ---------------------------------------------------------------------
+# 7. 운영용 출력
+# ---------------------------------------------------------------------
+
+def compact_result(r: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "ticker": r["ticker"],
+        "name": r["name"],
+        "profile": r["profile"],
+        "state": r["state"],
+        "failed_hard_gates": r["failed_hard_gates"],
+        "failed_purpose_gates": r["failed_purpose_gates"],
+        "pending_gates": r["pending_gates"],
+        "rank_metrics": r["rank_metrics"],
+    }
+
+
+# ---------------------------------------------------------------------
+# 8. 최소 검증 샘플
+# ---------------------------------------------------------------------
+
+SAMPLE_HIDDEN_GEM_PASS = {
+    "ticker": "111111",
+    "name": "샘플_상방진주",
+    "current_price": 10000,
+    "market_cap_krw": 500_000_000_000,
+    "avg_trading_value_20d": 8_000_000_000,
+    "asset_type": "COMMON",
+
+    "price_hold": True,
+    "supply_decay": True,
+    "absorption_score": 0.82,
+    "rvol": 1.6,
+    "rs_positive": True,
+    "breadth_expanding": True,
+    "sector_energy_rising": True,
+    "day_change_pct": 2.5,
+
+    "above_vwap": True,
+    "execution_strength": 135,
+    "foreign_inst_flow_positive": True,
+    "program_flow_positive": False,
+
+    "sector_energy_score": 78,
+}
+
+SAMPLE_HIDDEN_GEM_FAIL = {
+    **SAMPLE_HIDDEN_GEM_PASS,
+    "ticker": "222222",
+    "name": "샘플_고득점착시",
+    "price_hold": False,  # 치명적 실패
+    "rvol": 2.5,
+    "execution_strength": 180,
+    "sector_energy_score": 95,
+}
+
+
+if __name__ == "__main__":
+    import json
+
+    a = evaluate_candidate(SAMPLE_HIDDEN_GEM_PASS, "HIDDEN_GEM")
+    b = evaluate_candidate(SAMPLE_HIDDEN_GEM_FAIL, "HIDDEN_GEM")
+
+    print(json.dumps({
+        "PASS_SAMPLE": compact_result(a),
+        "FAIL_SAMPLE": compact_result(b),
+    }, ensure_ascii=False, indent=2))
+COMMON_GATE_FRAMEWORK_EOF
+
+COPY <<'COMMON_GATE_RUNNER_EOF' /app/공통_게이트우선_독립구동_V1_0.py
+# -*- coding: utf-8 -*-
+"""공통_게이트우선 독립 sidecar.
+
+원칙
+- 메인 ALPHA500 프로세스를 import하거나 수정하지 않는다.
+- /data/results/latest_alpha500_{KRX,NXT}.json 을 읽기 전용으로 소비한다.
+- 첨부 원본 framework의 evaluate_candidate/evaluate_universe만 호출한다.
+- 메인 스냅샷에 없는 근거는 임의 추정하지 않고 미확보로 둔다.
+- 보강이 필요한 값은 COMMON_GATE_MANUAL_INPUT의 overrides/rows에서만 받는다.
+- 결과는 COMMON_GATE_RESULT_DIR 아래 별도 JSON에만 쓴다.
+"""
+from __future__ import annotations
+
+import json, os, time, traceback
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Any, Dict, List
+
+from 공통_게이트우선_판정프레임워크_V1_0 import (
+    ENGINE_VERSION as FRAMEWORK_VERSION,
+    PROFILE_GATES,
+    STATE_ORDER,
+    compact_result,
+    evaluate_candidate,
+)
+
+KST=timezone(timedelta(hours=9))
+SIDECAR_VERSION="COMMON_GATE_SIDECAR_V1_0"
+RESULT_DIR=Path(os.getenv("RESULT_DIR","/data/results"))
+OUT_DIR=Path(os.getenv("COMMON_GATE_RESULT_DIR",str(RESULT_DIR/"common_gate")))
+MANUAL_INPUT=Path(os.getenv("COMMON_GATE_MANUAL_INPUT",str(RESULT_DIR/"common_gate_input.json")))
+POLL=max(5,int(os.getenv("COMMON_GATE_POLL_SECONDS","15")))
+STALE_SECONDS=max(60,int(os.getenv("COMMON_GATE_STALE_SECONDS","900")))
+PROFILES=[x.strip().upper() for x in os.getenv("COMMON_GATE_PROFILES","HIDDEN_GEM,MONEY_GAME,INDEP_LEADER,ASYM_RS").split(",") if x.strip().upper() in PROFILE_GATES]
+
+
+def now_iso(): return datetime.now(KST).isoformat(timespec="seconds")
+def f(v,d=0.0):
+    try: return float(v)
+    except Exception: return d
+
+def truth(v):
+    if isinstance(v,bool): return v
+    if isinstance(v,(int,float)): return v!=0
+    return str(v or "").strip().lower() in {"1","true","yes","y","on","pass","positive"}
+
+def read_json(p:Path):
+    try:
+        z=json.loads(p.read_text(encoding="utf-8"))
+        return z
+    except Exception:
+        return None
+
+def write_json_atomic(p:Path,obj:Any):
+    p.parent.mkdir(parents=True,exist_ok=True)
+    t=p.with_suffix(p.suffix+".tmp")
+    t.write_text(json.dumps(obj,ensure_ascii=False,indent=2,default=str),encoding="utf-8")
+    t.replace(p)
+
+def parse_kst(v):
+    if not v: return None
+    try:
+        d=datetime.fromisoformat(str(v).replace("Z","+00:00"))
+        if d.tzinfo is None: d=d.replace(tzinfo=KST)
+        return d.astimezone(KST)
+    except Exception: return None
+
+def snapshot_stale(summary:Dict[str,Any])->bool:
+    d=parse_kst(summary.get("live_updated_kst") or summary.get("live_sector_updated_kst") or summary.get("timestamp_kst"))
+    return True if d is None else (datetime.now(KST)-d).total_seconds()>STALE_SECONDS
+
+def merge_rows(dst:Dict[str,Dict[str,Any]], rows:Any):
+    if not isinstance(rows,list): return
+    for r in rows:
+        if not isinstance(r,dict): continue
+        code=str(r.get("symbol") or r.get("ticker") or "").zfill(6)
+        if not(code.isdigit() and len(code)==6): continue
+        z=dst.setdefault(code,{"symbol":code})
+        for k,v in r.items():
+            if v not in (None,""):
+                z[k]=v
+
+def manual_data()->Dict[str,Any]:
+    z=read_json(MANUAL_INPUT)
+    return z if isinstance(z,dict) else {}
+
+def sector_index(summary):
+    out={}
+    for r in summary.get("sector_energy") or []:
+        if isinstance(r,dict):
+            key=str(r.get("ENERGY_CLUSTER") or r.get("cluster") or "")
+            if key: out[key]=r
+    return out
+
+def volume_index(summary):
+    out={}
+    for key in ("volume_direction_top","volume_direction_history"):
+        for r in summary.get(key) or []:
+            if not isinstance(r,dict): continue
+            c=str(r.get("symbol") or "").zfill(6)
+            if c.isdigit() and len(c)==6 and c not in out: out[c]=r
+    return out
+
+def build_auto_rows(summary:Dict[str,Any], manual:Dict[str,Any])->List[Dict[str,Any]]:
+    merged={}
+    # sector_live_pool gives the broadest read-only universe. richer rows overlay it.
+    for key in ("sector_live_pool","live_pool","live_deep30","live_watch10","top_watch","top_final"):
+        merge_rows(merged,summary.get(key))
+    sec=sector_index(summary); vol=volume_index(summary)
+    overrides=manual.get("overrides") if isinstance(manual.get("overrides"),dict) else {}
+    venue=str(summary.get("venue") or "").upper()
+    stale=snapshot_stale(summary)
+    rows=[]
+    for code,r in merged.items():
+        cl=str(r.get("ENERGY_CLUSTER") or "")
+        sr=sec.get(cl,{})
+        vr=vol.get(code,{})
+        market_cap_100m=f(r.get("market_cap_100m"),0)
+        rs5=f(r.get("rs5"),0); rs20=f(r.get("rs20"),0); mrs=f(r.get("market_rs"),0)
+        trend=str(r.get("energy_trend") or sr.get("energy_trend") or "").upper()
+        delta=f(r.get("energy_delta"),f(sr.get("energy_delta"),0))
+        breadth=f(r.get("cluster_breadth"),f(sr.get("cluster_breadth"),0))
+        price_hold=(r.get("stage1_above_vwap") is True or r.get("stage1_ema20_hold") is True)
+        asym=str(r.get("asym_rs_class") or "").upper()
+        cluster_state=str(r.get("cluster_state") or sr.get("cluster_state") or "").upper()
+        trade=f(r.get("trade_strength"),0)
+        foreign=f(r.get("foreign_net"),0); inst=f(r.get("institution_net"),0); program=f(r.get("program_net"),0)
+        vstate=str(vr.get("combined_state") or "").upper()
+        payload={
+            "ticker":code,"name":str(r.get("name") or code),"current_price":f(r.get("current_price"),0),
+            "market_cap_krw":market_cap_100m*100_000_000 if market_cap_100m>0 else 0,
+            "asset_type":"COMMON","data_stale":stale,"data_conflict":False,
+            "market_session_valid": venue in {"KRX","NXT"},
+            # 직접 존재하거나 명시적으로 계산 가능한 값만 번역한다.
+            "price_hold":price_hold,"above_vwap":r.get("stage1_above_vwap") is True,
+            "rvol":f(vr.get("volume_ratio"),0),"execution_strength":trade,
+            "rs_5d":rs5,"rs_20d":rs20,"rs_value":mrs,"rs_positive":rs5>0,
+            "breadth_expanding":breadth>=0.55,
+            "sector_energy_rising": trend in {"RISING","RISING_STRONG"} or delta>=0.35,
+            "sector_energy_score":f(r.get("cluster_energy"),f(sr.get("cluster_energy"),0)),
+            "foreign_inst_flow_positive":foreign>0 and inst>0,
+            "program_flow_positive":program>0,
+            "day_change_pct":f(r.get("change_pct"),0),
+            "sector_relative_strength":mrs,
+            "sector_weak_stock_strong":(cluster_state not in {"S2","S3"}) and asym in {"SUPER","STRONG"} and rs5>0,
+            # 아래 항목은 메인 snapshot에 동일 의미 근거가 없으므로 자동 추정하지 않는다.
+            "supply_decay":False,"absorption_score":0.0,"turnover_share_rising":False,
+            "reaccumulation":False,"personal_sell_absorbed":False,
+            "up_capture_ratio":0.0,"down_capture_ratio":0.0,
+            "adapter_meta":{
+                "venue":venue,"source_timestamp":summary.get("timestamp_kst"),"volume_state":vstate,
+                "cluster":cl,"cluster_state":cluster_state,"energy_delta":delta,"breadth":breadth,
+                "unavailable_auto_fields":["supply_decay","absorption_score","turnover_share_rising","reaccumulation","personal_sell_absorbed","up_capture_ratio","down_capture_ratio","avg_trading_value_20d"],
+            },
+        }
+        ov=overrides.get(code) or overrides.get(str(r.get("name") or ""))
+        if isinstance(ov,dict): payload.update(ov)
+        rows.append(payload)
+    return rows
+
+def evaluate_rows(rows,profile):
+    out=[]
+    for p in rows:
+        try:
+            r=evaluate_candidate(p,profile)
+            r["adapter_meta"]=p.get("adapter_meta",{})
+            out.append(r)
+        except Exception as e:
+            out.append({"ticker":str(p.get("ticker") or ""),"name":str(p.get("name") or ""),"profile":profile,"state":"REJECT","error":f"{type(e).__name__}: {e}"})
+    out.sort(key=lambda r:(STATE_ORDER.get(str(r.get("state")),-1),tuple(r.get("rank_key") or ())),reverse=True)
+    return out
+
+def add_manual_rows(base:List[Dict[str,Any]],manual:Dict[str,Any],venue:str):
+    rows=manual.get("rows") if isinstance(manual.get("rows"),list) else []
+    for r in rows:
+        if not isinstance(r,dict): continue
+        rv=str(r.get("venue") or venue).upper()
+        if rv==venue: base.append(dict(r))
+
+def run_venue(venue:str,manual:Dict[str,Any]):
+    src=RESULT_DIR/f"latest_alpha500_{venue}.json"
+    summary=read_json(src)
+    if not isinstance(summary,dict):
+        return {"sidecar_version":SIDECAR_VERSION,"framework_version":FRAMEWORK_VERSION,"venue":venue,"status":"NO_SOURCE","source":str(src),"generated_at_kst":now_iso(),"profiles":{}}
+    rows=build_auto_rows(summary,manual); add_manual_rows(rows,manual,venue)
+    profiles={}
+    for profile in PROFILES:
+        ev=evaluate_rows(rows,profile)
+        counts={s:sum(1 for x in ev if x.get("state")==s) for s in ("ENTER","ARMED","FORMING","WATCH","REJECT")}
+        profiles[profile]={
+            "counts":counts,
+            "top_enter":[compact_result(x) for x in ev if x.get("state")=="ENTER"][:20],
+            "top_armed":[compact_result(x) for x in ev if x.get("state")=="ARMED"][:20],
+            "results":ev,
+        }
+    return {
+        "sidecar_version":SIDECAR_VERSION,"framework_version":FRAMEWORK_VERSION,"venue":venue,"status":"OK",
+        "generated_at_kst":now_iso(),"source_timestamp_kst":summary.get("timestamp_kst"),"source_file":str(src),
+        "candidate_rows":len(rows),"profiles":profiles,
+        "separation":"READ_ONLY_SIDECAR_NO_MAIN_ENGINE_IMPORT_NO_DECISION_MIXING",
+    }
+
+def run_once():
+    OUT_DIR.mkdir(parents=True,exist_ok=True)
+    manual=manual_data(); all_out={"generated_at_kst":now_iso(),"sidecar_version":SIDECAR_VERSION,"framework_version":FRAMEWORK_VERSION,"venues":{}}
+    for venue in ("KRX","NXT"):
+        z=run_venue(venue,manual); all_out["venues"][venue]=z
+        write_json_atomic(OUT_DIR/f"latest_common_gate_{venue}.json",z)
+    write_json_atomic(OUT_DIR/"latest_common_gate.json",all_out)
+    return all_out
+
+def main():
+    once=os.getenv("COMMON_GATE_RUN_ONCE","false").strip().lower() in {"1","true","yes","y","on"}
+    while True:
+        try:
+            z=run_once()
+            brief={v:{p:d.get("counts") for p,d in (z["venues"][v].get("profiles") or {}).items()} for v in ("KRX","NXT")}
+            print(json.dumps({"event":"common_gate_sidecar","at":now_iso(),"brief":brief},ensure_ascii=False),flush=True)
+        except Exception as e:
+            print(json.dumps({"event":"common_gate_sidecar_error","at":now_iso(),"error":f"{type(e).__name__}: {e}","trace":traceback.format_exc(limit=3)},ensure_ascii=False),flush=True)
+        if once: break
+        time.sleep(POLL)
+
+if __name__=="__main__": main()
+COMMON_GATE_RUNNER_EOF
+
+COPY <<'COMMON_GATE_START_EOF' /app/start_alpha500_with_common_gate.sh
+#!/bin/sh
+set -eu
+if [ "${COMMON_GATE_INDEPENDENT_ENABLED:-true}" = "true" ] || [ "${COMMON_GATE_INDEPENDENT_ENABLED:-true}" = "1" ]; then
+  (
+    while true; do
+      python /app/공통_게이트우선_독립구동_V1_0.py || true
+      sleep 5
+    done
+  ) &
+fi
+exec python /app/오백종목_통합엔진_웹서비스_V1_0.py
+COMMON_GATE_START_EOF
+RUN chmod +x /app/start_alpha500_with_common_gate.sh && mkdir -p /data/results/common_gate
+
 EXPOSE 10000
-CMD ["python", "오백종목_통합엔진_웹서비스_V1_0.py"]
+CMD ["/app/start_alpha500_with_common_gate.sh"]
