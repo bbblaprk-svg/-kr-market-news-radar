@@ -11064,3 +11064,849 @@ RUN chmod +x /app/start_alpha500_with_common_gate.sh && mkdir -p /data/results/c
 
 EXPOSE 10000
 CMD ["/app/start_alpha500_with_common_gate.sh"]
+
+# ===== 보조정보원장 V1.1 · KIS주원장 + LS독립검증 + 보조정보비차단 =====
+COPY <<'CTX_LEDGER_V11_MODULE_20261104' /app/context_ledger_sidecar.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import hashlib, json, logging, os, re, sqlite3, threading, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import parse_qs, quote_plus, urlparse
+from xml.etree import ElementTree as ET
+import requests
+
+KST = timezone(timedelta(hours=9))
+LOG = logging.getLogger("context_ledger")
+
+
+def now_kst(): return datetime.now(KST)
+def now_iso(): return now_kst().isoformat(timespec="seconds")
+def _bool(name, default=False):
+    v=os.getenv(name, "true" if default else "false").strip().lower(); return v in {"1","true","yes","y","on"}
+def _int(name, default):
+    try: return int(os.getenv(name, str(default)))
+    except Exception: return default
+
+def _clean_text(s):
+    s=re.sub(r"<[^>]+>", " ", str(s or "")); s=re.sub(r"\s+", " ", s).strip(); return s[:500]
+def _hash(*parts): return hashlib.sha256("\x1f".join(str(x or "") for x in parts).encode("utf-8","ignore")).hexdigest()
+
+def _google_rss(q):
+    return "https://news.google.com/rss/search?q="+quote_plus(q)+"&hl=ko&gl=KR&ceid=KR:ko"
+
+BROKERS = "키움증권 OR NH투자증권 OR 미래에셋증권 OR 삼성증권 OR 한국투자증권 OR KB증권 OR 신한투자증권 OR 하나증권"
+DEFAULT_SOURCES = [
+    {"group":"BROKER","name":"GOOGLE_NEWS_BROKER_RESEARCH","kind":"rss","url":_google_rss(f"({BROKERS}) (리포트 OR 목표가 OR 추천 OR 관심종목 OR 투자의견) when:1d")},
+    {"group":"PORTAL","name":"GOOGLE_NEWS_KR_MARKET","kind":"rss","url":_google_rss("(코스피 OR 코스닥 OR 국내증시 OR 한국증시 OR 주식시장) when:1d")},
+    {"group":"PORTAL","name":"NAVER_STOCK_NEWS","kind":"html","url":"https://stock.naver.com/news/section"},
+    {"group":"MEDIA","name":"GOOGLE_NEWS_MAJOR_MEDIA","kind":"rss","url":_google_rss("(site:hankyung.com OR site:mk.co.kr OR site:sedaily.com OR site:edaily.co.kr OR site:mt.co.kr) (증시 OR 종목 OR 주식 OR 투자) when:1d")},
+]
+
+class ContextLedger:
+    def __init__(self):
+        self.enabled=_bool("CONTEXT_LEDGER_ENABLED", True)
+        self.interval=_int("CONTEXT_LEDGER_INTERVAL_SECONDS",600)
+        self.timeout=_int("CONTEXT_LEDGER_HTTP_TIMEOUT",12)
+        self.retries=_int("CONTEXT_LEDGER_RETRIES",3)
+        self.max_workers=_int("CONTEXT_LEDGER_MAX_WORKERS",6)
+        self.max_items_source=_int("CONTEXT_LEDGER_MAX_ITEMS_PER_SOURCE",80)
+        self.retention_runs=_int("CONTEXT_LEDGER_RETENTION_RUNS",36)
+        self.db_path=Path(os.getenv("CONTEXT_LEDGER_DB_PATH","/data/context_ledger/context_ledger.db"))
+        self.db_path.parent.mkdir(parents=True,exist_ok=True)
+        self.lock=threading.RLock(); self.run_lock=threading.Lock(); self.last_error=None; self.last_run_id=None
+        self.market_ledger_base=os.getenv("MARKET_LEDGER_BASE","https://quant-signal-v3-7-51-clean2.onrender.com").rstrip("/")
+        self.sources=self._sources(); self._init_db()
+        self.ls_status_provider=None
+        self.ls_result_provider=None
+    def set_ls_provider(self,status_provider=None,result_provider=None):
+        self.ls_status_provider=status_provider
+        self.ls_result_provider=result_provider
+        LOG.info("CONTEXT_LEDGER_LS_PROVIDER_BOUND status=%s result=%s",bool(status_provider),bool(result_provider))
+    def _sources(self):
+        src=list(DEFAULT_SOURCES)
+        raw=os.getenv("CONTEXT_EXTRA_SOURCES_JSON","").strip()
+        if raw:
+            try:
+                extra=json.loads(raw)
+                if isinstance(extra,list):
+                    for x in extra:
+                        if isinstance(x,dict) and x.get("group") and x.get("name") and x.get("url"):
+                            src.append({"group":str(x["group"]).upper(),"name":str(x["name"]),"kind":str(x.get("kind") or "rss"),"url":str(x["url"])})
+            except Exception as e: LOG.warning("CONTEXT_EXTRA_SOURCES_JSON invalid: %s",e)
+        return src
+    def _con(self):
+        c=sqlite3.connect(str(self.db_path),timeout=30,check_same_thread=False)
+        c.row_factory=sqlite3.Row; c.execute("PRAGMA journal_mode=WAL"); c.execute("PRAGMA synchronous=NORMAL"); return c
+    def _init_db(self):
+        with self._con() as c:
+            c.executescript('''
+            CREATE TABLE IF NOT EXISTS context_runs(
+              run_id TEXT PRIMARY KEY,status TEXT NOT NULL,started_at TEXT,completed_at TEXT,
+              source_count INTEGER DEFAULT 0,ok_sources INTEGER DEFAULT 0,broker_ok INTEGER DEFAULT 0,portal_ok INTEGER DEFAULT 0,media_ok INTEGER DEFAULT 0,
+              item_count INTEGER DEFAULT 0,dedup_count INTEGER DEFAULT 0,coverage_pct REAL DEFAULT 0,content_sha256 TEXT,error_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_context_runs_ready ON context_runs(status,completed_at DESC);
+            CREATE TABLE IF NOT EXISTS context_items(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT NOT NULL,source_group TEXT NOT NULL,source_name TEXT NOT NULL,
+              published_at TEXT,title TEXT NOT NULL,url TEXT,summary TEXT,item_hash TEXT NOT NULL,
+              FOREIGN KEY(run_id) REFERENCES context_runs(run_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_context_item ON context_items(run_id,item_hash);
+            CREATE INDEX IF NOT EXISTS idx_context_items_run ON context_items(run_id,source_group);
+            CREATE TABLE IF NOT EXISTS context_source_status(
+              source_name TEXT PRIMARY KEY,source_group TEXT,last_status TEXT,last_http_status INTEGER,last_success_at TEXT,last_attempt_at TEXT,
+              latency_ms INTEGER,item_count INTEGER,last_error TEXT
+            );
+            ''')
+    def _headers(self):
+        return {"User-Agent":"Mozilla/5.0 (compatible; KRMarketContextLedger/1.1; +Render)","Accept":"application/rss+xml,application/xml,text/xml,text/html,application/json;q=0.9,*/*;q=0.8"}
+    def _request(self,url):
+        err=None
+        for i in range(max(1,self.retries)):
+            t=time.monotonic()
+            try:
+                r=requests.get(url,headers=self._headers(),timeout=self.timeout,allow_redirects=True)
+                lat=int((time.monotonic()-t)*1000)
+                if r.status_code>=500 or r.status_code==429:
+                    err=RuntimeError(f"HTTP {r.status_code}"); time.sleep(min(4,0.5*(2**i))); continue
+                r.raise_for_status(); return r,lat
+            except Exception as e:
+                err=e; time.sleep(min(4,0.5*(2**i)))
+        raise err or RuntimeError("request failed")
+    def _parse_rss(self,text):
+        out=[]
+        root=ET.fromstring(text)
+        for node in root.findall(".//item")[:self.max_items_source]:
+            title=_clean_text(node.findtext("title")); link=(node.findtext("link") or "").strip(); pub=_clean_text(node.findtext("pubDate")); desc=_clean_text(node.findtext("description"))
+            if title: out.append({"title":title,"url":link,"published_at":pub,"summary":desc[:280]})
+        return out
+    def _parse_html(self,text):
+        out=[]; seen=set()
+        for m in re.finditer(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',text,re.I|re.S):
+            href=m.group(1); title=_clean_text(m.group(2))
+            if len(title)<8 or title in seen: continue
+            if href.startswith("/"): href="https://stock.naver.com"+href
+            if not href.startswith("http"): continue
+            seen.add(title); out.append({"title":title,"url":href,"published_at":"","summary":""})
+            if len(out)>=self.max_items_source: break
+        return out
+    def _fetch_source(self,s):
+        started=now_iso(); t=time.monotonic(); status="ERROR"; code=None; items=[]; err=""
+        try:
+            r,lat=self._request(s["url"]); code=r.status_code
+            if s.get("kind")=="html": items=self._parse_html(r.text)
+            else: items=self._parse_rss(r.text)
+            status="OK" if items else "EMPTY"
+        except Exception as e:
+            lat=int((time.monotonic()-t)*1000); err=f"{type(e).__name__}: {e}"
+        result={**s,"status":status,"http_status":code,"latency_ms":lat,"items":items,"error":err,"attempt_at":started}
+        with self._con() as c:
+            c.execute('''INSERT INTO context_source_status(source_name,source_group,last_status,last_http_status,last_success_at,last_attempt_at,latency_ms,item_count,last_error)
+                         VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(source_name) DO UPDATE SET source_group=excluded.source_group,last_status=excluded.last_status,last_http_status=excluded.last_http_status,
+                         last_success_at=CASE WHEN excluded.last_status='OK' THEN excluded.last_attempt_at ELSE context_source_status.last_success_at END,last_attempt_at=excluded.last_attempt_at,
+                         latency_ms=excluded.latency_ms,item_count=excluded.item_count,last_error=excluded.last_error''',
+                      (s["name"],s["group"],status,code,started if status=="OK" else None,started,lat,len(items),err))
+        return result
+    def collect(self,reason="schedule"):
+        if not self.enabled: return {"status":"DISABLED"}
+        if not self.run_lock.acquire(blocking=False): return {"status":"BUSY","run_id":self.last_run_id}
+        try:
+            started=now_kst(); run_id=started.strftime("%Y%m%d_%H%M%S_CONTEXT")
+            self.last_run_id=run_id
+            with self._con() as c:
+                c.execute("INSERT OR REPLACE INTO context_runs(run_id,status,started_at,source_count,error_json) VALUES(?,?,?,?,?)",(run_id,"COLLECTING",started.isoformat(timespec="seconds"),len(self.sources),json.dumps({"reason":reason},ensure_ascii=False)))
+            results=[]
+            with ThreadPoolExecutor(max_workers=max(1,self.max_workers)) as ex:
+                fut=[ex.submit(self._fetch_source,s) for s in self.sources]
+                for f in as_completed(fut): results.append(f.result())
+            raw=[]; ok_by={"BROKER":0,"PORTAL":0,"MEDIA":0}; errors=[]
+            for r in results:
+                if r["status"]=="OK": ok_by[r["group"]]=ok_by.get(r["group"],0)+1
+                elif r["status"]=="ERROR": errors.append({"source":r["name"],"error":r["error"]})
+                for it in r["items"]:
+                    raw.append({**it,"source_group":r["group"],"source_name":r["name"]})
+            dedup={}
+            for it in raw:
+                h=_hash(it.get("title",""),it.get("url","")); it["item_hash"]=h; dedup[h]=it
+            items=list(dedup.values())
+            ok_sources=sum(1 for r in results if r["status"]=="OK")
+            coverage=round(ok_sources/max(1,len(self.sources))*100,1)
+            # Strict READY gate: at least one successful source in each required group and enough evidence.
+            valid_groups=all(ok_by.get(g,0)>=1 for g in ("BROKER","PORTAL","MEDIA"))
+            status="READY" if valid_groups and len(items)>=10 else ("PARTIAL" if items else "FAILED")
+            content_hash=_hash(*sorted(i["item_hash"] for i in items)) if items else ""
+            completed=now_iso()
+            with self._con() as c:
+                c.execute("BEGIN IMMEDIATE")
+                c.execute("DELETE FROM context_items WHERE run_id=?",(run_id,))
+                c.executemany('''INSERT OR IGNORE INTO context_items(run_id,source_group,source_name,published_at,title,url,summary,item_hash) VALUES(?,?,?,?,?,?,?,?)''',
+                    [(run_id,i["source_group"],i["source_name"],i.get("published_at"),i["title"],i.get("url"),i.get("summary"),i["item_hash"]) for i in items])
+                c.execute('''UPDATE context_runs SET status=?,completed_at=?,ok_sources=?,broker_ok=?,portal_ok=?,media_ok=?,item_count=?,dedup_count=?,coverage_pct=?,content_sha256=?,error_json=? WHERE run_id=?''',
+                    (status,completed,ok_sources,ok_by.get("BROKER",0),ok_by.get("PORTAL",0),ok_by.get("MEDIA",0),len(items),max(0,len(raw)-len(items)),coverage,content_hash,json.dumps(errors,ensure_ascii=False),run_id))
+                # retention by completed runs
+                old=c.execute("SELECT run_id FROM context_runs ORDER BY COALESCE(completed_at,started_at) DESC LIMIT -1 OFFSET ?",(self.retention_runs,)).fetchall()
+                for row in old:
+                    c.execute("DELETE FROM context_items WHERE run_id=?",(row[0],)); c.execute("DELETE FROM context_runs WHERE run_id=?",(row[0],))
+                c.commit()
+            LOG.info("CONTEXT_LEDGER_DONE run=%s status=%s items=%s coverage=%s broker=%s portal=%s media=%s",run_id,status,len(items),coverage,ok_by.get("BROKER",0),ok_by.get("PORTAL",0),ok_by.get("MEDIA",0))
+            return self.manifest(run_id)
+        except Exception as e:
+            self.last_error=f"{type(e).__name__}: {e}"; LOG.exception("CONTEXT_LEDGER_FAILED")
+            return {"status":"FAILED","error":self.last_error}
+        finally:
+            self.run_lock.release()
+    def manifest(self,run_id):
+        with self._con() as c:
+            r=c.execute("SELECT * FROM context_runs WHERE run_id=?",(run_id,)).fetchone()
+        return dict(r) if r else None
+    def latest(self,ready_only=True):
+        with self._con() as c:
+            q="SELECT * FROM context_runs WHERE status='READY' ORDER BY completed_at DESC LIMIT 1" if ready_only else "SELECT * FROM context_runs ORDER BY COALESCE(completed_at,started_at) DESC LIMIT 1"
+            r=c.execute(q).fetchone()
+        return dict(r) if r else None
+    def latest_completed(self):
+        with self._con() as c:
+            r=c.execute("SELECT * FROM context_runs WHERE completed_at IS NOT NULL AND status IN ('READY','PARTIAL','FAILED') ORDER BY completed_at DESC LIMIT 1").fetchone()
+        return dict(r) if r else None
+    def items(self,run_id,group=None,limit=300):
+        limit=max(1,min(int(limit),1000)); p=[run_id]; w="run_id=?"
+        if group: w+=" AND source_group=?"; p.append(group.upper())
+        p.append(limit)
+        with self._con() as c:
+            rows=c.execute(f"SELECT source_group,source_name,published_at,title,url,summary,item_hash FROM context_items WHERE {w} ORDER BY id ASC LIMIT ?",tuple(p)).fetchall()
+        return [dict(x) for x in rows]
+    def source_status(self):
+        with self._con() as c: rows=c.execute("SELECT * FROM context_source_status ORDER BY source_group,source_name").fetchall()
+        return [dict(x) for x in rows]
+    def _market_manifest(self,market):
+        payload=None; manifest=None; error=None
+        try:
+            _mh=self._headers()
+            _mt=os.getenv("MARKET_LEDGER_TOKEN","").strip()
+            if _mt: _mh["x-app-token"]=_mt
+            r=requests.get(self.market_ledger_base+"/api/ledger/latest",params={"market":market},headers=_mh,timeout=min(8,self.timeout))
+            if r.status_code==200:
+                payload=r.json(); manifest=payload.get("manifest") if isinstance(payload,dict) else None
+                if not isinstance(manifest,dict) and isinstance(payload,dict): manifest=payload
+            else: error=f"HTTP {r.status_code}"
+        except Exception as e:
+            error=f"{type(e).__name__}: {e}"
+        return manifest,error
+    def _ls_snapshot(self,market):
+        state={}; result={}; errors=[]
+        try:
+            if callable(self.ls_status_provider): state=self.ls_status_provider() or {}
+        except Exception as e: errors.append(f"status:{type(e).__name__}:{e}")
+        try:
+            if callable(self.ls_result_provider): result=self.ls_result_provider() or {}
+        except Exception as e: errors.append(f"result:{type(e).__name__}:{e}")
+        if not isinstance(state,dict): state={}
+        if not isinstance(result,dict): result={}
+        req=str(market or "KRX").upper()
+        state_venue=str(state.get("venue") or state.get("expected_venue") or "").upper()
+        result_venue=str(result.get("venue") or "").upper()
+        market_match=(state_venue==req) or (result_venue==req)
+        ws_status=str(state.get("ws_status") or "").upper()
+        configured=bool(state.get("ls_configured"))
+        result_status=str(result.get("status") or "").upper()
+        result_ready=bool(result and result_venue==req and result_status in {"READY","OK","COMPLETE"})
+        live_ready=bool(configured and state_venue==req and ws_status=="RECEIVING")
+        usable=bool(market_match and (live_ready or result_ready or ws_status=="STALE"))
+        ready=bool(live_ready or result_ready)
+        mode="LIVE_WS" if live_ready else ("SNAPSHOT" if result_ready else ("STALE" if usable else "UNAVAILABLE"))
+        return {
+            "ready":ready,"usable":usable,"mode":mode,"configured":configured,"market_match":market_match,
+            "requested_market":req,"state_venue":state_venue or None,"result_venue":result_venue or None,
+            "ws_status":ws_status or None,"ws_tick_age_seconds":state.get("ws_tick_age_seconds"),
+            "last_message_kst":state.get("ws_last_message_kst"),"result_timestamp_kst":result.get("timestamp_kst"),
+            "errors":errors,
+        }
+    def _context_quality(self):
+        ctx=self.latest_completed()
+        if not ctx:
+            return {"available":False,"full":False,"groups_available":0,"item_count":0,"status":"NONE","manifest":None,"groups":{"BROKER":False,"PORTAL":False,"MEDIA":False}}
+        groups={"BROKER":int(ctx.get("broker_ok") or 0)>0,"PORTAL":int(ctx.get("portal_ok") or 0)>0,"MEDIA":int(ctx.get("media_ok") or 0)>0}
+        n=sum(1 for v in groups.values() if v); items=int(ctx.get("item_count") or 0)
+        return {"available":items>0,"full":all(groups.values()) and items>=10,"groups_available":n,"item_count":items,"status":ctx.get("status"),"manifest":ctx,"groups":groups}
+    def work_gate(self, market="KRX"):
+        market=str(market or "KRX").upper()
+        m_manifest,m_error=self._market_manifest(market)
+        market_ready=bool(isinstance(m_manifest,dict) and str(m_manifest.get("status") or "").upper()=="READY")
+        ls=self._ls_snapshot(market)
+        ctx=self._context_quality()
+        if not market_ready:
+            status="NOT_READY"; grade="STOP"; allowed=False
+        elif ls.get("ready") and ctx.get("full"):
+            status="FULL_READY"; grade="A+"; allowed=True
+        elif ls.get("ready"):
+            status="MARKET_READY"; grade="A"; allowed=True
+        elif ls.get("usable") or ctx.get("available"):
+            status="DEGRADED_READY"; grade="B"; allowed=True
+        else:
+            status="MARKET_ONLY"; grade="C"; allowed=True
+        missing=[]
+        if not ls.get("ready"): missing.append("LS_FULL_VALIDATION")
+        for g,ok in (ctx.get("groups") or {}).items():
+            if not ok: missing.append(g)
+        return {
+            "status":status,"work_allowed":allowed,"data_grade":grade,"market":market,
+            "market_ready":market_ready,"market_manifest":m_manifest,"market_error":m_error,
+            "ls":ls,"context":ctx,"missing_axes":missing,
+            "context_is_blocking":False,
+            "policy":"KIS_MARKET_LEDGER_AUTHORITY__LS_INDEPENDENT_CROSSCHECK__BROKER_PORTAL_MEDIA_OPTIONAL_EVIDENCE",
+            "read_order":["KIS_MARKET_LEDGER","LS_RADAR","BROKER","PORTAL","MEDIA"],
+            "now_kst":now_iso()
+        }
+    def health(self):
+        latest=self.latest(False); ready=self.latest(True)
+        return {"ok":True,"service":"KR_MARKET_CONTEXT_LEDGER_V1_1","enabled":self.enabled,"storage":"LOCAL_SQLITE_RECOLLECTABLE","db_path":str(self.db_path),"latest":latest,"latest_ready":ready,"last_error":self.last_error,"source_count":len(self.sources),"interval_seconds":self.interval,"authority":"CONTEXT_OPTIONAL_NEVER_OVERRIDES_KIS_MARKET_LEDGER"}
+    def _loop(self):
+        time.sleep(_int("CONTEXT_LEDGER_START_DELAY_SECONDS",8))
+        while True:
+            self.collect("startup_or_interval")
+            time.sleep(max(60,self.interval))
+    def start(self):
+        if self.enabled:
+            threading.Thread(target=self._loop,daemon=True,name="context-ledger").start()
+            LOG.info("CONTEXT_LEDGER_STARTED interval=%ss sources=%s",self.interval,len(self.sources))
+    def handle_get(self,raw_path):
+        u=urlparse(raw_path); path=u.path; qs=parse_qs(u.query)
+        if path=="/api/context/health": return 200,self.health()
+        if path=="/api/context/latest":
+            m=self.latest_completed()
+            if not m:return 404,{"status":"NO_COMPLETED_CONTEXT_LEDGER"}
+            return 200,{"manifest":m,"items":self.items(m["run_id"],None,_int("CONTEXT_LEDGER_API_ITEM_LIMIT",300)),"blocking":False}
+        if path=="/api/context/latest/manifest":
+            m=self.latest_completed(); return (200,m) if m else (404,{"status":"NO_COMPLETED_CONTEXT_LEDGER"})
+        if path=="/api/context/latest/items":
+            m=self.latest_completed()
+            if not m:return 404,{"status":"NO_COMPLETED_CONTEXT_LEDGER"}
+            return 200,{"run_id":m["run_id"],"items":self.items(m["run_id"],(qs.get("group")or[None])[0],(qs.get("limit")or[300])[0]),"blocking":False}
+        if path=="/api/context/source-status": return 200,{"sources":self.source_status(),"now_kst":now_iso()}
+        if path=="/api/context/ls-bridge": return 200,self._ls_snapshot((qs.get("market")or["KRX"])[0])
+        if path=="/api/context/work-gate": return 200,self.work_gate((qs.get("market")or["KRX"])[0])
+        m=re.match(r"^/api/context/run/([^/]+)/manifest$",path)
+        if m:
+            z=self.manifest(m.group(1)); return (200,z) if z else (404,{"error":"run not found"})
+        m=re.match(r"^/api/context/run/([^/]+)/items$",path)
+        if m:
+            z=self.manifest(m.group(1))
+            if not z:return 404,{"error":"run not found"}
+            return 200,{"run_id":m.group(1),"items":self.items(m.group(1),(qs.get("group")or[None])[0],(qs.get("limit")or[300])[0])}
+        return None
+    def handle_post(self,raw_path,headers):
+        path=urlparse(raw_path).path
+        if path!="/api/context/collect":return None
+        token=os.getenv("CONTEXT_ADMIN_TOKEN","").strip()
+        if not token or headers.get("X-Admin-Token","")!=token:return 403,{"error":"manual collection disabled or unauthorized"}
+        threading.Thread(target=self.collect,args=("manual",),daemon=True).start(); return 202,{"accepted":True}
+
+CONTEXT_LEDGER=ContextLedger()
+
+CTX_LEDGER_V11_MODULE_20261104
+
+COPY <<'CTX_LEDGER_V11_PATCH_20261104' /tmp/apply_context_ledger_v1_1.py
+from pathlib import Path
+p=Path('/app/오백종목_통합엔진_웹서비스_V1_0.py')
+s=p.read_text()
+if 'CONTEXT_LEDGER_INTEGRATION_V1_1' in s:
+    print('CONTEXT_LEDGER_ALREADY_APPLIED')
+    raise SystemExit(0)
+orig=s
+needle='from 거래량가속_완만상승_LS브리지_V2 import LSVolumeDirectionBridge\n'
+rep=needle+'# CONTEXT_LEDGER_INTEGRATION_V1_1\ntry:\n    from context_ledger_sidecar import CONTEXT_LEDGER\nexcept Exception as _ctx_import_error:\n    CONTEXT_LEDGER = None\n    print(f"CONTEXT_LEDGER_IMPORT_ERROR {type(_ctx_import_error).__name__}: {_ctx_import_error}", flush=True)\n'
+assert s.count(needle)==1, 'import anchor mismatch'; s=s.replace(needle,rep,1)
+needle='''    def do_GET(self):\n        path = urlparse(self.path).path\n'''
+rep='''    def do_GET(self):\n        path = urlparse(self.path).path\n        if CONTEXT_LEDGER is not None and path.startswith("/api/context/"):\n            try:\n                _ctx = CONTEXT_LEDGER.handle_get(self.path)\n                if _ctx is not None:\n                    return self._json(_ctx[0], _ctx[1])\n            except Exception as _ctx_err:\n                return self._json(500, {"error": f"CONTEXT_LEDGER: {type(_ctx_err).__name__}: {_ctx_err}"})\n'''
+assert s.count(needle)==1, 'GET anchor mismatch'; s=s.replace(needle,rep,1)
+needle='''    def do_POST(self):\n        if urlparse(self.path).path == "/api/run":\n            return self.do_GET()\n        return self._json(404, {"error": "not found"})\n'''
+rep='''    def do_POST(self):\n        path = urlparse(self.path).path\n        if CONTEXT_LEDGER is not None and path.startswith("/api/context/"):\n            try:\n                _ctx = CONTEXT_LEDGER.handle_post(self.path, self.headers)\n                if _ctx is not None:\n                    return self._json(_ctx[0], _ctx[1])\n            except Exception as _ctx_err:\n                return self._json(500, {"error": f"CONTEXT_LEDGER: {type(_ctx_err).__name__}: {_ctx_err}"})\n        if path == "/api/run":\n            return self.do_GET()\n        return self._json(404, {"error": "not found"})\n'''
+assert s.count(needle)==1, 'POST anchor mismatch'; s=s.replace(needle,rep,1)
+needle='''    threading.Thread(target=close_bet_loop, daemon=True).start()\n    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)\n'''
+rep='''    threading.Thread(target=close_bet_loop, daemon=True).start()\n    if CONTEXT_LEDGER is not None:\n        try:\n            CONTEXT_LEDGER.set_ls_provider(state_copy, load_latest)\n            CONTEXT_LEDGER.start()\n        except Exception as _ctx_start_error:\n            print(f"CONTEXT_LEDGER_START_ERROR {type(_ctx_start_error).__name__}: {_ctx_start_error}", flush=True)\n    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)\n'''
+assert s.count(needle)==1, 'main anchor mismatch'; s=s.replace(needle,rep,1)
+p.write_text(s)
+print('CONTEXT_LEDGER_OVERLAY_APPLIED bytes_delta=',len(s)-len(orig))
+
+CTX_LEDGER_V11_PATCH_20261104
+
+RUN python /tmp/apply_context_ledger_v1_1.py \
+ && python -m py_compile /app/context_ledger_sidecar.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && grep -Fq 'CONTEXT_LEDGER_INTEGRATION_V1_1' /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && grep -Fq 'CONTEXT_LEDGER.set_ls_provider(state_copy, load_latest)' /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && echo 'CONTEXT_LEDGER_V1_1_BUILD_TEST_PASS KIS_AUTHORITY=YES LS_READONLY=YES CONTEXT_BLOCKING=NO' \
+ && rm -f /tmp/apply_context_ledger_v1_1.py
+
+
+# === CONTEXT LEDGER V1.2 KIS-LS SYMBOL CROSSCHECK OVERLAY ===
+COPY <<'CTX_LEDGER_V12_MODULE_20261104' /app/context_ledger_sidecar.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import hashlib, json, logging, os, re, sqlite3, threading, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import parse_qs, quote_plus, urlparse
+from xml.etree import ElementTree as ET
+import requests
+
+KST = timezone(timedelta(hours=9))
+LOG = logging.getLogger("context_ledger")
+
+
+def now_kst(): return datetime.now(KST)
+def now_iso(): return now_kst().isoformat(timespec="seconds")
+def _bool(name, default=False):
+    v=os.getenv(name, "true" if default else "false").strip().lower(); return v in {"1","true","yes","y","on"}
+def _int(name, default):
+    try: return int(os.getenv(name, str(default)))
+    except Exception: return default
+
+def _clean_text(s):
+    s=re.sub(r"<[^>]+>", " ", str(s or "")); s=re.sub(r"\s+", " ", s).strip(); return s[:500]
+def _hash(*parts): return hashlib.sha256("\x1f".join(str(x or "") for x in parts).encode("utf-8","ignore")).hexdigest()
+
+def _google_rss(q):
+    return "https://news.google.com/rss/search?q="+quote_plus(q)+"&hl=ko&gl=KR&ceid=KR:ko"
+
+BROKERS = "키움증권 OR NH투자증권 OR 미래에셋증권 OR 삼성증권 OR 한국투자증권 OR KB증권 OR 신한투자증권 OR 하나증권"
+DEFAULT_SOURCES = [
+    {"group":"BROKER","name":"GOOGLE_NEWS_BROKER_RESEARCH","kind":"rss","url":_google_rss(f"({BROKERS}) (리포트 OR 목표가 OR 추천 OR 관심종목 OR 투자의견) when:1d")},
+    {"group":"PORTAL","name":"GOOGLE_NEWS_KR_MARKET","kind":"rss","url":_google_rss("(코스피 OR 코스닥 OR 국내증시 OR 한국증시 OR 주식시장) when:1d")},
+    {"group":"PORTAL","name":"NAVER_STOCK_NEWS","kind":"html","url":"https://stock.naver.com/news/section"},
+    {"group":"MEDIA","name":"GOOGLE_NEWS_MAJOR_MEDIA","kind":"rss","url":_google_rss("(site:hankyung.com OR site:mk.co.kr OR site:sedaily.com OR site:edaily.co.kr OR site:mt.co.kr) (증시 OR 종목 OR 주식 OR 투자) when:1d")},
+]
+
+class ContextLedger:
+    def __init__(self):
+        self.enabled=_bool("CONTEXT_LEDGER_ENABLED", True)
+        self.interval=_int("CONTEXT_LEDGER_INTERVAL_SECONDS",600)
+        self.timeout=_int("CONTEXT_LEDGER_HTTP_TIMEOUT",12)
+        self.retries=_int("CONTEXT_LEDGER_RETRIES",3)
+        self.max_workers=_int("CONTEXT_LEDGER_MAX_WORKERS",6)
+        self.max_items_source=_int("CONTEXT_LEDGER_MAX_ITEMS_PER_SOURCE",80)
+        self.retention_runs=_int("CONTEXT_LEDGER_RETENTION_RUNS",36)
+        self.db_path=Path(os.getenv("CONTEXT_LEDGER_DB_PATH","/data/context_ledger/context_ledger.db"))
+        self.db_path.parent.mkdir(parents=True,exist_ok=True)
+        self.lock=threading.RLock(); self.run_lock=threading.Lock(); self.last_error=None; self.last_run_id=None
+        self.market_ledger_base=os.getenv("MARKET_LEDGER_BASE","https://quant-signal-v3-7-51-clean2.onrender.com").rstrip("/")
+        self.sources=self._sources(); self._init_db()
+        self.ls_status_provider=None
+        self.ls_result_provider=None
+        self.ls_result_for_venue_provider=None
+        self.cross_cache={}
+    def set_ls_provider(self,status_provider=None,result_provider=None,result_for_venue_provider=None):
+        self.ls_status_provider=status_provider
+        self.ls_result_provider=result_provider
+        self.ls_result_for_venue_provider=result_for_venue_provider
+        LOG.info("CONTEXT_LEDGER_LS_PROVIDER_BOUND status=%s result=%s venue_result=%s",bool(status_provider),bool(result_provider),bool(result_for_venue_provider))
+    def _sources(self):
+        src=list(DEFAULT_SOURCES)
+        raw=os.getenv("CONTEXT_EXTRA_SOURCES_JSON","").strip()
+        if raw:
+            try:
+                extra=json.loads(raw)
+                if isinstance(extra,list):
+                    for x in extra:
+                        if isinstance(x,dict) and x.get("group") and x.get("name") and x.get("url"):
+                            src.append({"group":str(x["group"]).upper(),"name":str(x["name"]),"kind":str(x.get("kind") or "rss"),"url":str(x["url"])})
+            except Exception as e: LOG.warning("CONTEXT_EXTRA_SOURCES_JSON invalid: %s",e)
+        return src
+    def _con(self):
+        c=sqlite3.connect(str(self.db_path),timeout=30,check_same_thread=False)
+        c.row_factory=sqlite3.Row; c.execute("PRAGMA journal_mode=WAL"); c.execute("PRAGMA synchronous=NORMAL"); return c
+    def _init_db(self):
+        with self._con() as c:
+            c.executescript('''
+            CREATE TABLE IF NOT EXISTS context_runs(
+              run_id TEXT PRIMARY KEY,status TEXT NOT NULL,started_at TEXT,completed_at TEXT,
+              source_count INTEGER DEFAULT 0,ok_sources INTEGER DEFAULT 0,broker_ok INTEGER DEFAULT 0,portal_ok INTEGER DEFAULT 0,media_ok INTEGER DEFAULT 0,
+              item_count INTEGER DEFAULT 0,dedup_count INTEGER DEFAULT 0,coverage_pct REAL DEFAULT 0,content_sha256 TEXT,error_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_context_runs_ready ON context_runs(status,completed_at DESC);
+            CREATE TABLE IF NOT EXISTS context_items(
+              id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT NOT NULL,source_group TEXT NOT NULL,source_name TEXT NOT NULL,
+              published_at TEXT,title TEXT NOT NULL,url TEXT,summary TEXT,item_hash TEXT NOT NULL,
+              FOREIGN KEY(run_id) REFERENCES context_runs(run_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_context_item ON context_items(run_id,item_hash);
+            CREATE INDEX IF NOT EXISTS idx_context_items_run ON context_items(run_id,source_group);
+            CREATE TABLE IF NOT EXISTS context_source_status(
+              source_name TEXT PRIMARY KEY,source_group TEXT,last_status TEXT,last_http_status INTEGER,last_success_at TEXT,last_attempt_at TEXT,
+              latency_ms INTEGER,item_count INTEGER,last_error TEXT
+            );
+            ''')
+    def _headers(self):
+        return {"User-Agent":"Mozilla/5.0 (compatible; KRMarketContextLedger/1.2; +Render)","Accept":"application/rss+xml,application/xml,text/xml,text/html,application/json;q=0.9,*/*;q=0.8"}
+    def _request(self,url):
+        err=None
+        for i in range(max(1,self.retries)):
+            t=time.monotonic()
+            try:
+                r=requests.get(url,headers=self._headers(),timeout=self.timeout,allow_redirects=True)
+                lat=int((time.monotonic()-t)*1000)
+                if r.status_code>=500 or r.status_code==429:
+                    err=RuntimeError(f"HTTP {r.status_code}"); time.sleep(min(4,0.5*(2**i))); continue
+                r.raise_for_status(); return r,lat
+            except Exception as e:
+                err=e; time.sleep(min(4,0.5*(2**i)))
+        raise err or RuntimeError("request failed")
+    def _parse_rss(self,text):
+        out=[]
+        root=ET.fromstring(text)
+        for node in root.findall(".//item")[:self.max_items_source]:
+            title=_clean_text(node.findtext("title")); link=(node.findtext("link") or "").strip(); pub=_clean_text(node.findtext("pubDate")); desc=_clean_text(node.findtext("description"))
+            if title: out.append({"title":title,"url":link,"published_at":pub,"summary":desc[:280]})
+        return out
+    def _parse_html(self,text):
+        out=[]; seen=set()
+        for m in re.finditer(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',text,re.I|re.S):
+            href=m.group(1); title=_clean_text(m.group(2))
+            if len(title)<8 or title in seen: continue
+            if href.startswith("/"): href="https://stock.naver.com"+href
+            if not href.startswith("http"): continue
+            seen.add(title); out.append({"title":title,"url":href,"published_at":"","summary":""})
+            if len(out)>=self.max_items_source: break
+        return out
+    def _fetch_source(self,s):
+        started=now_iso(); t=time.monotonic(); status="ERROR"; code=None; items=[]; err=""
+        try:
+            r,lat=self._request(s["url"]); code=r.status_code
+            if s.get("kind")=="html": items=self._parse_html(r.text)
+            else: items=self._parse_rss(r.text)
+            status="OK" if items else "EMPTY"
+        except Exception as e:
+            lat=int((time.monotonic()-t)*1000); err=f"{type(e).__name__}: {e}"
+        result={**s,"status":status,"http_status":code,"latency_ms":lat,"items":items,"error":err,"attempt_at":started}
+        with self._con() as c:
+            c.execute('''INSERT INTO context_source_status(source_name,source_group,last_status,last_http_status,last_success_at,last_attempt_at,latency_ms,item_count,last_error)
+                         VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(source_name) DO UPDATE SET source_group=excluded.source_group,last_status=excluded.last_status,last_http_status=excluded.last_http_status,
+                         last_success_at=CASE WHEN excluded.last_status='OK' THEN excluded.last_attempt_at ELSE context_source_status.last_success_at END,last_attempt_at=excluded.last_attempt_at,
+                         latency_ms=excluded.latency_ms,item_count=excluded.item_count,last_error=excluded.last_error''',
+                      (s["name"],s["group"],status,code,started if status=="OK" else None,started,lat,len(items),err))
+        return result
+    def collect(self,reason="schedule"):
+        if not self.enabled: return {"status":"DISABLED"}
+        if not self.run_lock.acquire(blocking=False): return {"status":"BUSY","run_id":self.last_run_id}
+        try:
+            started=now_kst(); run_id=started.strftime("%Y%m%d_%H%M%S_CONTEXT")
+            self.last_run_id=run_id
+            with self._con() as c:
+                c.execute("INSERT OR REPLACE INTO context_runs(run_id,status,started_at,source_count,error_json) VALUES(?,?,?,?,?)",(run_id,"COLLECTING",started.isoformat(timespec="seconds"),len(self.sources),json.dumps({"reason":reason},ensure_ascii=False)))
+            results=[]
+            with ThreadPoolExecutor(max_workers=max(1,self.max_workers)) as ex:
+                fut=[ex.submit(self._fetch_source,s) for s in self.sources]
+                for f in as_completed(fut): results.append(f.result())
+            raw=[]; ok_by={"BROKER":0,"PORTAL":0,"MEDIA":0}; errors=[]
+            for r in results:
+                if r["status"]=="OK": ok_by[r["group"]]=ok_by.get(r["group"],0)+1
+                elif r["status"]=="ERROR": errors.append({"source":r["name"],"error":r["error"]})
+                for it in r["items"]:
+                    raw.append({**it,"source_group":r["group"],"source_name":r["name"]})
+            dedup={}
+            for it in raw:
+                h=_hash(it.get("title",""),it.get("url","")); it["item_hash"]=h; dedup[h]=it
+            items=list(dedup.values())
+            ok_sources=sum(1 for r in results if r["status"]=="OK")
+            coverage=round(ok_sources/max(1,len(self.sources))*100,1)
+            # Strict READY gate: at least one successful source in each required group and enough evidence.
+            valid_groups=all(ok_by.get(g,0)>=1 for g in ("BROKER","PORTAL","MEDIA"))
+            status="READY" if valid_groups and len(items)>=10 else ("PARTIAL" if items else "FAILED")
+            content_hash=_hash(*sorted(i["item_hash"] for i in items)) if items else ""
+            completed=now_iso()
+            with self._con() as c:
+                c.execute("BEGIN IMMEDIATE")
+                c.execute("DELETE FROM context_items WHERE run_id=?",(run_id,))
+                c.executemany('''INSERT OR IGNORE INTO context_items(run_id,source_group,source_name,published_at,title,url,summary,item_hash) VALUES(?,?,?,?,?,?,?,?)''',
+                    [(run_id,i["source_group"],i["source_name"],i.get("published_at"),i["title"],i.get("url"),i.get("summary"),i["item_hash"]) for i in items])
+                c.execute('''UPDATE context_runs SET status=?,completed_at=?,ok_sources=?,broker_ok=?,portal_ok=?,media_ok=?,item_count=?,dedup_count=?,coverage_pct=?,content_sha256=?,error_json=? WHERE run_id=?''',
+                    (status,completed,ok_sources,ok_by.get("BROKER",0),ok_by.get("PORTAL",0),ok_by.get("MEDIA",0),len(items),max(0,len(raw)-len(items)),coverage,content_hash,json.dumps(errors,ensure_ascii=False),run_id))
+                # retention by completed runs
+                old=c.execute("SELECT run_id FROM context_runs ORDER BY COALESCE(completed_at,started_at) DESC LIMIT -1 OFFSET ?",(self.retention_runs,)).fetchall()
+                for row in old:
+                    c.execute("DELETE FROM context_items WHERE run_id=?",(row[0],)); c.execute("DELETE FROM context_runs WHERE run_id=?",(row[0],))
+                c.commit()
+            LOG.info("CONTEXT_LEDGER_DONE run=%s status=%s items=%s coverage=%s broker=%s portal=%s media=%s",run_id,status,len(items),coverage,ok_by.get("BROKER",0),ok_by.get("PORTAL",0),ok_by.get("MEDIA",0))
+            return self.manifest(run_id)
+        except Exception as e:
+            self.last_error=f"{type(e).__name__}: {e}"; LOG.exception("CONTEXT_LEDGER_FAILED")
+            return {"status":"FAILED","error":self.last_error}
+        finally:
+            self.run_lock.release()
+    def manifest(self,run_id):
+        with self._con() as c:
+            r=c.execute("SELECT * FROM context_runs WHERE run_id=?",(run_id,)).fetchone()
+        return dict(r) if r else None
+    def latest(self,ready_only=True):
+        with self._con() as c:
+            q="SELECT * FROM context_runs WHERE status='READY' ORDER BY completed_at DESC LIMIT 1" if ready_only else "SELECT * FROM context_runs ORDER BY COALESCE(completed_at,started_at) DESC LIMIT 1"
+            r=c.execute(q).fetchone()
+        return dict(r) if r else None
+    def latest_completed(self):
+        with self._con() as c:
+            r=c.execute("SELECT * FROM context_runs WHERE completed_at IS NOT NULL AND status IN ('READY','PARTIAL','FAILED') ORDER BY completed_at DESC LIMIT 1").fetchone()
+        return dict(r) if r else None
+    def items(self,run_id,group=None,limit=300):
+        limit=max(1,min(int(limit),1000)); p=[run_id]; w="run_id=?"
+        if group: w+=" AND source_group=?"; p.append(group.upper())
+        p.append(limit)
+        with self._con() as c:
+            rows=c.execute(f"SELECT source_group,source_name,published_at,title,url,summary,item_hash FROM context_items WHERE {w} ORDER BY id ASC LIMIT ?",tuple(p)).fetchall()
+        return [dict(x) for x in rows]
+    def source_status(self):
+        with self._con() as c: rows=c.execute("SELECT * FROM context_source_status ORDER BY source_group,source_name").fetchall()
+        return [dict(x) for x in rows]
+    def _market_manifest(self,market):
+        payload=None; manifest=None; error=None
+        try:
+            _mh=self._headers()
+            _mt=os.getenv("MARKET_LEDGER_TOKEN","").strip()
+            if _mt: _mh["x-app-token"]=_mt
+            r=requests.get(self.market_ledger_base+"/api/ledger/latest",params={"market":market},headers=_mh,timeout=min(8,self.timeout))
+            if r.status_code==200:
+                payload=r.json(); manifest=payload.get("manifest") if isinstance(payload,dict) else None
+                if not isinstance(manifest,dict) and isinstance(payload,dict): manifest=payload
+            else: error=f"HTTP {r.status_code}"
+        except Exception as e:
+            error=f"{type(e).__name__}: {e}"
+        return manifest,error
+    def _ls_snapshot(self,market):
+        state={}; result={}; errors=[]
+        try:
+            if callable(self.ls_status_provider): state=self.ls_status_provider() or {}
+        except Exception as e: errors.append(f"status:{type(e).__name__}:{e}")
+        try:
+            if callable(self.ls_result_provider): result=self.ls_result_provider() or {}
+        except Exception as e: errors.append(f"result:{type(e).__name__}:{e}")
+        if not isinstance(state,dict): state={}
+        if not isinstance(result,dict): result={}
+        req=str(market or "KRX").upper()
+        state_venue=str(state.get("venue") or state.get("expected_venue") or "").upper()
+        result_venue=str(result.get("venue") or "").upper()
+        market_match=(state_venue==req) or (result_venue==req)
+        ws_status=str(state.get("ws_status") or "").upper()
+        configured=bool(state.get("ls_configured"))
+        result_status=str(result.get("status") or "").upper()
+        result_ready=bool(result and result_venue==req and result_status in {"READY","OK","COMPLETE"})
+        live_ready=bool(configured and state_venue==req and ws_status=="RECEIVING")
+        usable=bool(market_match and (live_ready or result_ready or ws_status=="STALE"))
+        ready=bool(live_ready or result_ready)
+        mode="LIVE_WS" if live_ready else ("SNAPSHOT" if result_ready else ("STALE" if usable else "UNAVAILABLE"))
+        return {
+            "ready":ready,"usable":usable,"mode":mode,"configured":configured,"market_match":market_match,
+            "requested_market":req,"state_venue":state_venue or None,"result_venue":result_venue or None,
+            "ws_status":ws_status or None,"ws_tick_age_seconds":state.get("ws_tick_age_seconds"),
+            "last_message_kst":state.get("ws_last_message_kst"),"result_timestamp_kst":result.get("timestamp_kst"),
+            "errors":errors,
+        }
+    def _ls_result_for_market(self, market):
+        req=str(market or "KRX").upper()
+        result={}
+        try:
+            if callable(self.ls_result_for_venue_provider): result=self.ls_result_for_venue_provider(req) or {}
+            elif callable(self.ls_result_provider): result=self.ls_result_provider() or {}
+        except Exception as e:
+            return {}, f"{type(e).__name__}: {e}"
+        if not isinstance(result,dict): return {}, "LS_RESULT_NOT_DICT"
+        venue=str(result.get("venue") or "").upper()
+        if venue and venue!=req: return {}, f"VENUE_MISMATCH:{venue}"
+        return result, None
+    def _ls_quotes(self, market="KRX", limit=500):
+        req=str(market or "KRX").upper(); limit=max(1,min(int(limit),1000))
+        result,error=self._ls_result_for_market(req)
+        if not result:
+            return {"market":req,"status":"UNAVAILABLE","error":error,"timestamp_kst":None,"total":0,"rows":[]}
+        stamp=result.get("timestamp_kst") or result.get("updated_at") or result.get("generated_at")
+        pools=[]
+        for key in ("live_pool","live_deep30","live_watch10","top_final","top_watch","anchor_sensors","sector_live_pool"):
+            value=result.get(key)
+            if isinstance(value,list): pools.extend(value)
+        out={}
+        def fnum(v):
+            try: return float(str(v).replace(",","").replace("%","").strip())
+            except Exception: return None
+        for r in pools:
+            if not isinstance(r,dict): continue
+            code=str(r.get("symbol") or r.get("code") or r.get("stock_code") or "").strip().zfill(6)
+            if len(code)!=6: continue
+            price=None
+            for k in ("current_price","price","stage1_close","last_price","close"):
+                price=fnum(r.get(k))
+                if price not in (None,0.0): break
+            if price in (None,0.0): continue
+            chg=None
+            for k in ("change_pct","current_return_pct","change_rate","return_pct"):
+                chg=fnum(r.get(k))
+                if chg is not None: break
+            prev=out.get(code)
+            row={"code":code,"name":str(r.get("name") or r.get("stock_name") or code),"price":price,"change_pct":chg,
+                 "timestamp_kst":stamp,"venue":req,"source":"LS_ALPHA500_READONLY"}
+            if prev is None: out[code]=row
+        rows=list(out.values())[:limit]
+        return {"market":req,"status":"READY" if rows else "EMPTY","error":error,"timestamp_kst":stamp,"total":len(out),"rows":rows}
+    def _market_rows(self,market,limit=5000):
+        headers=self._headers(); token=os.getenv("MARKET_LEDGER_TOKEN","").strip()
+        if token: headers["x-app-token"]=token
+        r=requests.get(self.market_ledger_base+"/api/ledger/latest/rows",params={"market":market,"limit":max(1,min(int(limit),5000))},headers=headers,timeout=min(12,self.timeout))
+        if r.status_code!=200: return [],None,f"HTTP {r.status_code}"
+        p=r.json() if r.content else {}; return (p.get("rows") or []),(p.get("manifest") or {}),None
+    def _parse_dt(self,value,assume_kst=False):
+        if value in (None,""): return None
+        try:
+            s=str(value).replace("Z","+00:00"); d=datetime.fromisoformat(s)
+            if d.tzinfo is None: d=d.replace(tzinfo=KST if assume_kst else timezone.utc)
+            return d.astimezone(timezone.utc)
+        except Exception:return None
+    def cross_check(self,market="KRX",limit=500):
+        req=str(market or "KRX").upper(); now=time.monotonic(); ttl=max(5,_int("CONTEXT_CROSSCHECK_CACHE_SECONDS",30)); key=(req,int(limit))
+        cached=self.cross_cache.get(key)
+        if cached and now-cached[0] <= ttl:return cached[1]
+        ls=self._ls_quotes(req,limit); kis_rows,kis_manifest,kerr=self._market_rows(req,5000)
+        kis={str(r.get("code") or "").zfill(6):r for r in kis_rows if isinstance(r,dict)}
+        max_skew=max(10,_int("CONTEXT_CROSSCHECK_MAX_TIME_SKEW_SECONDS",120))
+        match_tol=float(os.getenv("CONTEXT_CROSSCHECK_MATCH_PCT","0.15")); near_tol=float(os.getenv("CONTEXT_CROSSCHECK_NEAR_PCT","0.50"))
+        details=[]; counts={"MATCH":0,"NEAR":0,"PRICE_DIVERGENCE":0,"TIME_SKEW":0,"TIME_UNKNOWN":0,"KIS_TIME_UNVERIFIED":0,"NO_KIS":0}
+        ls_dt=self._parse_dt(ls.get("timestamp_kst"),True)
+        for x in ls.get("rows") or []:
+            k=kis.get(x["code"])
+            if not k:
+                counts["NO_KIS"]+=1; details.append({**x,"state":"NO_KIS"}); continue
+            kp=float(k.get("price") or 0); lp=float(x.get("price") or 0); diff=abs(lp-kp)/kp*100 if kp>0 else None
+            q=str(k.get("source_timestamp_quality") or "LEGACY_UNKNOWN").upper(); kd=self._parse_dt(k.get("source_timestamp"),False)
+            skew=abs((ls_dt-kd).total_seconds()) if (ls_dt and kd) else None
+            if q=="REQUEST_TIME_ONLY": state="KIS_TIME_UNVERIFIED"
+            elif skew is None: state="TIME_UNKNOWN"
+            elif skew>max_skew: state="TIME_SKEW"
+            elif diff is not None and diff<=match_tol: state="MATCH"
+            elif diff is not None and diff<=near_tol: state="NEAR"
+            else: state="PRICE_DIVERGENCE"
+            counts[state]=counts.get(state,0)+1
+            details.append({"code":x["code"],"name":x.get("name"),"kis_price":kp,"ls_price":lp,"price_diff_pct":round(diff,4) if diff is not None else None,
+                            "time_skew_seconds":round(skew,1) if skew is not None else None,"kis_timestamp_quality":q,"state":state})
+        comparable=counts["MATCH"]+counts["NEAR"]+counts["PRICE_DIVERGENCE"]
+        out={"market":req,"status":"OK" if not kerr else "DEGRADED","kis_error":kerr,"kis_round_id":(kis_manifest or {}).get("round_id"),
+             "ls_timestamp_kst":ls.get("timestamp_kst"),"ls_quotes":len(ls.get("rows") or []),"overlap":len(details),"comparable":comparable,"counts":counts,
+             "match_rate_pct":round((counts["MATCH"]+counts["NEAR"])/comparable*100,2) if comparable else None,
+             "policy":"READ_ONLY; compare only when timestamps are sufficiently aligned; never overwrite KIS authority","rows":details[:max(1,min(int(limit),500))]}
+        self.cross_cache[key]=(now,out); return out
+
+    def _context_quality(self):
+        ctx=self.latest_completed()
+        if not ctx:
+            return {"available":False,"full":False,"groups_available":0,"item_count":0,"status":"NONE","manifest":None,"groups":{"BROKER":False,"PORTAL":False,"MEDIA":False}}
+        groups={"BROKER":int(ctx.get("broker_ok") or 0)>0,"PORTAL":int(ctx.get("portal_ok") or 0)>0,"MEDIA":int(ctx.get("media_ok") or 0)>0}
+        n=sum(1 for v in groups.values() if v); items=int(ctx.get("item_count") or 0)
+        return {"available":items>0,"full":all(groups.values()) and items>=10,"groups_available":n,"item_count":items,"status":ctx.get("status"),"manifest":ctx,"groups":groups}
+    def work_gate(self, market="KRX"):
+        market=str(market or "KRX").upper()
+        m_manifest,m_error=self._market_manifest(market)
+        market_ready=bool(isinstance(m_manifest,dict) and str(m_manifest.get("status") or "").upper()=="READY")
+        ls=self._ls_snapshot(market)
+        cross=self.cross_check(market,_int("CONTEXT_CROSSCHECK_LIMIT",200))
+        ctx=self._context_quality()
+        if not market_ready:
+            status="NOT_READY"; grade="STOP"; allowed=False
+        elif ls.get("ready") and ctx.get("full"):
+            status="FULL_READY"; grade="A+"; allowed=True
+        elif ls.get("ready"):
+            status="MARKET_READY"; grade="A"; allowed=True
+        elif ls.get("usable") or ctx.get("available"):
+            status="DEGRADED_READY"; grade="B"; allowed=True
+        else:
+            status="MARKET_ONLY"; grade="C"; allowed=True
+        missing=[]
+        if not ls.get("ready"): missing.append("LS_FULL_VALIDATION")
+        for g,ok in (ctx.get("groups") or {}).items():
+            if not ok: missing.append(g)
+        return {
+            "status":status,"work_allowed":allowed,"data_grade":grade,"market":market,
+            "market_ready":market_ready,"market_manifest":m_manifest,"market_error":m_error,
+            "ls":ls,"cross_validation":cross,"context":ctx,"missing_axes":missing,
+            "context_is_blocking":False,
+            "policy":"KIS_MARKET_LEDGER_AUTHORITY__LS_INDEPENDENT_CROSSCHECK__BROKER_PORTAL_MEDIA_OPTIONAL_EVIDENCE",
+            "read_order":["KIS_MARKET_LEDGER","LS_RADAR","BROKER","PORTAL","MEDIA"],
+            "now_kst":now_iso()
+        }
+    def health(self):
+        latest=self.latest(False); ready=self.latest(True)
+        return {"ok":True,"service":"KR_MARKET_CONTEXT_LEDGER_V1_2","enabled":self.enabled,"storage":"LOCAL_SQLITE_RECOLLECTABLE","db_path":str(self.db_path),"latest":latest,"latest_ready":ready,"last_error":self.last_error,"source_count":len(self.sources),"interval_seconds":self.interval,"authority":"CONTEXT_OPTIONAL_NEVER_OVERRIDES_KIS_MARKET_LEDGER"}
+    def _loop(self):
+        time.sleep(_int("CONTEXT_LEDGER_START_DELAY_SECONDS",8))
+        while True:
+            self.collect("startup_or_interval")
+            time.sleep(max(60,self.interval))
+    def start(self):
+        if self.enabled:
+            threading.Thread(target=self._loop,daemon=True,name="context-ledger").start()
+            LOG.info("CONTEXT_LEDGER_STARTED interval=%ss sources=%s",self.interval,len(self.sources))
+    def handle_get(self,raw_path):
+        u=urlparse(raw_path); path=u.path; qs=parse_qs(u.query)
+        if path=="/api/context/health": return 200,self.health()
+        if path=="/api/context/latest":
+            m=self.latest_completed()
+            if not m:return 404,{"status":"NO_COMPLETED_CONTEXT_LEDGER"}
+            return 200,{"manifest":m,"items":self.items(m["run_id"],None,_int("CONTEXT_LEDGER_API_ITEM_LIMIT",300)),"blocking":False}
+        if path=="/api/context/latest/manifest":
+            m=self.latest_completed(); return (200,m) if m else (404,{"status":"NO_COMPLETED_CONTEXT_LEDGER"})
+        if path=="/api/context/latest/items":
+            m=self.latest_completed()
+            if not m:return 404,{"status":"NO_COMPLETED_CONTEXT_LEDGER"}
+            return 200,{"run_id":m["run_id"],"items":self.items(m["run_id"],(qs.get("group")or[None])[0],(qs.get("limit")or[300])[0]),"blocking":False}
+        if path=="/api/context/source-status": return 200,{"sources":self.source_status(),"now_kst":now_iso()}
+        if path=="/api/context/ls-bridge": return 200,self._ls_snapshot((qs.get("market")or["KRX"])[0])
+        if path=="/api/context/ls-quotes": return 200,self._ls_quotes((qs.get("market")or["KRX"])[0],int((qs.get("limit")or["500"])[0]))
+        if path=="/api/context/cross-check": return 200,self.cross_check((qs.get("market")or["KRX"])[0],int((qs.get("limit")or["200"])[0]))
+        if path=="/api/context/work-gate": return 200,self.work_gate((qs.get("market")or["KRX"])[0])
+        m=re.match(r"^/api/context/run/([^/]+)/manifest$",path)
+        if m:
+            z=self.manifest(m.group(1)); return (200,z) if z else (404,{"error":"run not found"})
+        m=re.match(r"^/api/context/run/([^/]+)/items$",path)
+        if m:
+            z=self.manifest(m.group(1))
+            if not z:return 404,{"error":"run not found"}
+            return 200,{"run_id":m.group(1),"items":self.items(m.group(1),(qs.get("group")or[None])[0],(qs.get("limit")or[300])[0])}
+        return None
+    def handle_post(self,raw_path,headers):
+        path=urlparse(raw_path).path
+        if path!="/api/context/collect":return None
+        token=os.getenv("CONTEXT_ADMIN_TOKEN","").strip()
+        if not token or headers.get("X-Admin-Token","")!=token:return 403,{"error":"manual collection disabled or unauthorized"}
+        threading.Thread(target=self.collect,args=("manual",),daemon=True).start(); return 202,{"accepted":True}
+
+CONTEXT_LEDGER=ContextLedger()
+
+CTX_LEDGER_V12_MODULE_20261104
+
+COPY <<'CTX_LEDGER_V12_PATCH_20261104' /tmp/apply_context_ledger_v1_2.py
+from pathlib import Path
+p=Path('/app/오백종목_통합엔진_웹서비스_V1_0.py')
+s=p.read_text()
+old='CONTEXT_LEDGER.set_ls_provider(state_copy, load_latest)'
+new='CONTEXT_LEDGER.set_ls_provider(state_copy, load_latest, load_latest_for_venue)'
+assert old in s or new in s, 'LS provider binding anchor missing'
+if old in s:s=s.replace(old,new,1)
+p.write_text(s)
+print('CONTEXT_LEDGER_V1_2_PROVIDER_PATCH_APPLIED')
+CTX_LEDGER_V12_PATCH_20261104
+
+RUN python /tmp/apply_context_ledger_v1_2.py \
+ && python -m py_compile /app/context_ledger_sidecar.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && grep -Fq 'set_ls_provider(state_copy, load_latest, load_latest_for_venue)' /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && rm -f /tmp/apply_context_ledger_v1_2.py
+
+COPY <<'CTX_LEDGER_V12_SMOKE_20261104' /tmp/context_v12_smoke.py
+import os
+os.environ['CONTEXT_LEDGER_DB_PATH']='/tmp/context-v12-smoke.db'
+from context_ledger_sidecar import ContextLedger
+c=ContextLedger()
+result={'venue':'KRX','timestamp_kst':'2026-11-04T14:30:00+09:00','live_pool':[{'symbol':'005930','name':'삼성전자','current_price':100.0,'change_pct':1.0}]}
+c.set_ls_provider(lambda:{'ls_configured':True,'venue':'KRX','ws_status':'RECEIVING'},lambda:result,lambda v:result if v=='KRX' else None)
+c._market_rows=lambda market,limit=5000: ([{'code':'005930','price':100.1,'source_timestamp':'2026-11-04T05:30:00+00:00','source_timestamp_quality':'EXCHANGE_TIMESTAMP'}],{'round_id':'TEST'},None)
+q=c._ls_quotes('KRX',100); assert q['total']==1 and q['rows'][0]['code']=='005930',q
+x=c.cross_check('KRX',100); assert x['counts']['MATCH']==1,x
+print('CONTEXT_LEDGER_V1_2_BUILD_TEST_PASS KIS_LS_SYMBOL_CROSSCHECK=YES NONBLOCKING=YES')
+CTX_LEDGER_V12_SMOKE_20261104
+RUN PYTHONPATH=/app CONTEXT_LEDGER_ENABLED=false CONTEXT_LEDGER_DB_PATH=/tmp/context-v12-smoke.db python /tmp/context_v12_smoke.py \
+ && rm -f /tmp/context_v12_smoke.py /tmp/context-v12-smoke.db /tmp/context-v12-smoke.db-wal /tmp/context-v12-smoke.db-shm
