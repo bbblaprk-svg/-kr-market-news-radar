@@ -11910,3 +11910,26 @@ print('CONTEXT_LEDGER_V1_2_BUILD_TEST_PASS KIS_LS_SYMBOL_CROSSCHECK=YES NONBLOCK
 CTX_LEDGER_V12_SMOKE_20261104
 RUN PYTHONPATH=/app CONTEXT_LEDGER_ENABLED=false CONTEXT_LEDGER_DB_PATH=/tmp/context-v12-smoke.db python /tmp/context_v12_smoke.py \
  && rm -f /tmp/context_v12_smoke.py /tmp/context-v12-smoke.db /tmp/context-v12-smoke.db-wal /tmp/context-v12-smoke.db-shm
+
+# ===== LS 보조원장 V1.2.1 · KRX/NXT DUAL QUERY SPLIT FIX =====
+# KRX|NXT or KRX,NXT is never forwarded as one invalid market to KIS.
+# It is split into two independent venue reads, preserving KRX/NXT separation.
+COPY <<'CTX_LEDGER_V121_MARKET_SPLIT_APPLY' /tmp/apply_context_market_split_v121.py
+from pathlib import Path
+p=Path('/app/context_ledger_sidecar.py')
+s=p.read_text(encoding='utf-8')
+old='''    def work_gate(self, market="KRX"):\n        market=str(market or "KRX").upper()\n        m_manifest,m_error=self._market_manifest(market)\n'''
+new='''    def work_gate(self, market="KRX"):\n        raw_market=str(market or "KRX").upper().strip()\n        normalized=raw_market.replace(",","|")\n        parts=[]\n        for x in normalized.split("|"):\n            x=x.strip()\n            if x in {"KRX","NXT"} and x not in parts:\n                parts.append(x)\n        if len(parts)>1:\n            markets={m:self.work_gate(m) for m in parts}\n            allowed=all(bool(v.get("work_allowed")) for v in markets.values())\n            return {\n                "status":"DUAL_MARKET_READY" if allowed else "DUAL_MARKET_PARTIAL",\n                "work_allowed":allowed,\n                "market":"|".join(parts),\n                "markets":markets,\n                "policy":"KRX_NXT_STRICTLY_SEPARATE__NEVER_FORWARD_COMBINED_MARKET_TO_KIS",\n                "now_kst":now_iso(),\n            }\n        market=parts[0] if parts else raw_market\n        m_manifest,m_error=self._market_manifest(market)\n'''
+if old not in s:
+    if 'KRX_NXT_STRICTLY_SEPARATE__NEVER_FORWARD_COMBINED_MARKET_TO_KIS' in s:
+        print('CTX_LEDGER_V121_ALREADY_APPLIED')
+    else:
+        raise SystemExit('CTX_LEDGER_V121_TARGET_NOT_FOUND')
+else:
+    p.write_text(s.replace(old,new,1),encoding='utf-8')
+    print('CTX_LEDGER_V121_APPLIED DUAL_MARKET_SPLIT=YES')
+CTX_LEDGER_V121_MARKET_SPLIT_APPLY
+RUN python /tmp/apply_context_market_split_v121.py \
+ && python -m py_compile /app/context_ledger_sidecar.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && grep -Fq 'KRX_NXT_STRICTLY_SEPARATE__NEVER_FORWARD_COMBINED_MARKET_TO_KIS' /app/context_ledger_sidecar.py \
+ && rm -f /tmp/apply_context_market_split_v121.py
