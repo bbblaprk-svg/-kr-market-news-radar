@@ -12065,3 +12065,391 @@ print('CONTEXT_LEDGER_V1_3_LIVE_BUILD_TEST_PASS LIVE_KIS=YES LS_CROSSCHECK=YES S
 CTX_LEDGER_V13_LIVE_SMOKE
 RUN PYTHONPATH=/app CONTEXT_LEDGER_ENABLED=false CONTEXT_LEDGER_DB_PATH=/tmp/context-v13-live-smoke.db python /tmp/context_v13_live_smoke.py \
  && rm -f /tmp/context_v13_live_smoke.py /tmp/context-v13-live-smoke.db /tmp/context-v13-live-smoke.db-wal /tmp/context-v13-live-smoke.db-shm
+
+# ===== LS PROGRAM TREND LEDGER V1.4 · t1632/t1636/t1637 =====
+# 기존 LS WS/가격/에너지/판정 로직은 변경하지 않고 독립 보조원장만 추가한다.
+COPY <<'LS_PROGRAM_TREND_V14_MODULE' /app/ls_program_trend_sidecar.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import json, logging, math, os, re, sqlite3, threading, time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+KST = timezone(timedelta(hours=9))
+LOG = logging.getLogger('ls_program_trend')
+
+def _bool(name, default=False):
+    return os.getenv(name, 'true' if default else 'false').strip().lower() in {'1','true','yes','y','on'}
+def _int(name, default):
+    try: return int(os.getenv(name, str(default)))
+    except Exception: return default
+def _num(v, default=None):
+    try:
+        if v in (None, '', ' '): return default
+        x = float(str(v).replace(',', ''))
+        return x if math.isfinite(x) else default
+    except Exception: return default
+def _now(): return datetime.now(KST)
+def _iso(): return _now().isoformat(timespec='seconds')
+def _code(v):
+    s = str(v or '').strip()
+    return s.zfill(6) if re.fullmatch(r'\d{1,6}', s) else ''
+def _hms(v):
+    s = re.sub(r'\D', '', str(v or ''))
+    if len(s) >= 6: s = s[-6:]
+    elif len(s) == 4: s += '00'
+    else: return None
+    try: return int(s[:2])*3600 + int(s[2:4])*60 + int(s[4:6])
+    except Exception: return None
+
+class LSProgramTrendLedger:
+    VERSION = 'LS_PROGRAM_TREND_V1_4'
+    def __init__(self):
+        self.enabled = _bool('LS_PROGRAM_LEDGER_ENABLED', True)
+        self.interval = max(60, _int('LS_PROGRAM_LEDGER_INTERVAL_SECONDS', 600))
+        self.stock_limit = max(1, min(60, _int('LS_PROGRAM_STOCK_LIMIT_PER_MARKET', 18)))
+        self.retention_runs = max(12, _int('LS_PROGRAM_RETENTION_RUNS', 144))
+        self.start_delay = max(0, _int('LS_PROGRAM_START_DELAY_SECONDS', 20))
+        self.db_path = Path(os.getenv('LS_PROGRAM_DB_PATH', '/data/context_ledger/ls_program_trend.db'))
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.ls_provider = None
+        self.candidate_provider = None
+        self.run_lock = threading.Lock()
+        self.last_error = None
+        self._init_db()
+
+    def bind(self, ls_provider=None, candidate_provider=None):
+        self.ls_provider = ls_provider
+        self.candidate_provider = candidate_provider
+        LOG.info('LS_PROGRAM_LEDGER_BOUND ls=%s candidates=%s', bool(ls_provider), bool(candidate_provider))
+
+    def _ls(self):
+        p = self.ls_provider() if callable(self.ls_provider) else self.ls_provider
+        if p is None: raise RuntimeError('LS_PROVIDER_UNBOUND')
+        return p
+
+    def _con(self):
+        c = sqlite3.connect(str(self.db_path), timeout=30, check_same_thread=False)
+        c.row_factory = sqlite3.Row
+        c.execute('PRAGMA journal_mode=WAL')
+        c.execute('PRAGMA synchronous=NORMAL')
+        return c
+
+    def _init_db(self):
+        with self._con() as c:
+            c.executescript('''
+            CREATE TABLE IF NOT EXISTS ls_program_runs(
+              run_id TEXT PRIMARY KEY, market TEXT NOT NULL, status TEXT NOT NULL,
+              started_at TEXT, completed_at TEXT, candidate_count INTEGER DEFAULT 0,
+              stock_success INTEGER DEFAULT 0, market_rows INTEGER DEFAULT 0,
+              ranking_rows INTEGER DEFAULT 0, error_json TEXT);
+            CREATE INDEX IF NOT EXISTS idx_lspr_runs ON ls_program_runs(market,status,completed_at DESC);
+            CREATE TABLE IF NOT EXISTS ls_program_market(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, market TEXT NOT NULL,
+              segment TEXT, unit TEXT, date TEXT, time TEXT,
+              total_net REAL,total_buy REAL,total_sell REAL,
+              arb_net REAL,arb_buy REAL,arb_sell REAL,
+              nonarb_net REAL,nonarb_buy REAL,nonarb_sell REAL, raw_json TEXT);
+            CREATE INDEX IF NOT EXISTS idx_lspr_market ON ls_program_market(market,run_id,time);
+            CREATE TABLE IF NOT EXISTS ls_program_ranking(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, market TEXT NOT NULL,
+              segment TEXT, rank_no INTEGER, code TEXT, name TEXT,
+              price REAL, change_pct REAL, net_qty REAL,buy_qty REAL,sell_qty REAL,
+              net_amt REAL,buy_amt REAL,sell_amt REAL, raw_json TEXT);
+            CREATE INDEX IF NOT EXISTS idx_lspr_rank ON ls_program_ranking(market,run_id,rank_no);
+            CREATE TABLE IF NOT EXISTS ls_program_stock(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, market TEXT NOT NULL,
+              code TEXT NOT NULL, name TEXT, date TEXT, time TEXT, price REAL, change_pct REAL,
+              volume REAL, net_qty REAL,buy_qty REAL,sell_qty REAL,
+              net_amt REAL,buy_amt REAL,sell_amt REAL, raw_json TEXT);
+            CREATE INDEX IF NOT EXISTS idx_lspr_stock ON ls_program_stock(market,code,run_id,time);
+            ''')
+            c.commit()
+
+    def _post(self, tr_cd, body):
+        return self._ls()._post_tr('/stock/program', tr_cd, body).json()
+
+    def _segments(self):
+        raw = os.getenv('LS_PROGRAM_MARKET_GUBUNS', '0:KOSPI,1:KOSDAQ')
+        out = []
+        for x in raw.split(','):
+            if ':' in x:
+                g,n = x.split(':',1)
+                if g.strip() and n.strip(): out.append((g.strip(), n.strip().upper()))
+        return out or [('0','KOSPI'),('1','KOSDAQ')]
+
+    def _summary(self, market):
+        try:
+            x = self.candidate_provider(market) if callable(self.candidate_provider) else {}
+            return x if isinstance(x, dict) else {}
+        except Exception as e:
+            LOG.warning('candidate provider failed market=%s err=%s', market, e)
+            return {}
+
+    def _extract_candidates(self, market, ranking_rows):
+        codes, seen, names = [], set(), {}
+        def add(c, n=''):
+            c = _code(c)
+            if c and c not in seen:
+                seen.add(c); codes.append(c); names[c] = str(n or '')
+        for z in ranking_rows:
+            add(z.get('shcode') or z.get('code') or z.get('ex_shcode'), z.get('hname') or z.get('name'))
+        s = self._summary(market)
+        for key in ('live_pool','entry_candidates','candidates','hotlist','top','lazy_history_candidates','close_bet_candidates','watch'):
+            v = s.get(key)
+            if isinstance(v, list):
+                for z in v:
+                    if isinstance(z, dict): add(z.get('symbol') or z.get('code') or z.get('shcode'), z.get('name'))
+                    else: add(z)
+        for c in os.getenv('LS_PROGRAM_PIN_CODES','').split(','): add(c)
+        return codes[:self.stock_limit], names
+
+    def _t1632(self, market, exchgubun):
+        rows, errors = [], []
+        now = _now()
+        for gubun, segment in self._segments():
+            for unit_code, unit in (('0','QTY'),('1','AMOUNT')):
+                body = {'t1632InBlock': {'gubun':gubun,'gubun1':unit_code,'gubun2':'0','gubun3':'0','date':now.strftime('%Y%m%d'),'time':now.strftime('%H%M%S'),'exchgubun':exchgubun}}
+                try:
+                    j = self._post('t1632', body)
+                    for z in j.get('t1632OutBlock1') or []:
+                        q = dict(z); q['_segment']=segment; q['_unit']=unit; rows.append(q)
+                except Exception as e:
+                    errors.append(f't1632:{segment}:{unit}:{type(e).__name__}:{e}')
+        return rows, errors
+
+    def _t1636(self, market, exchgubun):
+        rows, errors = [], []
+        for gubun, segment in self._segments():
+            body = {'t1636InBlock': {'gubun':gubun,'gubun1':'1','gubun2':'0','shcode':'','cts_idx':0,'exchgubun':exchgubun}}
+            try:
+                j = self._post('t1636', body)
+                for z in j.get('t1636OutBlock1') or []:
+                    q = dict(z); q['_segment']=segment; rows.append(q)
+            except Exception as e:
+                errors.append(f't1636:{segment}:{type(e).__name__}:{e}')
+        return rows, errors
+
+    def _t1637(self, exchgubun, code):
+        now = _now()
+        body = {'t1637InBlock': {'gubun1':'0','gubun2':'0','shcode':code,'date':now.strftime('%Y%m%d'),'time':now.strftime('%H%M%S'),'cts_idx':9999,'exchgubun':exchgubun}}
+        j = self._post('t1637', body)
+        return sorted([dict(z) for z in (j.get('t1637OutBlock1') or [])], key=lambda z: _hms(z.get('time')) or -1)
+
+    def _save_market(self, c, run_id, market, rows):
+        for z in rows:
+            c.execute('INSERT INTO ls_program_market(run_id,market,segment,unit,date,time,total_net,total_buy,total_sell,arb_net,arb_buy,arb_sell,nonarb_net,nonarb_buy,nonarb_sell,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+              (run_id,market,z.get('_segment'),z.get('_unit'),str(z.get('date') or ''),str(z.get('time') or ''),_num(z.get('tot3')),_num(z.get('tot1')),_num(z.get('tot2')),_num(z.get('cha3')),_num(z.get('cha1')),_num(z.get('cha2')),_num(z.get('bcha3')),_num(z.get('bcha1')),_num(z.get('bcha2')),json.dumps(z,ensure_ascii=False,separators=(',',':'))))
+
+    def _save_rank(self, c, run_id, market, rows):
+        for z in rows:
+            c.execute('INSERT INTO ls_program_ranking(run_id,market,segment,rank_no,code,name,price,change_pct,net_qty,buy_qty,sell_qty,net_amt,buy_amt,sell_amt,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+              (run_id,market,z.get('_segment'),int(_num(z.get('rank'),0) or 0),_code(z.get('shcode') or z.get('code') or z.get('ex_shcode')),str(z.get('hname') or z.get('name') or ''),_num(z.get('price')),_num(z.get('diff')),_num(z.get('svolume')),_num(z.get('stksvolume')),_num(z.get('offervolume')),_num(z.get('svalue')),_num(z.get('stksvalue')),_num(z.get('offervalue')),json.dumps(z,ensure_ascii=False,separators=(',',':'))))
+
+    def _save_stock(self, c, run_id, market, code, name, rows):
+        for z in rows:
+            c.execute('INSERT INTO ls_program_stock(run_id,market,code,name,date,time,price,change_pct,volume,net_qty,buy_qty,sell_qty,net_amt,buy_amt,sell_amt,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+              (run_id,market,code,str(name or z.get('hname') or ''),str(z.get('date') or ''),str(z.get('time') or ''),_num(z.get('price')),_num(z.get('diff')),_num(z.get('volume')),_num(z.get('svolume')),_num(z.get('stksvolume')),_num(z.get('offervolume')),_num(z.get('svalue')),_num(z.get('stksvalue')),_num(z.get('offervalue')),json.dumps(z,ensure_ascii=False,separators=(',',':'))))
+
+    def collect_market(self, market):
+        market = str(market or 'KRX').upper()
+        if market not in {'KRX','NXT'}: return {'status':'INVALID_MARKET','market':market}
+        if not self.run_lock.acquire(blocking=False): return {'status':'SKIPPED_BUSY','market':market}
+        exchgubun = 'N' if market == 'NXT' else 'K'
+        run_id = _now().strftime('%Y%m%d_%H%M%S') + f'_LSPROG_{market}'
+        started, errors = _iso(), []
+        try:
+            market_rows, e = self._t1632(market, exchgubun); errors += e
+            rank_rows, e = self._t1636(market, exchgubun); errors += e
+            codes, names = self._extract_candidates(market, rank_rows)
+            stock_data, success = [], 0
+            for code in codes:
+                try:
+                    rows = self._t1637(exchgubun, code)
+                    if rows: stock_data.append((code,names.get(code,''),rows)); success += 1
+                    else: errors.append(f't1637:{code}:EMPTY')
+                except Exception as e:
+                    errors.append(f't1637:{code}:{type(e).__name__}:{e}')
+            status = 'READY' if (market_rows or success) else ('PARTIAL' if rank_rows else 'FAILED')
+            with self._con() as c:
+                c.execute('INSERT OR REPLACE INTO ls_program_runs VALUES(?,?,?,?,?,?,?,?,?,?)', (run_id,market,status,started,_iso(),len(codes),success,len(market_rows),len(rank_rows),json.dumps(errors,ensure_ascii=False)))
+                self._save_market(c,run_id,market,market_rows); self._save_rank(c,run_id,market,rank_rows)
+                for code,name,rows in stock_data: self._save_stock(c,run_id,market,code,name,rows)
+                old = c.execute('SELECT run_id FROM ls_program_runs WHERE market=? ORDER BY completed_at DESC LIMIT -1 OFFSET ?', (market,self.retention_runs)).fetchall()
+                for z in old:
+                    rid=z[0]
+                    for t in ('ls_program_market','ls_program_ranking','ls_program_stock'): c.execute(f'DELETE FROM {t} WHERE run_id=?',(rid,))
+                    c.execute('DELETE FROM ls_program_runs WHERE run_id=?',(rid,))
+                c.commit()
+            self.last_error = None
+            LOG.info('LS_PROGRAM_LEDGER_DONE market=%s run=%s status=%s candidates=%s stock_ok=%s market_rows=%s rank_rows=%s errors=%s', market,run_id,status,len(codes),success,len(market_rows),len(rank_rows),len(errors))
+            return {'status':status,'market':market,'run_id':run_id,'candidates':len(codes),'stock_success':success,'market_rows':len(market_rows),'ranking_rows':len(rank_rows),'errors':errors[:20]}
+        except Exception as e:
+            self.last_error = f'{type(e).__name__}: {e}'
+            LOG.exception('LS_PROGRAM_LEDGER_FAILED market=%s', market)
+            return {'status':'FAILED','market':market,'run_id':run_id,'error':self.last_error}
+        finally:
+            self.run_lock.release()
+
+    def _loop(self):
+        time.sleep(self.start_delay)
+        while True:
+            started = time.monotonic()
+            for market in ('KRX','NXT'):
+                try: self.collect_market(market)
+                except Exception: LOG.exception('LS_PROGRAM loop market=%s', market)
+            time.sleep(max(60, self.interval - (time.monotonic()-started)))
+
+    def start(self):
+        if self.enabled:
+            threading.Thread(target=self._loop, daemon=True, name='ls-program-ledger').start()
+            LOG.info('LS_PROGRAM_LEDGER_STARTED interval=%ss stock_limit=%s', self.interval, self.stock_limit)
+
+    def latest_run(self, market):
+        with self._con() as c:
+            r = c.execute('SELECT * FROM ls_program_runs WHERE market=? ORDER BY completed_at DESC LIMIT 1',(market,)).fetchone()
+        return dict(r) if r else None
+
+    def _stock_rows(self, market, code, limit=300):
+        with self._con() as c:
+            rid = c.execute('SELECT run_id FROM ls_program_stock WHERE market=? AND code=? ORDER BY id DESC LIMIT 1',(market,code)).fetchone()
+            if not rid: return []
+            rows = c.execute('SELECT * FROM ls_program_stock WHERE run_id=? AND market=? AND code=? ORDER BY id ASC LIMIT ?',(rid[0],market,code,max(1,min(int(limit),1000)))).fetchall()
+        return [dict(r) for r in rows]
+
+    def _trend(self, rows):
+        if not rows: return {'status':'NO_DATA'}
+        rows = sorted(rows, key=lambda r:_hms(r.get('time')) or -1)
+        last, lt = rows[-1], _hms(rows[-1].get('time'))
+        out = {'status':'READY','asof_time':last.get('time'),'price':last.get('price'),'net_qty':last.get('net_qty'),'net_amt':last.get('net_amt')}
+        for mins in (10,20,30):
+            prev = None
+            if lt is not None:
+                target = lt - mins*60
+                cand = [r for r in rows if _hms(r.get('time')) is not None and _hms(r.get('time')) <= target]
+                prev = cand[-1] if cand else None
+            dq = (last.get('net_qty')-prev.get('net_qty')) if prev and last.get('net_qty') is not None and prev.get('net_qty') is not None else None
+            da = (last.get('net_amt')-prev.get('net_amt')) if prev and last.get('net_amt') is not None and prev.get('net_amt') is not None else None
+            out[f'delta_{mins}m_qty'] = dq; out[f'delta_{mins}m_amt'] = da
+            out[f'velocity_{mins}m_qty_per_min'] = dq/mins if dq is not None else None
+            out[f'velocity_{mins}m_amt_per_min'] = da/mins if da is not None else None
+        d10, d20 = out.get('delta_10m_qty'), out.get('delta_20m_qty')
+        if d10 is None: state='WARMUP'
+        elif d10 > 0 and (d20 or 0) > 0: state='PROGRAM_BUY_ACCEL'
+        elif d10 > 0: state='PROGRAM_BUY_TURN'
+        elif d10 < 0 and (d20 or 0) < 0: state='PROGRAM_SELL_ACCEL'
+        elif d10 < 0: state='PROGRAM_SELL_TURN'
+        else: state='PROGRAM_FLAT'
+        out['trend_state'] = state
+        return out
+
+    def stock_view(self, market, code, limit=300):
+        market, code = str(market or 'KRX').upper(), _code(code)
+        rows = self._stock_rows(market, code, limit)
+        return {'version':self.VERSION,'market':market,'code':code,'trend':self._trend(rows),'rows':rows}
+
+    def market_view(self, market, segment=None, unit='AMOUNT', limit=300):
+        market = str(market or 'KRX').upper(); run = self.latest_run(market)
+        if not run: return {'version':self.VERSION,'market':market,'status':'NO_DATA','rows':[]}
+        q='SELECT * FROM ls_program_market WHERE run_id=? AND market=?'; args=[run['run_id'],market]
+        if segment: q+=' AND segment=?'; args.append(str(segment).upper())
+        if unit: q+=' AND unit=?'; args.append(str(unit).upper())
+        q+=' ORDER BY id ASC LIMIT ?'; args.append(max(1,min(int(limit),1000)))
+        with self._con() as c: rows=[dict(r) for r in c.execute(q,args).fetchall()]
+        return {'version':self.VERSION,'market':market,'run':run,'rows':rows}
+
+    def top_view(self, market, limit=30):
+        market = str(market or 'KRX').upper(); run = self.latest_run(market)
+        if not run: return {'version':self.VERSION,'market':market,'status':'NO_DATA','buy':[],'sell':[]}
+        with self._con() as c:
+            rows=[dict(r) for r in c.execute('SELECT * FROM ls_program_stock WHERE run_id=? AND market=? ORDER BY id ASC',(run['run_id'],market)).fetchall()]
+        by={}
+        for r in rows: by.setdefault(r['code'],[]).append(r)
+        items=[]
+        for code, rr in by.items():
+            tr=self._trend(rr); items.append({'code':code,'name':rr[-1].get('name'),**tr})
+        def score(x): return x.get('delta_10m_amt') if x.get('delta_10m_amt') is not None else (x.get('net_amt') or 0)
+        n=max(1,min(int(limit),100))
+        return {'version':self.VERSION,'market':market,'run':run,'buy':sorted(items,key=score,reverse=True)[:n],'sell':sorted(items,key=score)[:n]}
+
+    def health(self):
+        return {'ok':True,'version':self.VERSION,'enabled':self.enabled,'interval_seconds':self.interval,'stock_limit_per_market':self.stock_limit,'db_path':str(self.db_path),'latest':{'KRX':self.latest_run('KRX'),'NXT':self.latest_run('NXT')},'last_error':self.last_error,'policy':'LS_INDEPENDENT_AUXILIARY__NEVER_OVERWRITE_KIS_AUTHORITY'}
+
+    def handle_get(self, raw_path):
+        u=urlparse(raw_path); path=u.path; qs=parse_qs(u.query); market=(qs.get('market') or ['KRX'])[0].upper()
+        if path=='/api/context/ls-program/health': return 200,self.health()
+        if path=='/api/context/ls-program/latest': return 200,{'health':self.health(),'top':self.top_view(market,int((qs.get('limit') or ['30'])[0]))}
+        if path=='/api/context/ls-program/top': return 200,self.top_view(market,int((qs.get('limit') or ['30'])[0]))
+        if path=='/api/context/ls-program/stock': return 200,self.stock_view(market,(qs.get('code') or [''])[0],int((qs.get('limit') or ['300'])[0]))
+        if path=='/api/context/ls-program/market': return 200,self.market_view(market,(qs.get('segment') or [None])[0],(qs.get('unit') or ['AMOUNT'])[0],int((qs.get('limit') or ['300'])[0]))
+        return None
+
+LS_PROGRAM_LEDGER = LSProgramTrendLedger()
+LS_PROGRAM_TREND_V14_MODULE
+
+COPY <<'LS_PROGRAM_TREND_V14_APPLY' /tmp/apply_ls_program_trend_v14.py
+from pathlib import Path
+p=Path('/app/오백종목_통합엔진_웹서비스_V1_0.py')
+s=p.read_text(encoding='utf-8')
+if 'LS_PROGRAM_TREND_INTEGRATION_V1_4' not in s:
+    anchor='''try:\n    from context_ledger_sidecar import CONTEXT_LEDGER\nexcept Exception as _ctx_import_error:\n    CONTEXT_LEDGER = None\n    print(f"CONTEXT_LEDGER_IMPORT_ERROR {type(_ctx_import_error).__name__}: {_ctx_import_error}", flush=True)\n'''
+    insert=anchor+'''# LS_PROGRAM_TREND_INTEGRATION_V1_4\ntry:\n    from ls_program_trend_sidecar import LS_PROGRAM_LEDGER\nexcept Exception as _lsprog_import_error:\n    LS_PROGRAM_LEDGER = None\n    print(f"LS_PROGRAM_LEDGER_IMPORT_ERROR {type(_lsprog_import_error).__name__}: {_lsprog_import_error}", flush=True)\n'''
+    if anchor not in s: raise SystemExit('LS_PROGRAM_IMPORT_ANCHOR_NOT_FOUND')
+    s=s.replace(anchor,insert,1)
+route='''        if CONTEXT_LEDGER is not None and path.startswith("/api/context/"):\n'''
+if 'path.startswith("/api/context/ls-program/")' not in s:
+    add='''        if LS_PROGRAM_LEDGER is not None and path.startswith("/api/context/ls-program/"):\n            try:\n                _lp = LS_PROGRAM_LEDGER.handle_get(self.path)\n                if _lp is not None:\n                    return self._json(_lp[0], _lp[1])\n            except Exception as _lp_err:\n                return self._json(500, {"error": f"LS_PROGRAM_LEDGER: {type(_lp_err).__name__}: {_lp_err}"})\n'''
+    if route not in s: raise SystemExit('LS_PROGRAM_ROUTE_ANCHOR_NOT_FOUND')
+    s=s.replace(route,add+route,1)
+start='''    if CONTEXT_LEDGER is not None:\n        try:\n            CONTEXT_LEDGER.set_ls_provider(state_copy, load_latest, load_latest_for_venue)\n            CONTEXT_LEDGER.start()\n        except Exception as _ctx_start_error:\n            print(f"CONTEXT_LEDGER_START_ERROR {type(_ctx_start_error).__name__}: {_ctx_start_error}", flush=True)\n'''
+if 'LS_PROGRAM_LEDGER.bind(lambda: get_engine().ls, load_latest_for_venue)' not in s:
+    add=start+'''    if LS_PROGRAM_LEDGER is not None:\n        try:\n            LS_PROGRAM_LEDGER.bind(lambda: get_engine().ls, load_latest_for_venue)\n            LS_PROGRAM_LEDGER.start()\n        except Exception as _lp_start_error:\n            print(f"LS_PROGRAM_LEDGER_START_ERROR {type(_lp_start_error).__name__}: {_lp_start_error}", flush=True)\n'''
+    if start not in s: raise SystemExit('LS_PROGRAM_START_ANCHOR_NOT_FOUND')
+    s=s.replace(start,add,1)
+p.write_text(s,encoding='utf-8')
+print('LS_PROGRAM_TREND_V1_4_APPLIED')
+LS_PROGRAM_TREND_V14_APPLY
+
+RUN python /tmp/apply_ls_program_trend_v14.py \
+ && python -m py_compile /app/ls_program_trend_sidecar.py /app/context_ledger_sidecar.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && grep -Fq 'LS_PROGRAM_TREND_INTEGRATION_V1_4' /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && grep -Fq '/api/context/ls-program/stock' /app/ls_program_trend_sidecar.py \
+ && rm -f /tmp/apply_ls_program_trend_v14.py
+
+COPY <<'LS_PROGRAM_TREND_V14_SMOKE' /tmp/ls_program_trend_v14_smoke.py
+import os, sys
+os.environ['LS_PROGRAM_DB_PATH']='/tmp/ls-program-v14-smoke.db'
+os.environ['LS_PROGRAM_LEDGER_ENABLED']='false'
+os.environ['LS_PROGRAM_STOCK_LIMIT_PER_MARKET']='2'
+sys.path.insert(0,'/tmp')
+from ls_program_trend_sidecar import LSProgramTrendLedger
+class Resp:
+    def __init__(self,j): self._j=j; self.content=b'x'
+    def json(self): return self._j
+class FakeLS:
+    def _post_tr(self,path,tr,body):
+        if tr=='t1632':
+            return Resp({'t1632OutBlock1':[{'time':'090000','tot3':'100','tot1':'300','tot2':'200','cha3':'20','cha1':'50','cha2':'30','bcha3':'80','bcha1':'250','bcha2':'170'}]})
+        if tr=='t1636':
+            return Resp({'t1636OutBlock1':[{'rank':'1','hname':'테스트','shcode':'005930','price':'100','diff':'1.0','svolume':'1000','svalue':'100000'}]})
+        if tr=='t1637':
+            code=body['t1637InBlock']['shcode']
+            return Resp({'t1637OutBlock1':[
+              {'date':'20261105','time':'090000','price':'100','diff':'0','volume':'1','svolume':'100','stksvolume':'200','offervolume':'100','svalue':'1000','stksvalue':'2000','offervalue':'1000','shcode':code},
+              {'date':'20261105','time':'091000','price':'101','diff':'1','volume':'2','svolume':'180','stksvolume':'300','offervolume':'120','svalue':'1800','stksvalue':'3000','offervalue':'1200','shcode':code},
+              {'date':'20261105','time':'092000','price':'102','diff':'2','volume':'3','svolume':'300','stksvolume':'450','offervolume':'150','svalue':'3000','stksvalue':'4500','offervalue':'1500','shcode':code}]})
+        raise RuntimeError(tr)
+c=LSProgramTrendLedger(); c.bind(FakeLS(),lambda market:{'live_pool':[{'symbol':'005930','name':'삼성전자'}]})
+r=c.collect_market('KRX'); assert r['status']=='READY',r
+v=c.stock_view('KRX','005930',200)
+assert v['trend']['delta_10m_qty']==120.0,v
+assert v['trend']['delta_20m_qty']==200.0,v
+assert v['trend']['trend_state']=='PROGRAM_BUY_ACCEL',v
+m=c.market_view('KRX','KOSPI','AMOUNT',20); assert m['rows'],m
+t=c.top_view('KRX',10); assert t['buy'] and t['buy'][0]['code']=='005930',t
+print('LS_PROGRAM_TREND_V1_4_BUILD_TEST_PASS T1632=YES T1636=YES T1637=YES DELTA10_20_30=YES KRX_NXT_SPLIT=YES')
+LS_PROGRAM_TREND_V14_SMOKE
+
+RUN PYTHONPATH=/app python /tmp/ls_program_trend_v14_smoke.py \
+ && rm -f /tmp/ls_program_trend_v14_smoke.py /tmp/ls-program-v14-smoke.db /tmp/ls-program-v14-smoke.db-wal /tmp/ls-program-v14-smoke.db-shm
