@@ -11933,3 +11933,135 @@ RUN python /tmp/apply_context_market_split_v121.py \
  && python -m py_compile /app/context_ledger_sidecar.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
  && grep -Fq 'KRX_NXT_STRICTLY_SEPARATE__NEVER_FORWARD_COMBINED_MARKET_TO_KIS' /app/context_ledger_sidecar.py \
  && rm -f /tmp/apply_context_market_split_v121.py
+
+
+# ===== LS 보조원장 V1.3 · KIS LIVE LEDGER READ-ONLY BRIDGE =====
+# Existing LS WS/REST/ALPHA500 judgement logic remains untouched.
+# Only ContextLedger read-only cross-check is upgraded to prefer KIS LIVE rows.
+COPY <<'CTX_LEDGER_V13_LIVE_APPLY' /tmp/apply_context_live_v13.py
+from pathlib import Path
+p=Path('/app/context_ledger_sidecar.py')
+s=p.read_text(encoding='utf-8')
+
+anchor='''    def _parse_dt(self,value,assume_kst=False):
+'''
+insert='''    def _market_live_summary(self,market):
+        headers=self._headers(); token=os.getenv("MARKET_LEDGER_TOKEN","").strip()
+        if token: headers["x-app-token"]=token
+        try:
+            r=requests.get(self.market_ledger_base+"/api/ledger/live/summary",params={"market":market},headers=headers,timeout=min(12,self.timeout))
+            if r.status_code!=200: return None,f"HTTP {r.status_code}"
+            p=r.json() if r.content else {}; return p,None
+        except Exception as e:return None,f"{type(e).__name__}: {e}"
+    def _market_live_rows(self,market,limit=5000):
+        headers=self._headers(); token=os.getenv("MARKET_LEDGER_TOKEN","").strip()
+        if token: headers["x-app-token"]=token
+        try:
+            r=requests.get(self.market_ledger_base+"/api/ledger/live/rows",params={"market":market,"limit":max(1,min(int(limit),5000))},headers=headers,timeout=min(12,self.timeout))
+            if r.status_code!=200: return [],None,f"HTTP {r.status_code}"
+            p=r.json() if r.content else {}; return (p.get("rows") or []),(p.get("summary") or {}),None
+        except Exception as e:return [],None,f"{type(e).__name__}: {e}"
+'''
+if '_market_live_rows(self,market,limit=5000)' not in s:
+    if anchor not in s: raise SystemExit('LIVE_METHOD_ANCHOR_NOT_FOUND')
+    s=s.replace(anchor,insert+anchor,1)
+
+old='''        ls=self._ls_quotes(req,limit); kis_rows,kis_manifest,kerr=self._market_rows(req,5000)
+        kis={str(r.get("code") or "").zfill(6):r for r in kis_rows if isinstance(r,dict)}
+'''
+new='''        ls=self._ls_quotes(req,limit)
+        live_rows,live_meta,live_err=self._market_live_rows(req,5000)
+        if live_rows:
+            kis_rows=live_rows; kis_manifest={"round_id":(live_meta or {}).get("latest_ready_round_id"),"live":True,"live_summary":live_meta}; kerr=None; kis_source="LIVE_LEDGER"
+        else:
+            kis_rows,kis_manifest,kerr=self._market_rows(req,5000); kis_source="IMMUTABLE_SNAPSHOT"
+            if live_err and not kerr:kerr=live_err
+        kis={str(r.get("code") or "").zfill(6):r for r in kis_rows if isinstance(r,dict)}
+'''
+if 'kis_source="LIVE_LEDGER"' not in s:
+    if old not in s: raise SystemExit('CROSSCHECK_SOURCE_ANCHOR_NOT_FOUND')
+    s=s.replace(old,new,1)
+
+s=s.replace('''details=[]; counts={"MATCH":0,"NEAR":0,"PRICE_DIVERGENCE":0,"TIME_SKEW":0,"TIME_UNKNOWN":0,"KIS_TIME_UNVERIFIED":0,"NO_KIS":0}''',
+'''details=[]; counts={"MATCH":0,"NEAR":0,"PRICE_DIVERGENCE":0,"TIME_SKEW":0,"TIME_UNKNOWN":0,"KIS_TIME_UNVERIFIED":0,"KIS_NOT_LIVE":0,"NO_KIS":0}''',1)
+oldstate='''            q=str(k.get("source_timestamp_quality") or "LEGACY_UNKNOWN").upper(); kd=self._parse_dt(k.get("source_timestamp"),False)
+            skew=abs((ls_dt-kd).total_seconds()) if (ls_dt and kd) else None
+            if q=="REQUEST_TIME_ONLY": state="KIS_TIME_UNVERIFIED"
+            elif skew is None: state="TIME_UNKNOWN"
+'''
+newstate='''            q=str(k.get("source_timestamp_quality") or "LEGACY_UNKNOWN").upper(); kd=self._parse_dt(k.get("source_timestamp"),False)
+            live_quality=str(k.get("quality") or "").upper()
+            skew=abs((ls_dt-kd).total_seconds()) if (ls_dt and kd) else None
+            if live_quality in {"SNAPSHOT_BASE","EXPIRED"}: state="KIS_NOT_LIVE"
+            elif q=="REQUEST_TIME_ONLY": state="KIS_TIME_UNVERIFIED"
+            elif skew is None: state="TIME_UNKNOWN"
+'''
+if 'live_quality in {"SNAPSHOT_BASE","EXPIRED"}' not in s:
+    if oldstate not in s: raise SystemExit('CROSSCHECK_STATE_ANCHOR_NOT_FOUND')
+    s=s.replace(oldstate,newstate,1)
+
+s=s.replace('''"time_skew_seconds":round(skew,1) if skew is not None else None,"kis_timestamp_quality":q,"state":state})''',
+'''"time_skew_seconds":round(skew,1) if skew is not None else None,"kis_timestamp_quality":q,"kis_live_quality":live_quality,"state":state})''',1)
+
+oldout='''        out={"market":req,"status":"OK" if not kerr else "DEGRADED","kis_error":kerr,"kis_round_id":(kis_manifest or {}).get("round_id"),
+             "ls_timestamp_kst":ls.get("timestamp_kst"),"ls_quotes":len(ls.get("rows") or []),"overlap":len(details),"comparable":comparable,"counts":counts,
+'''
+newout='''        out={"market":req,"status":"OK" if not kerr else "DEGRADED","kis_error":kerr,"kis_round_id":(kis_manifest or {}).get("round_id"),"kis_source":kis_source,"kis_live_summary":(kis_manifest or {}).get("live_summary"),
+             "ls_timestamp_kst":ls.get("timestamp_kst"),"ls_quotes":len(ls.get("rows") or []),"overlap":len(details),"comparable":comparable,"counts":counts,
+'''
+if '"kis_source":kis_source' not in s:
+    if oldout not in s: raise SystemExit('CROSSCHECK_OUT_ANCHOR_NOT_FOUND')
+    s=s.replace(oldout,newout,1)
+
+wg='''        m_manifest,m_error=self._market_manifest(market)
+        market_ready=bool(isinstance(m_manifest,dict) and str(m_manifest.get("status") or "").upper()=="READY")
+'''
+wgnew='''        m_manifest,m_error=self._market_manifest(market)
+        market_live,market_live_error=self._market_live_summary(market)
+        live_available=bool(isinstance(market_live,dict) and int(market_live.get("total_symbols") or 0)>0)
+        market_ready=bool(isinstance(m_manifest,dict) and str(m_manifest.get("status") or "").upper()=="READY")
+'''
+if 'market_live_error=self._market_live_summary' not in s:
+    if wg not in s: raise SystemExit('WORKGATE_LIVE_ANCHOR_NOT_FOUND')
+    s=s.replace(wg,wgnew,1)
+ret='''            "market_ready":market_ready,"market_manifest":m_manifest,"market_error":m_error,
+            "ls":ls,"cross_validation":cross,"context":ctx,"missing_axes":missing,
+'''
+retnew='''            "market_ready":market_ready,"market_manifest":m_manifest,"market_error":m_error,
+            "market_live_available":live_available,"market_live":market_live,"market_live_error":market_live_error,
+            "ls":ls,"cross_validation":cross,"context":ctx,"missing_axes":missing,
+'''
+if '"market_live_available":live_available' not in s:
+    if ret not in s: raise SystemExit('WORKGATE_RETURN_ANCHOR_NOT_FOUND')
+    s=s.replace(ret,retnew,1)
+s=s.replace('''"read_order":["KIS_MARKET_LEDGER","LS_RADAR","BROKER","PORTAL","MEDIA"]''',
+'''"read_order":["KIS_LIVE_LEDGER","KIS_IMMUTABLE_SNAPSHOT","LS_RADAR","BROKER","PORTAL","MEDIA"]''',1)
+s=s.replace('''"service":"KR_MARKET_CONTEXT_LEDGER_V1_2"''','''"service":"KR_MARKET_CONTEXT_LEDGER_V1_3_LIVE_BRIDGE"''',1)
+p.write_text(s,encoding='utf-8')
+print('CONTEXT_LEDGER_V1_3_LIVE_PATCH_APPLIED')
+CTX_LEDGER_V13_LIVE_APPLY
+RUN python /tmp/apply_context_live_v13.py \
+ && python -m py_compile /app/context_ledger_sidecar.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && grep -Fq 'KIS_LIVE_LEDGER' /app/context_ledger_sidecar.py \
+ && grep -Fq 'market_live_available' /app/context_ledger_sidecar.py \
+ && rm -f /tmp/apply_context_live_v13.py
+
+COPY <<'CTX_LEDGER_V13_LIVE_SMOKE' /tmp/context_v13_live_smoke.py
+import os
+os.environ['CONTEXT_LEDGER_DB_PATH']='/tmp/context-v13-live-smoke.db'
+from context_ledger_sidecar import ContextLedger
+c=ContextLedger()
+c._market_manifest=lambda market: ({'status':'READY','round_id':'R1'},None)
+c._market_live_summary=lambda market: ({'status':'LIVE_AVAILABLE','total_symbols':2,'fresh_symbols':1,'snapshot_base_symbols':1,'latest_ready_round_id':'R1'},None)
+c._market_live_rows=lambda market,limit=5000: ([{'code':'005930','price':100.1,'source_timestamp':'2026-11-05T00:00:00+00:00','source_timestamp_quality':'EXCHANGE_TIMESTAMP','quality':'LIVE'}],{'latest_ready_round_id':'R1'},None)
+result={'venue':'KRX','timestamp_kst':'2026-11-05T09:00:00+09:00','live_pool':[{'symbol':'005930','name':'삼성전자','current_price':100.0,'change_pct':1.0}]}
+c.set_ls_provider(lambda:{'ls_configured':True,'venue':'KRX','ws_status':'RECEIVING'},lambda:result,lambda v:result if v=='KRX' else None)
+x=c.cross_check('KRX',100)
+assert x['kis_source']=='LIVE_LEDGER',x
+assert x['counts']['MATCH']==1,x
+g=c.work_gate('KRX')
+assert g['market_live_available'] is True,g
+print('CONTEXT_LEDGER_V1_3_LIVE_BUILD_TEST_PASS LIVE_KIS=YES LS_CROSSCHECK=YES SNAPSHOT_FALLBACK=YES')
+CTX_LEDGER_V13_LIVE_SMOKE
+RUN PYTHONPATH=/app CONTEXT_LEDGER_ENABLED=false CONTEXT_LEDGER_DB_PATH=/tmp/context-v13-live-smoke.db python /tmp/context_v13_live_smoke.py \
+ && rm -f /tmp/context_v13_live_smoke.py /tmp/context-v13-live-smoke.db /tmp/context-v13-live-smoke.db-wal /tmp/context-v13-live-smoke.db-shm
