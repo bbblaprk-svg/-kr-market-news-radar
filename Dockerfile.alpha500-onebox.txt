@@ -12469,6 +12469,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import requests
+
 LOG = logging.getLogger("ls_derivatives_ledger")
 KST = timezone(timedelta(hours=9))
 
@@ -12518,24 +12520,74 @@ def _month_add(yyyymm: str, n: int) -> str:
     return f"{y:04d}{m:02d}"
 
 
+def _sign(v) -> int:
+    x = _float(v, 0.0) or 0.0
+    return 1 if x > 0 else (-1 if x < 0 else 0)
+
+
 class LSDerivativesLedger:
-    VERSION = "LS_DERIVATIVES_LEDGER_V1_0"
+    """LS derivatives sidecar V1.1.
+
+    Design goals:
+    - Reuse the existing shared AdaptiveLSProvider. Never create a second OAuth token.
+    - FAST path: t2111/t2101 only, normally every 75s.
+    - SLOW path: contract/options/OI trend refresh every 240s.
+    - KIS market-flow watcher: 30s lightweight poll. Meaningful KIS flow turns request an
+      immediate FAST check, protected by a cooldown so LS rate limits are not amplified.
+    - Existing t1632/t1636/t1637 LS program ledgers are not touched.
+    """
+
+    VERSION = "LS_DERIVATIVES_LEDGER_V1_1_FAST_SLOW_KIS_TRIGGER"
+    MASTER_VERSION = "MARKET_RESPONSE_MASTER_SNAPSHOT_V1"
     PATH = "/futureoption/market-data"
 
     def __init__(self):
         self.enabled = _bool("LS_DERIVATIVES_LEDGER_ENABLED", True)
-        self.interval = max(180, _int("LS_DERIVATIVES_INTERVAL_SECONDS", 180))
+        self.fast_interval = max(60, min(180, _int("LS_DERIVATIVES_FAST_INTERVAL_SECONDS", 75)))
+        self.slow_interval = max(180, min(600, _int("LS_DERIVATIVES_SLOW_INTERVAL_SECONDS", 240)))
+        # compatibility for older health readers
+        self.interval = self.fast_interval
         self.start_delay = max(3, _int("LS_DERIVATIVES_START_DELAY_SECONDS", 25))
+        self.kis_watch_enabled = _bool("LS_DERIVATIVES_KIS_WATCH_ENABLED", True)
+        self.kis_poll_interval = max(20, min(120, _int("LS_DERIVATIVES_KIS_POLL_SECONDS", 30)))
+        self.trigger_cooldown = max(60, min(300, _int("LS_DERIVATIVES_TRIGGER_COOLDOWN_SECONDS", 90)))
+        self.kis_url = os.getenv(
+            "KIS_AUTHORITY_URL", "https://quant-signal-v3-7-51-clean2.onrender.com"
+        ).rstrip("/")
+        self.kis_flow_path = os.getenv("KIS_FLOW_LATEST_PATH", "/api/ledger/flow/latest")
+        self.kis_top_path = os.getenv("KIS_TOP_PATH", "/work-ledger/top?market=KRX&limit=10")
+        self.http_timeout = max(2, min(20, _int("LS_DERIVATIVES_HTTP_TIMEOUT_SECONDS", 8)))
         self.db_path = Path(os.getenv("LS_DERIVATIVES_DB_PATH", "/data/context_ledger/ls_derivatives.db"))
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
         self._ls_provider = None
         self._session_provider = None
         self._lock = threading.RLock()
         self._running = False
+        self._trigger_lock = threading.RLock()
+        self._pending_trigger_reasons: list[str] = []
+        self._cached_code = None
+        self._cached_name = None
+        self._cached_board_month = None
+        self._http = requests.Session()
+
         self.last_error = None
         self.last_collect_at = None
+        self.last_fast_at = None
+        self.last_slow_at = None
+        self.last_trigger_at = None
+        self.last_trigger_reason = None
         self.last_raw = {}
+
+        self.kis_last_poll_at = None
+        self.kis_last_error = None
+        self.kis_last_flow = None
+        self.kis_last_top = None
+        self.kis_last_change_at = None
+        self.kis_last_change_reasons: list[str] = []
+
         self._init_db()
+        self._restore_cached_contract()
 
     def _con(self):
         c = sqlite3.connect(self.db_path, timeout=30)
@@ -12572,10 +12624,30 @@ class LSDerivativesLedger:
             );
             CREATE INDEX IF NOT EXISTS idx_deriv_samples_time ON derivative_samples(sampled_at DESC);
             """)
+            cols = {str(x[1]) for x in c.execute("PRAGMA table_info(derivative_samples)").fetchall()}
+            for name, ddl in (
+                ("sample_kind", "TEXT"),
+                ("reason", "TEXT"),
+                ("options_sampled_at", "TEXT"),
+            ):
+                if name not in cols:
+                    c.execute(f"ALTER TABLE derivative_samples ADD COLUMN {name} {ddl}")
             c.commit()
 
+    def _restore_cached_contract(self):
+        try:
+            with self._con() as c:
+                r = c.execute(
+                    "SELECT contract_code,contract_name FROM derivative_samples "
+                    "WHERE contract_code IS NOT NULL AND contract_code<>'' ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            if r:
+                self._cached_code = _text(r["contract_code"])
+                self._cached_name = _text(r["contract_name"]) or "KOSPI200_NEAR_FUTURE"
+        except Exception:
+            pass
+
     def bind(self, ls_provider, session_provider=None):
-        # IMPORTANT: receive the existing shared AdaptiveLSProvider. No OAuth is created here.
         self._ls_provider = ls_provider() if callable(ls_provider) else ls_provider
         self._session_provider = session_provider
         LOG.info("LS_DERIVATIVES_BOUND shared_provider=%s", bool(self._ls_provider))
@@ -12594,7 +12666,6 @@ class LSDerivativesLedger:
         return j
 
     def _is_collection_window(self) -> bool:
-        # Prefer existing service session logic when available.
         try:
             if self._session_provider is not None:
                 s = self._session_provider() if callable(self._session_provider) else self._session_provider
@@ -12631,16 +12702,13 @@ class LSDerivativesLedger:
 
     def _master_near_future(self) -> tuple[str | None, str | None, dict | None, list[str]]:
         errors = []
-        # Try documented master TR. The exact gubun semantics can vary by product catalog,
-        # so try the common values without inventing a positive result.
         for g in ("1", "0", "2"):
             try:
                 j = self._post("t9943", {"t9943InBlock": {"gubun": g}})
                 rows = j.get("t9943OutBlock") or []
                 candidates = []
                 for z in rows:
-                    name = _text(z.get("hname"))
-                    code = _text(z.get("shcode"))
+                    name = _text(z.get("hname")); code = _text(z.get("shcode"))
                     if not code:
                         continue
                     score = 0
@@ -12673,7 +12741,13 @@ class LSDerivativesLedger:
                 continue
             atm_idx = next((i for i, x in enumerate(arr) if _text(x.get("atmgubun")) not in {"", "0"}), None)
             if atm_idx is None:
-                atm_idx = min(range(len(arr)), key=lambda i: abs(_float(arr[i].get("jisuconv"), _float(arr[i].get("actprice"), 0.0)) - _float(arr[i].get("actprice"), 0.0)))
+                atm_idx = min(
+                    range(len(arr)),
+                    key=lambda i: abs(
+                        _float(arr[i].get("jisuconv"), _float(arr[i].get("actprice"), 0.0))
+                        - _float(arr[i].get("actprice"), 0.0)
+                    ),
+                )
             lo, hi = max(0, atm_idx - n_each_side), min(len(arr), atm_idx + n_each_side + 1)
             for x in arr[lo:hi]:
                 rows.append({
@@ -12690,164 +12764,215 @@ class LSDerivativesLedger:
                 })
         return rows
 
-    def _prev(self):
+    def _prev(self, code: str | None = None):
         with self._con() as c:
-            r = c.execute("SELECT * FROM derivative_samples WHERE quality IN ('READY','PARTIAL') ORDER BY id DESC LIMIT 1").fetchone()
+            if code:
+                r = c.execute(
+                    "SELECT * FROM derivative_samples WHERE quality IN ('READY','PARTIAL') "
+                    "AND contract_code=? ORDER BY id DESC LIMIT 1", (code,)
+                ).fetchone()
+            else:
+                r = c.execute(
+                    "SELECT * FROM derivative_samples WHERE quality IN ('READY','PARTIAL') ORDER BY id DESC LIMIT 1"
+                ).fetchone()
             return dict(r) if r else None
+
+    def _latest_options(self):
+        with self._con() as c:
+            r = c.execute(
+                "SELECT sampled_at,options_sampled_at,options_status,cimpv,pimpv,atm_json FROM derivative_samples "
+                "WHERE options_status IN ('READY','PARTIAL','CACHED_SLOW') AND atm_json IS NOT NULL "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return dict(r) if r else None
 
     @staticmethod
     def _structure(price_delta, oi_delta):
         if price_delta is None or oi_delta is None:
             return "WARMUP"
-        if price_delta > 0 and oi_delta > 0:
-            return "LONG_BUILD"
-        if price_delta > 0 and oi_delta < 0:
-            return "SHORT_COVER"
-        if price_delta < 0 and oi_delta > 0:
-            return "SHORT_BUILD"
-        if price_delta < 0 and oi_delta < 0:
-            return "LONG_LIQUIDATION"
+        if price_delta > 0 and oi_delta > 0: return "LONG_BUILD"
+        if price_delta > 0 and oi_delta < 0: return "SHORT_COVER"
+        if price_delta < 0 and oi_delta > 0: return "SHORT_BUILD"
+        if price_delta < 0 and oi_delta < 0: return "LONG_LIQUIDATION"
         return "FLAT_OR_MIXED"
 
-    def collect_once(self, reason="interval") -> dict:
+    def _quote(self, code: str, errors: list[str], raw: dict) -> tuple[dict, str | None]:
+        try:
+            j = self._post("t2111", {"t2111InBlock": {"focode": code}})
+            raw["t2111"] = j
+            return j.get("t2111OutBlock") or {}, "t2111"
+        except Exception as ex:
+            errors.append(f"t2111:{type(ex).__name__}:{ex}")
+        try:
+            j = self._post("t2101", {"t2101InBlock": {"focode": code}})
+            raw["t2101"] = j
+            return j.get("t2101OutBlock") or {}, "t2101"
+        except Exception as ex:
+            errors.append(f"t2101:{type(ex).__name__}:{ex}")
+            return {}, None
+
+    def _save_sample(
+        self, *, started, code, name, price, diff, volume, oi, oi_reported_delta, basis,
+        atm, cimpv, pimpv, options_status, options_sampled_at, source_tr, quality,
+        errors, sample_kind, reason
+    ):
+        prev = self._prev(code)
+        interval_sec = price_delta = oi_delta = basis_delta = None
+        if prev:
+            try:
+                t0 = datetime.fromisoformat(prev["sampled_at"])
+                interval_sec = max(0.0, (started - t0).total_seconds())
+            except Exception:
+                interval_sec = None
+            if price is not None and prev.get("futures_price") is not None:
+                price_delta = price - float(prev["futures_price"])
+            if oi is not None and prev.get("open_interest") is not None:
+                oi_delta = oi - float(prev["open_interest"])
+            if basis is not None and prev.get("basis") is not None:
+                basis_delta = basis - float(prev["basis"])
+        structure = self._structure(price_delta, oi_delta)
+
+        with self._con() as c:
+            c.execute("""
+            INSERT INTO derivative_samples(
+              sampled_at,contract_code,contract_name,futures_price,futures_change_rate,volume,
+              open_interest,open_interest_reported_delta,open_interest_delta,basis,basis_delta,
+              sample_interval_seconds,futures_structure,options_status,cimpv,pimpv,atm_json,
+              source_tr,quality,error_json,sample_kind,reason,options_sampled_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                _iso(started), code, name, price, diff, volume,
+                oi, oi_reported_delta, oi_delta, basis, basis_delta,
+                interval_sec, structure, options_status, cimpv, pimpv,
+                json.dumps(atm or [], ensure_ascii=False), source_tr, quality,
+                json.dumps(errors, ensure_ascii=False), sample_kind, reason, options_sampled_at,
+            ))
+            c.commit()
+        self.last_collect_at = _iso(started)
+        if sample_kind == "FAST": self.last_fast_at = _iso(started)
+        if sample_kind == "SLOW": self.last_slow_at = _iso(started)
+        self.last_error = errors[-1] if errors else None
+        result = self.latest(); result["reason"] = reason
+        return result
+
+    def collect_fast(self, reason="fast_interval") -> dict:
         if not self.enabled:
             return {"status": "DISABLED"}
         with self._lock:
             if self._running:
                 return {"status": "BUSY"}
             self._running = True
-        started = _now()
-        errors = []
-        raw = {}
+        started = _now(); errors = []; raw = {}
+        try:
+            code = self._cached_code
+            name = self._cached_name or "KOSPI200_NEAR_FUTURE"
+            if not code:
+                # First-ever startup has no contract cache; bootstrap with one slow pass.
+                with self._lock: self._running = False
+                return self.collect_slow("fast_bootstrap_slow")
+            quote, quote_tr = self._quote(code, errors, raw)
+            price = _float(quote.get("price")); diff = _float(quote.get("diff")); volume = _float(quote.get("volume"))
+            oi = _float(quote.get("mgjv")); oi_reported_delta = _float(quote.get("mgjvdiff")); basis = _float(quote.get("sbasis"))
+            if price is not None and oi is not None and basis is not None: quality = "READY"
+            elif price is not None or oi is not None or basis is not None: quality = "PARTIAL"
+            else: quality = "UNAVAILABLE"
+
+            opt = self._latest_options() or {}
+            try: atm = json.loads(opt.get("atm_json") or "[]")
+            except Exception: atm = []
+            options_sampled_at = opt.get("options_sampled_at") or opt.get("sampled_at")
+            options_status = "CACHED_SLOW" if atm else "UNAVAILABLE"
+            result = self._save_sample(
+                started=started, code=code, name=name, price=price, diff=diff, volume=volume,
+                oi=oi, oi_reported_delta=oi_reported_delta, basis=basis, atm=atm,
+                cimpv=_float(opt.get("cimpv")), pimpv=_float(opt.get("pimpv")),
+                options_status=options_status, options_sampled_at=options_sampled_at,
+                source_tr=quote_tr or "", quality=quality, errors=errors,
+                sample_kind="FAST", reason=reason,
+            )
+            self.last_raw = {"sampled_at": _iso(started), "contract_code": code, "sample_kind": "FAST", "raw": raw}
+            return result
+        except Exception as e:
+            self.last_error = f"{type(e).__name__}:{e}"
+            LOG.exception("LS_DERIVATIVES_FAST_FAILED")
+            return {"status": "FAILED", "error": self.last_error, "sampled_at": _iso(started)}
+        finally:
+            with self._lock: self._running = False
+
+    def collect_slow(self, reason="slow_interval") -> dict:
+        if not self.enabled:
+            return {"status": "DISABLED"}
+        with self._lock:
+            if self._running:
+                return {"status": "BUSY"}
+            self._running = True
+        started = _now(); errors = []; raw = {}
         try:
             board, board_month, e = self._option_board(); errors += e
-            if board:
-                raw["t2301"] = board
+            if board: raw["t2301"] = board
             board_head = (board or {}).get("t2301OutBlock") or {}
             code = _text(board_head.get("gmshcode"))
             name = "KOSPI200_NEAR_FUTURE" if code else None
-
-            master_raw = None
             if not code:
                 code, name, master_raw, e = self._master_near_future(); errors += e
-                if master_raw:
-                    raw["t9943"] = master_raw
-
-            quote = {}
-            quote_tr = None
+                if master_raw: raw["t9943"] = master_raw
             if code:
-                try:
-                    j = self._post("t2111", {"t2111InBlock": {"focode": code}})
-                    raw["t2111"] = j
-                    quote = j.get("t2111OutBlock") or {}
-                    quote_tr = "t2111"
-                except Exception as ex:
-                    errors.append(f"t2111:{type(ex).__name__}:{ex}")
-                    # Compatibility fallback requested by operating spec.
-                    try:
-                        j = self._post("t2101", {"t2101InBlock": {"focode": code}})
-                        raw["t2101"] = j
-                        quote = j.get("t2101OutBlock") or {}
-                        quote_tr = "t2101"
-                    except Exception as ex2:
-                        errors.append(f"t2101:{type(ex2).__name__}:{ex2}")
+                self._cached_code = code
+                self._cached_name = name or "KOSPI200_NEAR_FUTURE"
+                self._cached_board_month = board_month
 
-            oi_trend = None
+            quote = {}; quote_tr = None
+            if code: quote, quote_tr = self._quote(code, errors, raw)
+
             oi_tr = None
             if code:
                 try:
                     j = self._post("t2424", {"t2424InBlock": {"focode": code, "bdgubun": "1", "nmin": 3, "tcgubun": "0", "cnt": 80}})
-                    raw["t2424"] = j
-                    oi_trend = j
-                    oi_tr = "t2424"
+                    raw["t2424"] = j; oi_tr = "t2424"
                 except Exception as ex:
                     errors.append(f"t2424:{type(ex).__name__}:{ex}")
                     try:
                         j = self._post("t2421", {"t2421InBlock": {"focode": code, "bdgubun": "1", "nmin": 3, "tcgubun": "0", "cnt": 80}})
-                        raw["t2421"] = j
-                        oi_trend = j
-                        oi_tr = "t2421"
+                        raw["t2421"] = j; oi_tr = "t2421"
                     except Exception as ex2:
                         errors.append(f"t2421:{type(ex2).__name__}:{ex2}")
 
             price = _float(quote.get("price"), _float(board_head.get("gmprice")))
             diff = _float(quote.get("diff"), _float(board_head.get("gmdiff")))
             volume = _float(quote.get("volume"), _float(board_head.get("gmvolume")))
-            oi = _float(quote.get("mgjv"))
-            oi_reported_delta = _float(quote.get("mgjvdiff"))
-            basis = _float(quote.get("sbasis"))
-            if not code:
-                quality = "UNAVAILABLE"
-            elif price is not None and oi is not None and basis is not None:
-                quality = "READY"
-            elif price is not None or oi is not None or basis is not None:
-                quality = "PARTIAL"
-            else:
-                quality = "UNAVAILABLE"
+            oi = _float(quote.get("mgjv")); oi_reported_delta = _float(quote.get("mgjvdiff")); basis = _float(quote.get("sbasis"))
+            if not code: quality = "UNAVAILABLE"
+            elif price is not None and oi is not None and basis is not None: quality = "READY"
+            elif price is not None or oi is not None or basis is not None: quality = "PARTIAL"
+            else: quality = "UNAVAILABLE"
 
-            prev = self._prev()
-            interval_sec = None
-            price_delta = oi_delta = basis_delta = None
-            if prev:
-                try:
-                    t0 = datetime.fromisoformat(prev["sampled_at"])
-                    interval_sec = max(0.0, (started - t0).total_seconds())
-                except Exception:
-                    interval_sec = None
-                if prev.get("contract_code") == code:
-                    if price is not None and prev.get("futures_price") is not None:
-                        price_delta = price - float(prev["futures_price"])
-                    if oi is not None and prev.get("open_interest") is not None:
-                        oi_delta = oi - float(prev["open_interest"])
-                    if basis is not None and prev.get("basis") is not None:
-                        basis_delta = basis - float(prev["basis"])
-
-            structure = self._structure(price_delta, oi_delta)
             atm = self._atm_slice(board, 2)
-            cimpv = _float(board_head.get("cimpv"))
-            pimpv = _float(board_head.get("pimpv"))
+            cimpv = _float(board_head.get("cimpv")); pimpv = _float(board_head.get("pimpv"))
             options_status = "READY" if board and atm else ("PARTIAL" if board else "UNAVAILABLE")
+            options_sampled_at = _iso(started) if board else None
             source_tr = "+".join([x for x in (quote_tr, oi_tr, "t2301" if board else None) if x])
-
-            with self._con() as c:
-                c.execute("""
-                INSERT INTO derivative_samples(
-                  sampled_at,contract_code,contract_name,futures_price,futures_change_rate,volume,
-                  open_interest,open_interest_reported_delta,open_interest_delta,basis,basis_delta,
-                  sample_interval_seconds,futures_structure,options_status,cimpv,pimpv,atm_json,
-                  source_tr,quality,error_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    _iso(started), code, name, price, diff, volume,
-                    oi, oi_reported_delta, oi_delta, basis, basis_delta,
-                    interval_sec, structure, options_status, cimpv, pimpv,
-                    json.dumps(atm, ensure_ascii=False), source_tr, quality,
-                    json.dumps(errors, ensure_ascii=False),
-                ))
-                c.commit()
-
+            result = self._save_sample(
+                started=started, code=code, name=name, price=price, diff=diff, volume=volume,
+                oi=oi, oi_reported_delta=oi_reported_delta, basis=basis, atm=atm,
+                cimpv=cimpv, pimpv=pimpv, options_status=options_status,
+                options_sampled_at=options_sampled_at, source_tr=source_tr, quality=quality,
+                errors=errors, sample_kind="SLOW", reason=reason,
+            )
             self.last_raw = {
-                "sampled_at": _iso(started),
-                "board_month": board_month,
-                "contract_code": code,
-                "raw": raw,
-                "raw_field_keys": {
-                    k: sorted(list((v.get(f"{k}OutBlock") or {}).keys())) if isinstance(v, dict) else []
-                    for k, v in raw.items() if k in {"t2111", "t2101", "t2424", "t2421", "t2301"}
-                },
+                "sampled_at": _iso(started), "board_month": board_month, "contract_code": code,
+                "sample_kind": "SLOW", "raw": raw,
             }
-            self.last_error = errors[-1] if errors else None
-            self.last_collect_at = _iso(started)
-            result = self.latest()
-            result["reason"] = reason
             return result
         except Exception as e:
             self.last_error = f"{type(e).__name__}:{e}"
-            LOG.exception("LS_DERIVATIVES_COLLECT_FAILED")
+            LOG.exception("LS_DERIVATIVES_SLOW_FAILED")
             return {"status": "FAILED", "error": self.last_error, "sampled_at": _iso(started)}
         finally:
-            with self._lock:
-                self._running = False
+            with self._lock: self._running = False
+
+    # backward-compatible entry point
+    def collect_once(self, reason="interval") -> dict:
+        return self.collect_slow(reason)
 
     def latest(self) -> dict:
         with self._con() as c:
@@ -12879,80 +13004,266 @@ class LSDerivativesLedger:
             d.pop("atm_json", None); d.pop("error_json", None)
         return {"version": self.VERSION, "count": len(rows), "rows": rows}
 
+    def _http_get_json(self, path: str):
+        r = self._http.get(self.kis_url + path, timeout=self.http_timeout, headers={"Accept": "application/json"})
+        r.raise_for_status()
+        j = r.json()
+        if not isinstance(j, dict):
+            raise RuntimeError("KIS_NON_DICT_RESPONSE")
+        return j
+
+    @staticmethod
+    def _compact_kis_flow(payload: dict) -> dict:
+        latest = payload.get("latest") or {}
+        out = {"status": payload.get("status"), "last_cycle_at": payload.get("last_cycle_at"), "markets": {}}
+        for market in ("KOSPI", "KOSDAQ"):
+            row = latest.get(f"KRX:{market}") or {}
+            out["markets"][market] = {
+                k: row.get(k) for k in (
+                    "foreign_net_amt", "institution_net_amt", "program_net_amt",
+                    "delta_foreign_net_amt_30s", "delta_institution_net_amt_30s",
+                    "delta_program_net_amt_30s", "source_time", "source_investor", "source_program",
+                )
+            }
+        return out
+
+    @staticmethod
+    def _detect_kis_changes(prev: dict | None, cur: dict | None) -> list[str]:
+        if not prev or not cur:
+            return []
+        reasons: list[str] = []
+        for market in ("KOSPI", "KOSDAQ"):
+            a = (prev.get("markets") or {}).get(market) or {}
+            b = (cur.get("markets") or {}).get(market) or {}
+            for field, tag in (
+                ("delta_program_net_amt_30s", "PROGRAM_DELTA"),
+                ("delta_foreign_net_amt_30s", "FOREIGN_DELTA"),
+                ("delta_institution_net_amt_30s", "INSTITUTION_DELTA"),
+            ):
+                av = _float(a.get(field)); bv = _float(b.get(field))
+                if av is None or bv is None or bv == 0:
+                    continue
+                if _sign(av) != 0 and _sign(av) != _sign(bv):
+                    reasons.append(f"{market}_{tag}_SIGN_FLIP")
+                elif av != 0 and abs(bv) >= abs(av) * 2.0 and abs(bv - av) > 0:
+                    reasons.append(f"{market}_{tag}_ACCEL")
+            av = _float(a.get("program_net_amt")); bv = _float(b.get("program_net_amt"))
+            if av is not None and bv is not None and _sign(av) != 0 and _sign(bv) != 0 and _sign(av) != _sign(bv):
+                reasons.append(f"{market}_PROGRAM_LEVEL_SIGN_FLIP")
+        # keep the trigger concise and deterministic
+        return reasons[:6]
+
+    def _queue_trigger(self, reasons: list[str]):
+        if not reasons:
+            return
+        with self._trigger_lock:
+            for x in reasons:
+                if x not in self._pending_trigger_reasons:
+                    self._pending_trigger_reasons.append(x)
+            self._pending_trigger_reasons = self._pending_trigger_reasons[-8:]
+
+    def _trigger_due(self) -> bool:
+        if not self._pending_trigger_reasons:
+            return False
+        if not self.last_trigger_at:
+            return True
+        try:
+            return (_now() - datetime.fromisoformat(self.last_trigger_at)).total_seconds() >= self.trigger_cooldown
+        except Exception:
+            return True
+
+    def _consume_trigger(self):
+        with self._trigger_lock:
+            reasons = list(self._pending_trigger_reasons)
+            self._pending_trigger_reasons.clear()
+        return reasons
+
+    def _poll_kis_once(self):
+        if not self.kis_watch_enabled:
+            return
+        try:
+            raw = self._http_get_json(self.kis_flow_path)
+            compact = self._compact_kis_flow(raw)
+            reasons = self._detect_kis_changes(self.kis_last_flow, compact)
+            self.kis_last_flow = compact
+            self.kis_last_poll_at = _iso()
+            self.kis_last_error = None
+            if reasons:
+                self.kis_last_change_at = _iso()
+                self.kis_last_change_reasons = reasons
+                self._queue_trigger(reasons)
+                LOG.info("LS_DERIVATIVES_KIS_TRIGGER_QUEUED reasons=%s", ",".join(reasons))
+                try:
+                    self.kis_last_top = self._http_get_json(self.kis_top_path)
+                except Exception as e:
+                    self.kis_last_top = {"status": "UNAVAILABLE", "error": type(e).__name__}
+        except Exception as e:
+            self.kis_last_poll_at = _iso()
+            self.kis_last_error = f"{type(e).__name__}:{e}"
+            LOG.warning("LS_DERIVATIVES_KIS_WATCH_ERROR %s", self.kis_last_error[:200])
+
+    def master_snapshot(self) -> dict:
+        latest = self.latest(); now = _now(); change_age = None
+        if self.kis_last_change_at:
+            try: change_age = max(0.0, (now - datetime.fromisoformat(self.kis_last_change_at)).total_seconds())
+            except Exception: pass
+        meaningful = bool(self.kis_last_change_reasons) and (change_age is None or change_age <= max(120, self.kis_poll_interval * 4))
+        return {
+            "version": self.MASTER_VERSION,
+            "generated_at": _iso(now),
+            "meaningful_change": meaningful,
+            "change_reasons": list(self.kis_last_change_reasons) if meaningful else [],
+            "kis": {
+                "authority_url": self.kis_url,
+                "poll_interval_seconds": self.kis_poll_interval,
+                "last_poll_at": self.kis_last_poll_at,
+                "last_error": self.kis_last_error,
+                "flow": self.kis_last_flow,
+                "top_on_change": self.kis_last_top,
+            },
+            "ls_derivatives": {
+                "fast_interval_seconds": self.fast_interval,
+                "slow_interval_seconds": self.slow_interval,
+                "trigger_cooldown_seconds": self.trigger_cooldown,
+                "last_fast_at": self.last_fast_at,
+                "last_slow_at": self.last_slow_at,
+                "last_trigger_at": self.last_trigger_at,
+                "last_trigger_reason": self.last_trigger_reason,
+                "pending_trigger_reasons": list(self._pending_trigger_reasons),
+                "latest": latest,
+            },
+            "v1_1_mode": "PARTIAL_V1_1",  # foreign futures source remains unverified
+            "policy": "KIS_30S_FAST_SIGNAL__LS_T2111_75S_OR_TRIGGER__LS_OPTIONS_OI_240S__NO_NEW_OAUTH",
+        }
+
     def health(self) -> dict:
         latest = self.latest()
-        ready = latest.get("status") == "READY"
         return {
             "ok": True,
             "version": self.VERSION,
             "enabled": self.enabled,
             "shared_provider_bound": self._ls_provider is not None,
-            "interval_seconds": self.interval,
+            "fast_interval_seconds": self.fast_interval,
+            "slow_interval_seconds": self.slow_interval,
+            "kis_watch_enabled": self.kis_watch_enabled,
+            "kis_poll_interval_seconds": self.kis_poll_interval,
+            "trigger_cooldown_seconds": self.trigger_cooldown,
             "collection_window": self._is_collection_window(),
             "last_collect_at": self.last_collect_at,
+            "last_fast_at": self.last_fast_at,
+            "last_slow_at": self.last_slow_at,
+            "last_trigger_at": self.last_trigger_at,
             "last_error": self.last_error,
+            "kis_last_poll_at": self.kis_last_poll_at,
+            "kis_last_error": self.kis_last_error,
             "latest_status": latest.get("status"),
             "latest_sampled_at": latest.get("sampled_at"),
+            "sample_kind": latest.get("sample_kind"),
             "core_axes": latest.get("core_axes", {}),
             "foreign_futures_status": "FOREIGN_FUTURES_PENDING_SOURCE",
-            "v1_1_mode": "PARTIAL_V1_1" if not ready or latest.get("foreign_futures_status") else "PARTIAL_V1_1",
-            "policy": "SHARED_EXISTING_LS_PROVIDER__NO_NEW_OAUTH__READ_ONLY",
+            "v1_1_mode": "PARTIAL_V1_1",
+            "policy": "SHARED_EXISTING_LS_PROVIDER__NO_NEW_OAUTH__FAST_SLOW_SPLIT__KIS_TRIGGER",
         }
 
     def raw_view(self) -> dict:
-        # Diagnostic only. It exposes broker payloads, never credentials/headers/tokens.
         if not self.last_raw:
             return {"version": self.VERSION, "status": "NO_RAW_YET"}
-        out = dict(self.last_raw)
-        raw = out.get("raw") or {}
-        # Keep the actual keys and one representative row per array to limit payload size.
-        slim = {}
+        out = dict(self.last_raw); raw = out.get("raw") or {}; slim = {}
         for tr, j in raw.items():
-            if not isinstance(j, dict):
-                continue
+            if not isinstance(j, dict): continue
             item = {}
             for k, v in j.items():
                 if isinstance(v, list):
                     item[k] = {"count": len(v), "sample": v[:1], "keys": sorted(v[0].keys()) if v and isinstance(v[0], dict) else []}
                 elif isinstance(v, dict):
                     item[k] = {"keys": sorted(v.keys()), "sample": v}
-                else:
-                    item[k] = v
+                else: item[k] = v
             slim[tr] = item
         out["raw"] = slim
         return out
 
     def handle_get(self, raw_path):
         u = urlparse(raw_path); path = u.path; qs = parse_qs(u.query)
-        if path == "/api/context/ls-derivatives/health":
-            return 200, self.health()
-        if path == "/api/context/ls-derivatives/latest":
-            return 200, self.latest()
-        if path == "/api/context/ls-derivatives/history":
-            return 200, self.history((qs.get("limit") or ["200"])[0])
-        if path == "/api/context/ls-derivatives/raw":
-            return 200, self.raw_view()
+        if path == "/api/context/ls-derivatives/health": return 200, self.health()
+        if path == "/api/context/ls-derivatives/latest": return 200, self.latest()
+        if path == "/api/context/ls-derivatives/history": return 200, self.history((qs.get("limit") or ["200"])[0])
+        if path == "/api/context/ls-derivatives/raw": return 200, self.raw_view()
+        if path == "/api/context/ls-derivatives/master-snapshot": return 200, self.master_snapshot()
+        if path == "/api/context/ls-derivatives/trigger":
+            reason = _text((qs.get("reason") or ["manual"])[0]) or "manual"
+            self._queue_trigger([f"MANUAL:{reason}"[:120]])
+            return 202, {"status": "QUEUED", "reason": reason, "cooldown_seconds": self.trigger_cooldown}
         return None
 
-    def _loop(self):
+    def _fast_scheduler_loop(self):
+        time.sleep(self.start_delay + 8)
+        while True:
+            try:
+                if self._is_collection_window():
+                    now = _now(); due = False
+                    if not self.last_fast_at:
+                        due = True
+                    else:
+                        try: due = (now - datetime.fromisoformat(self.last_fast_at)).total_seconds() >= self.fast_interval
+                        except Exception: due = True
+                    if self._trigger_due():
+                        reasons = self._consume_trigger()
+                        why = "kis_trigger:" + ",".join(reasons)
+                        r = self.collect_fast(why)
+                        if r.get("status") != "BUSY":
+                            self.last_trigger_at = _iso()
+                            self.last_trigger_reason = why
+                            LOG.info("LS_DERIVATIVES_TRIGGER_EXECUTED status=%s reason=%s", r.get("status"), why[:180])
+                        else:
+                            self._queue_trigger(reasons)
+                    elif due:
+                        self.collect_fast("fast_interval")
+            except Exception:
+                LOG.exception("LS_DERIVATIVES_FAST_LOOP_ERROR")
+            time.sleep(5)
+
+    def _slow_scheduler_loop(self):
         time.sleep(self.start_delay)
         while True:
             try:
                 if self._is_collection_window():
-                    self.collect_once("interval")
+                    now = _now(); due = False
+                    if not self.last_slow_at:
+                        due = True
+                    else:
+                        try: due = (now - datetime.fromisoformat(self.last_slow_at)).total_seconds() >= self.slow_interval
+                        except Exception: due = True
+                    if due:
+                        self.collect_slow("slow_interval")
             except Exception:
-                LOG.exception("LS_DERIVATIVES_LOOP_ERROR")
-            time.sleep(self.interval)
+                LOG.exception("LS_DERIVATIVES_SLOW_LOOP_ERROR")
+            time.sleep(10)
+
+    def _kis_watch_loop(self):
+        time.sleep(self.start_delay + 3)
+        while True:
+            try:
+                if self._is_collection_window():
+                    self._poll_kis_once()
+            except Exception:
+                LOG.exception("LS_DERIVATIVES_KIS_WATCH_LOOP_ERROR")
+            time.sleep(self.kis_poll_interval)
 
     def start(self):
         if not self.enabled:
-            LOG.info("LS_DERIVATIVES_DISABLED")
-            return
-        threading.Thread(target=self._loop, daemon=True, name="ls-derivatives-ledger").start()
-        LOG.info("LS_DERIVATIVES_STARTED interval=%ss", self.interval)
+            LOG.info("LS_DERIVATIVES_DISABLED"); return
+        threading.Thread(target=self._slow_scheduler_loop, daemon=True, name="ls-derivatives-slow").start()
+        threading.Thread(target=self._fast_scheduler_loop, daemon=True, name="ls-derivatives-fast").start()
+        if self.kis_watch_enabled:
+            threading.Thread(target=self._kis_watch_loop, daemon=True, name="ls-derivatives-kis-watch").start()
+        LOG.info(
+            "LS_DERIVATIVES_STARTED fast=%ss slow=%ss kis_poll=%ss trigger_cooldown=%ss",
+            self.fast_interval, self.slow_interval, self.kis_poll_interval, self.trigger_cooldown,
+        )
 
 
 LS_DERIVATIVES_LEDGER = LSDerivativesLedger()
+
 LS_DERIVATIVES_LEDGER_V10_MODULE
 
 COPY <<'LS_DERIVATIVES_LEDGER_V10_APPLY' /tmp/apply_ls_derivatives_v10.py
@@ -12993,22 +13304,26 @@ RUN python /tmp/apply_ls_derivatives_v10.py \
  && python -m py_compile /app/ls_derivatives_ledger.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
  && grep -Fq 'LS_DERIVATIVES_INTEGRATION_V1_0' /app/오백종목_통합엔진_웹서비스_V1_0.py \
  && grep -Fq '/api/context/ls-derivatives/health' /app/ls_derivatives_ledger.py \
+ && grep -Fq '/api/context/ls-derivatives/master-snapshot' /app/ls_derivatives_ledger.py \
+ && grep -Fq 'LS_DERIVATIVES_KIS_TRIGGER_QUEUED' /app/ls_derivatives_ledger.py \
  && grep -Fq 'LS_DERIVATIVES_LEDGER.bind(lambda: get_engine().ls, market_session_now)' /app/오백종목_통합엔진_웹서비스_V1_0.py \
- && echo 'LS_DERIVATIVES_V1_0_BUILD_TEST_PASS SHARED_PROVIDER=YES NEW_OAUTH=NO T1632_1636_1637_UNCHANGED=YES' \
+ && echo 'LS_DERIVATIVES_V1_1_BUILD_TEST_PASS FAST_75S=YES SLOW_240S=YES KIS_TRIGGER=YES SHARED_PROVIDER=YES NEW_OAUTH=NO T1632_1636_1637_UNCHANGED=YES' \
  && rm -f /tmp/apply_ls_derivatives_v10.py
 
 COPY <<'LS_DERIVATIVES_LEDGER_V10_SMOKE' /tmp/ls_derivatives_v10_smoke.py
 import os,sys
 os.environ['LS_DERIVATIVES_LEDGER_ENABLED']='true'
-os.environ['LS_DERIVATIVES_DB_PATH']='/tmp/ls-derivatives-v10-smoke.db'
+os.environ['LS_DERIVATIVES_KIS_WATCH_ENABLED']='false'
+os.environ['LS_DERIVATIVES_DB_PATH']='/tmp/ls-derivatives-v11-smoke.db'
 sys.path.insert(0,'/app')
 from ls_derivatives_ledger import LSDerivativesLedger
 class Resp:
     def __init__(self,j): self._j=j
     def json(self): return self._j
 class FakeLS:
-    def __init__(self): self.n=0
+    def __init__(self): self.n=0; self.calls=[]
     def _post_tr(self,path,tr,body):
+        self.calls.append(tr)
         assert path=='/futureoption/market-data'
         if tr=='t2301':
             def rows(prefix,iv,oi):
@@ -13023,19 +13338,28 @@ class FakeLS:
         if tr=='t2424':
             return Resp({'t2424OutBlock':{'price':'356','openyak':'100100'},'t2424OutBlock1':[{'dt':'20261106090000','close':'355','closeopenyak':'100000','openupdn':'100'}]})
         raise RuntimeError(tr)
-for f in ['/tmp/ls-derivatives-v10-smoke.db','/tmp/ls-derivatives-v10-smoke.db-wal','/tmp/ls-derivatives-v10-smoke.db-shm']:
+for f in ['/tmp/ls-derivatives-v11-smoke.db','/tmp/ls-derivatives-v11-smoke.db-wal','/tmp/ls-derivatives-v11-smoke.db-shm']:
     try: os.remove(f)
     except: pass
-x=LSDerivativesLedger(); x.bind(FakeLS(),lambda:{'venue':'KRX','session':'KRX_REGULAR','scan_allowed':True})
-a=x.collect_once('smoke1'); b=x.collect_once('smoke2')
+x=LSDerivativesLedger(); f=FakeLS(); x.bind(f,lambda:{'venue':'KRX','session':'KRX_REGULAR','scan_allowed':True})
+a=x.collect_slow('smoke_slow'); b=x.collect_fast('smoke_fast')
 assert a['status']=='READY' and b['status']=='READY',(a,b)
+assert a['sample_kind']=='SLOW' and b['sample_kind']=='FAST',(a,b)
 assert b['open_interest_delta']==100.0,b
 assert abs(b['basis_delta']-0.1)<1e-9,b
 assert b['futures_structure']=='LONG_BUILD',b
-assert len(b['atm'])==10,b
-assert x.health()['shared_provider_bound'] is True
-print('LS_DERIVATIVES_V1_0_SMOKE_PASS READY=YES DELTA=YES LONG_BUILD=YES ATM_PM2=YES')
+assert b['options_status']=='CACHED_SLOW',b
+assert f.calls==['t2301','t2111','t2424','t2111'],f.calls
+prev={'markets':{'KOSPI':{'delta_program_net_amt_30s':-10,'delta_foreign_net_amt_30s':-5,'delta_institution_net_amt_30s':1,'program_net_amt':-100},'KOSDAQ':{}}}
+cur={'markets':{'KOSPI':{'delta_program_net_amt_30s':20,'delta_foreign_net_amt_30s':8,'delta_institution_net_amt_30s':3,'program_net_amt':50},'KOSDAQ':{}}}
+reasons=x._detect_kis_changes(prev,cur)
+assert 'KOSPI_PROGRAM_DELTA_SIGN_FLIP' in reasons and 'KOSPI_FOREIGN_DELTA_SIGN_FLIP' in reasons and 'KOSPI_PROGRAM_LEVEL_SIGN_FLIP' in reasons,reasons
+snap=x.master_snapshot()
+assert snap['ls_derivatives']['fast_interval_seconds']==75 and snap['ls_derivatives']['slow_interval_seconds']==240,snap
+assert snap['v1_1_mode']=='PARTIAL_V1_1',snap
+print('LS_DERIVATIVES_V1_1_SMOKE_PASS FAST_ONLY_T2111=YES SLOW_OPTIONS_OI=YES KIS_TRIGGER=YES MASTER_SNAPSHOT=YES')
+
 LS_DERIVATIVES_LEDGER_V10_SMOKE
 
 RUN PYTHONPATH=/app python /tmp/ls_derivatives_v10_smoke.py \
- && rm -f /tmp/ls_derivatives_v10_smoke.py /tmp/ls-derivatives-v10-smoke.db /tmp/ls-derivatives-v10-smoke.db-wal /tmp/ls-derivatives-v10-smoke.db-shm
+ && rm -f /tmp/ls_derivatives_v10_smoke.py /tmp/ls-derivatives-v11-smoke.db /tmp/ls-derivatives-v11-smoke.db-wal /tmp/ls-derivatives-v11-smoke.db-shm
