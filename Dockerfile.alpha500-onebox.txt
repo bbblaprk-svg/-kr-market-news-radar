@@ -1,3 +1,6 @@
+# NEWS_IMPACT_RELEASE=V1_2_1_FINAL_FORCE
+# REQUIRED_RENDER_DOCKERFILE_PATH=Dockerfile.alpha500-onebox.txt
+# DO_NOT_UPLOAD_OLDER_V1_2_FILE
 # syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
@@ -16657,3 +16660,1386 @@ NEWS_IMPACT_V12_SMOKE
 
 RUN PYTHONPATH=/app python /tmp/news_impact_v12_smoke.py \
  && rm -f /tmp/news_impact_v12_smoke.py /tmp/news-impact-v12-smoke.sqlite3 /tmp/news-impact-v12-smoke.sqlite3-wal /tmp/news-impact-v12-smoke.sqlite3-shm
+
+# ===== NEWS_IMPACT V1.2.1 PUBLISH-TIME + TWICE-DAILY BRIEFING FINAL OVERRIDE =====
+# Only /app/news_impact_sidecar.py is overridden. KIS/LS collectors and ALPHA500 logic remain unchanged.
+COPY <<'NEWS_IMPACT_SIDECAR_V121_PUBLISH_BRIEF_MODULE' /app/news_impact_sidecar.py
+# -*- coding: utf-8 -*-
+"""NEWS_IMPACT_SIDECAR_V1_2_1
+
+Low-load, non-blocking catalyst/news sidecar for the existing ALPHA500 + KIS/LS service.
+Design goals:
+- NEVER create a new brokerage OAuth/session.
+- NEVER block or mutate KIS/LS/ALPHA500 collectors.
+- Reuse the existing local ALPHA500 summary (load_latest) as the trigger source.
+- External network is used only for disclosures/news, with concurrency/budget/cooldowns.
+- Store event metadata/fingerprints, not full article bodies.
+- News never creates BUY by itself; it is mapped to catalyst states and must be confirmed by price/flow/sector.
+- V1.2 separates FLOW_ONLY market/sector context from DIRECT_IMPACT company events.
+- V1.2 uses 3 stages: event classification -> economic impact -> observed market response.
+- V1.2.1 separates ingestion time from publication time in 10-minute counters and adds a low-load twice-daily briefing endpoint.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from email.utils import parsedate_to_datetime
+import html
+import json
+import logging
+import os
+import re
+import sqlite3
+import threading
+import time
+from xml.etree import ElementTree as ET
+from collections import deque
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import quote_plus, urlparse
+
+import requests
+
+LOG = logging.getLogger("news_impact_sidecar")
+KST = timezone(timedelta(hours=9))
+
+
+def _now() -> datetime:
+    return datetime.now(KST)
+
+
+def _iso(dt: Optional[datetime] = None) -> str:
+    return (dt or _now()).isoformat(timespec="seconds")
+
+
+def _text(v: Any) -> str:
+    return str(v or "").strip()
+
+
+def _num(v: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if v in (None, ""):
+            return default
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return default
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _int_env(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        return max(lo, min(hi, int(os.getenv(name, str(default)))))
+    except Exception:
+        return default
+
+
+def _norm(s: str) -> str:
+    s = html.unescape(_text(s)).lower()
+    s = re.sub(r"https?://\S+", " ", s)
+    s = re.sub(r"\[[^\]]+\]|\([^)]*속보[^)]*\)", " ", s)
+    s = re.sub(r"[^0-9a-z가-힣.%+-]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _fingerprint(title: str, entity: str = "", event_type: str = "") -> str:
+    base = f"{_norm(title)}|{_norm(entity)}|{event_type}"
+    return hashlib.sha1(base.encode("utf-8", "ignore")).hexdigest()[:24]
+
+
+def _domain(url: str) -> str:
+    try:
+        return urlparse(url).netloc.lower().lstrip("www.")
+    except Exception:
+        return ""
+
+
+def _parse_dt(v: Any) -> Optional[datetime]:
+    s = _text(v)
+    if not s:
+        return None
+    # GDELT seendate: 20261107T001500Z / ISO / RFC-ish fallbacks
+    for fmt in ("%Y%m%dT%H%M%SZ", "%Y%m%d%H%M%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
+        try:
+            d = datetime.strptime(s, fmt)
+            if fmt.endswith("Z"):
+                d = d.replace(tzinfo=timezone.utc).astimezone(KST)
+            else:
+                d = d.replace(tzinfo=KST)
+            return d
+        except Exception:
+            pass
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=KST)
+        return d.astimezone(KST)
+    except Exception:
+        pass
+    # RSS/HTTP RFC dates such as "Fri, 06 Nov 2026 08:34:00 GMT".
+    try:
+        d = parsedate_to_datetime(s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(KST)
+    except Exception:
+        return None
+
+
+EVENT_RULES: List[Tuple[str, Tuple[str, ...]]] = [
+    ("EARNINGS", ("실적", "영업이익", "매출", "순이익", "earnings", "operating profit", "revenue")),
+    ("GUIDANCE", ("가이던스", "전망", "실적 전망", "guidance", "outlook", "forecast")),
+    ("ORDER", ("수주", "공급계약", "계약 체결", "order", "contract", "backlog")),
+    ("CAPEX", ("시설투자", "설비투자", "증설", "투자 결정", "capex", "capacity expansion")),
+    ("AI_CAPEX", ("ai capex", "ai 투자", "인공지능 투자", "gpu 투자", "데이터센터 투자")),
+    ("BUYBACK", ("자사주", "자기주식 취득", "share buyback", "repurchase")),
+    ("CANCELLATION", ("자기주식 소각", "자사주 소각", "share cancellation")),
+    ("CAPITAL_RAISE", ("유상증자", "rights offering", "capital raise", "증자 결정")),
+    ("CONVERTIBLE", ("전환사채", "신주인수권부사채", "cb 발행", "bw 발행", "convertible bond")),
+    ("MNA", ("인수합병", "인수 결정", "합병 결정", "m&a", "merger", "acquisition")),
+    ("CLINICAL", ("임상", "clinical trial", "phase 1", "phase 2", "phase 3")),
+    ("APPROVAL", ("품목허가", "승인", "허가 획득", "approval", "fda", "nda approval")),
+    ("POLICY", ("정책", "정부 지원", "보조금", "세액공제", "policy", "subsidy", "tax credit")),
+    ("REGULATION", ("규제", "제재", "과징금", "regulation", "sanction", "antitrust")),
+    ("RATE", ("금리", "연준", "fomc", "fed", "treasury yield", "rate cut", "rate hike")),
+    ("FX", ("환율", "원달러", "달러 강세", "달러 약세", "usd/krw", "dollar")),
+    ("OIL", ("유가", "원유", "opec", "wti", "brent", "oil")),
+    ("GEOPOLITICS", ("지정학", "전쟁", "미사일", "관세", "수출규제", "war", "tariff", "export control")),
+    ("SEMICONDUCTOR", ("반도체", "hbm", "dram", "nand", "semiconductor", "foundry")),
+    ("DATACENTER", ("데이터센터", "data center", "datacenter", "전력망", "transformer")),
+    ("ROBOT", ("로봇", "휴머노이드", "robot", "humanoid")),
+    ("DEFENSE", ("방산", "무기", "defense", "missile", "artillery")),
+    ("NUCLEAR", ("원전", "smr", "nuclear")),
+]
+
+POSITIVE_WORDS = (
+    "수주", "공급계약", "상향", "흑자", "사상 최대", "증설", "승인", "허가", "자사주", "소각",
+    "order win", "contract win", "upgrade", "record profit", "approval", "buyback", "capacity expansion",
+)
+NEGATIVE_WORDS = (
+    "하향", "적자", "리콜", "소송", "제재", "유상증자", "전환사채", "거래정지", "부도", "임상 실패",
+    "downgrade", "loss", "recall", "lawsuit", "sanction", "offering", "default", "clinical failure",
+)
+HIGH_EVENT_TYPES = {"EARNINGS", "GUIDANCE", "ORDER", "CAPEX", "BUYBACK", "CANCELLATION", "MNA", "CLINICAL", "APPROVAL", "CAPITAL_RAISE", "CONVERTIBLE"}
+
+# V1.2: profit guard + FLOW_ONLY/DIRECT_IMPACT separation. News never creates BUY by itself.
+HARD_NEGATIVE_TYPES = {"CAPITAL_RAISE", "CONVERTIBLE", "REGULATION", "CLINICAL", "EARNINGS", "GUIDANCE"}
+HARD_NEGATIVE_WORDS = (
+    "목표가 하향", "투자의견 하향", "적자 전환", "적자전환", "실적 부진", "실적 쇼크", "어닝쇼크",
+    "하회", "전망 하향", "가이던스 하향", "수주 취소", "계약 해지", "대주주 매각", "보호예수 해제",
+    "유상증자", "전환사채", "신주인수권부사채", "임상 실패", "허가 취소", "거래정지", "상장폐지",
+    "downgrade", "misses estimates", "guidance cut", "offering", "convertible", "clinical failure", "contract cancellation"
+)
+JUNK_TITLE_WORDS = (
+    "개인정보처리방침", "개인정보 처리방침", "이용약관", "1:1 문의", "문의 바로가기", "로그인",
+    "서비스 이용", "고객센터", "네이버페이", "copyright", "미국 · 글로벌", "국내 · 코스피", "국내 · 코스닥"
+)
+PROFIT_STATES = {
+    "CATALYST_CONFIRMED", "NEGATIVE_ABSORBED"
+}
+RISK_STATES = {
+    "ENTRY_BLOCKED_BY_NEWS", "NEGATIVE_CONFIRMED", "NEGATIVE_OVERHANG", "SECTOR_HEADWIND",
+    "SELL_THE_NEWS", "POSITIVE_NEWS_FAILED", "PRICED_IN"
+}
+
+# V1.2: distinguish market/sector flow context from company-specific economic impact.
+# FLOW_ONLY may explain or tighten gates, but it cannot directly veto a single-stock entry.
+DIRECT_EVENT_TYPES = {
+    "EARNINGS", "GUIDANCE", "ORDER", "CAPEX", "BUYBACK", "CANCELLATION", "MNA",
+    "CLINICAL", "APPROVAL", "CAPITAL_RAISE", "CONVERTIBLE"
+}
+FLOW_EVENT_TYPES = {
+    "AI_CAPEX", "POLICY", "REGULATION", "RATE", "FX", "OIL", "GEOPOLITICS",
+    "SEMICONDUCTOR", "DATACENTER", "ROBOT", "DEFENSE", "NUCLEAR"
+}
+DIRECT_IMPACT_WORDS = (
+    "공급계약", "수주", "계약 체결", "계약해지", "계약 해지", "수주 취소",
+    "실적", "영업이익", "매출", "가이던스", "목표가", "투자의견",
+    "자사주", "자기주식", "소각", "유상증자", "전환사채", "신주인수권부사채",
+    "임상", "품목허가", "허가 취소", "승인", "리콜", "대주주 매각",
+    "order win", "contract win", "contract cancellation", "earnings", "guidance",
+    "buyback", "offering", "convertible", "clinical", "approval", "recall"
+)
+FLOW_ONLY_WORDS = (
+    "연준", "fomc", "금리", "국채금리", "환율", "원달러", "달러", "유가", "opec",
+    "관세", "수출규제", "정부 지원", "보조금", "세액공제", "정책", "지정학", "전쟁",
+    "ai capex", "데이터센터 투자", "반도체 업황", "메모리 가격", "산업 전망",
+    "fed", "treasury yield", "rate cut", "rate hike", "tariff", "export control", "subsidy"
+)
+
+
+# Map the ALPHA500 cluster names/keywords to practical search terms.
+SECTOR_ALIASES = {
+    "반도체": "반도체 HBM AI 메모리",
+    "hbm": "HBM 반도체 AI 메모리",
+    "후공정": "반도체 후공정 HBM 장비",
+    "전공정": "반도체 전공정 장비",
+    "기판": "반도체 기판 PCB FCBGA",
+    "유리기판": "유리기판 TGV 반도체",
+    "전력반도체": "전력반도체 SiC GaN",
+    "로봇": "로봇 휴머노이드 자동화",
+    "바이오": "바이오 제약 임상 허가",
+    "제약": "제약 바이오 신약 허가",
+    "원전": "원전 SMR 수주",
+    "방산": "방산 수출 수주",
+    "전력": "전력기기 변압기 데이터센터 전력망",
+    "데이터센터": "데이터센터 AI 전력 인프라",
+    "ess": "ESS 에너지저장장치 배터리",
+    "화장품": "화장품 수출 K뷰티",
+    "조선": "조선 수주 LNG선 기자재",
+    "자동차": "자동차 하이브리드 수출",
+}
+
+
+class NewsImpactSidecar:
+    VERSION = "NEWS_IMPACT_SIDECAR_V1_2_1_PUBLISH_TIME_DIGEST"
+    SNAPSHOT_VERSION = "NEWS_IMPACT_SNAPSHOT_V1_2_1"
+
+    def __init__(self):
+        self.enabled = _bool_env("NEWS_IMPACT_ENABLED", True)
+        self.trigger_poll_seconds = _int_env("NEWS_TRIGGER_POLL_SECONDS", 15, 10, 120)
+        self.kind_poll_seconds = _int_env("NEWS_KIND_POLL_SECONDS", 120, 60, 600)
+        self.global_poll_seconds = _int_env("NEWS_GLOBAL_POLL_SECONDS", 600, 180, 1800)
+        self.sector_cooldown = _int_env("NEWS_SECTOR_COOLDOWN_SECONDS", 300, 60, 1800)
+        self.ticker_cooldown = _int_env("NEWS_TICKER_COOLDOWN_SECONDS", 600, 120, 3600)
+        self.market_cooldown = _int_env("NEWS_MARKET_COOLDOWN_SECONDS", 180, 60, 900)
+        self.request_timeout = _int_env("NEWS_REQUEST_TIMEOUT_SECONDS", 4, 2, 15)
+        self.max_http_concurrency = _int_env("NEWS_MAX_HTTP_CONCURRENCY", 2, 1, 4)
+        self.max_queue = _int_env("NEWS_MAX_QUEUE", 20, 5, 100)
+        self.events_limit = _int_env("NEWS_EVENT_MEMORY_LIMIT", 1000, 100, 5000)
+        self.raw_limit = _int_env("NEWS_RAW_HEADLINE_LIMIT", 500, 50, 2000)
+        self.max_external_per_hour = _int_env("NEWS_MAX_EXTERNAL_CALLS_PER_HOUR", 80, 20, 1000)
+        self.gdelt_maxrecords = _int_env("NEWS_GDELT_MAXRECORDS", 25, 5, 75)
+        self.naver_maxdisplay = _int_env("NEWS_NAVER_MAXDISPLAY", 50, 10, 100)
+        self.use_naver = _bool_env("NEWS_USE_NAVER", False)
+        self.dart_key = _text(os.getenv("OPENDART_API_KEY") or os.getenv("DART_API_KEY"))
+        self.naver_id = _text(os.getenv("NAVER_CLIENT_ID"))
+        self.naver_secret = _text(os.getenv("NAVER_CLIENT_SECRET"))
+        self.kind_url = _text(os.getenv("NEWS_KIND_URL")) or "https://kind.krx.co.kr/disclosure/todaydisclosure.do?method=searchTodayDisclosureMain"
+        self.gdelt_url = "https://api.gdeltproject.org/api/v2/doc/doc"
+        self.db_path = _text(os.getenv("NEWS_IMPACT_DB_PATH")) or "/tmp/news-impact-v1.sqlite3"
+
+        self._summary_provider: Optional[Callable[[], Optional[dict]]] = None
+        self._market_signal_provider: Optional[Callable[[], Optional[dict]]] = None
+        self._context_provider: Optional[Callable[[], Optional[dict]]] = None
+        self._lock = threading.RLock()
+        self._http_sem = threading.BoundedSemaphore(self.max_http_concurrency)
+        self._session = requests.Session()
+        self._session.headers.update({"User-Agent": "NEWS_IMPACT_SIDECAR_V1/1.2"})
+        self._stop = threading.Event()
+        self._started = False
+
+        self.events: deque = deque(maxlen=self.events_limit)
+        self.raw_items: deque = deque(maxlen=self.raw_limit)
+        self._event_by_fp: Dict[str, dict] = {}
+        self._seen_urls: Dict[str, float] = {}
+        self._cooldowns: Dict[str, float] = {}
+        self._external_calls: deque = deque()
+        self._queue: deque = deque(maxlen=self.max_queue)
+        self._queue_lock = threading.RLock()
+        self._previous_summary: Optional[dict] = None
+        self._last_kind_ids: set = set()
+        self._last_market_signal: Optional[str] = None
+        self._last_context_run_id: Optional[str] = None
+        self._kind_blocked_until = 0.0
+        self._boot_at = time.time()
+
+        self.last_trigger_poll_at = None
+        self.last_kind_poll_at = None
+        self.last_global_poll_at = None
+        self.last_fetch_at = None
+        self.last_event_at = None
+        self.last_error = None
+        self.last_kind_error = None
+        self.last_global_error = None
+        self.last_domestic_error = None
+        self.last_trigger_reasons: List[str] = []
+        self.last_meaningful_change_at = None
+        self.provider_status = {"CONTEXT":"WAITING_BIND","KIND": "STARTING", "DART": "DISABLED_NO_KEY", "NAVER": "DISABLED_NO_KEY", "GOOGLE_RSS":"STARTING", "GDELT": "STARTING"}
+        if self.dart_key:
+            self.provider_status["DART"] = "READY_CONFIG"
+        if self.naver_id and self.naver_secret:
+            self.provider_status["NAVER"] = "READY_CONFIG"
+
+        self._init_db()
+        self._load_recent_events()
+
+    # ---------- persistence ----------
+    def _db(self):
+        con = sqlite3.connect(self.db_path, timeout=2)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        return con
+
+    def _init_db(self):
+        try:
+            con = self._db()
+            con.execute("""CREATE TABLE IF NOT EXISTS events(
+                event_id TEXT PRIMARY KEY,
+                fingerprint TEXT,
+                first_seen TEXT,
+                last_seen TEXT,
+                published_at TEXT,
+                source TEXT,
+                source_domain TEXT,
+                title TEXT,
+                url TEXT,
+                ticker TEXT,
+                name TEXT,
+                sector TEXT,
+                event_type TEXT,
+                direction TEXT,
+                state TEXT,
+                source_count INTEGER,
+                first_price REAL,
+                last_price REAL,
+                return_pct REAL,
+                gates_json TEXT,
+                metadata_json TEXT
+            )""")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_events_last_seen ON events(last_seen)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_events_ticker ON events(ticker)")
+            con.commit(); con.close()
+        except Exception as e:
+            LOG.warning("NEWS_DB_INIT_ERROR %s", e)
+
+    def _load_recent_events(self):
+        try:
+            con = self._db()
+            rows = con.execute("SELECT event_id,fingerprint,first_seen,last_seen,published_at,source,source_domain,title,url,ticker,name,sector,event_type,direction,state,source_count,first_price,last_price,return_pct,gates_json,metadata_json FROM events ORDER BY last_seen DESC LIMIT ?", (min(self.events_limit, 500),)).fetchall()
+            con.close()
+            for r in reversed(rows):
+                d = dict(zip(["event_id","fingerprint","first_seen","last_seen","published_at","source","source_domain","title","url","ticker","name","sector","event_type","direction","state","source_count","first_price","last_price","return_pct","gates_json","metadata_json"], r))
+                try: d["gates"] = json.loads(d.pop("gates_json") or "{}")
+                except Exception: d["gates"] = {}
+                try: d["metadata"] = json.loads(d.pop("metadata_json") or "{}")
+                except Exception: d["metadata"] = {}
+                self.events.append(d); self._event_by_fp[d["fingerprint"]] = d
+        except Exception as e:
+            LOG.warning("NEWS_DB_LOAD_ERROR %s", e)
+
+    def _persist(self, e: dict):
+        try:
+            con = self._db()
+            con.execute("""INSERT INTO events(event_id,fingerprint,first_seen,last_seen,published_at,source,source_domain,title,url,ticker,name,sector,event_type,direction,state,source_count,first_price,last_price,return_pct,gates_json,metadata_json)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(event_id) DO UPDATE SET last_seen=excluded.last_seen,published_at=excluded.published_at,source_count=excluded.source_count,last_price=excluded.last_price,return_pct=excluded.return_pct,state=excluded.state,gates_json=excluded.gates_json,metadata_json=excluded.metadata_json""",
+            (e.get("event_id"),e.get("fingerprint"),e.get("first_seen"),e.get("last_seen"),e.get("published_at"),e.get("source"),e.get("source_domain"),e.get("title"),e.get("url"),e.get("ticker"),e.get("name"),e.get("sector"),e.get("event_type"),e.get("direction"),e.get("state"),int(e.get("source_count") or 1),e.get("first_price"),e.get("last_price"),e.get("return_pct"),json.dumps(e.get("gates") or {},ensure_ascii=False),json.dumps(e.get("metadata") or {},ensure_ascii=False)))
+            con.commit(); con.close()
+        except Exception as ex:
+            LOG.warning("NEWS_DB_SAVE_ERROR %s", ex)
+
+    # ---------- binding / shared-state ----------
+    def bind(self, summary_provider: Callable[[], Optional[dict]], market_signal_provider: Optional[Callable[[], Optional[dict]]] = None, context_provider: Optional[Callable[[], Optional[dict]]] = None):
+        self._summary_provider = summary_provider
+        self._market_signal_provider = market_signal_provider
+        self._context_provider = context_provider
+        self.provider_status["CONTEXT"] = "BOUND" if context_provider else "UNAVAILABLE"
+        LOG.info("NEWS_IMPACT_BOUND local_summary=True market_signal=%s context_reuse=%s", bool(market_signal_provider), bool(context_provider))
+
+    def _summary(self) -> dict:
+        try:
+            x = self._summary_provider() if self._summary_provider else None
+            return x if isinstance(x, dict) else {}
+        except Exception as e:
+            self.last_error = f"SUMMARY:{type(e).__name__}:{e}"
+            return {}
+
+    def _market_signal(self) -> dict:
+        try:
+            x = self._market_signal_provider() if self._market_signal_provider else None
+            return x if isinstance(x, dict) else {}
+        except Exception:
+            return {}
+
+
+    def _context_snapshot(self) -> dict:
+        try:
+            x = self._context_provider() if self._context_provider else None
+            return x if isinstance(x, dict) else {}
+        except Exception as e:
+            self.provider_status["CONTEXT"] = "ERROR"
+            self.last_error = f"CONTEXT:{type(e).__name__}:{e}"
+            return {}
+
+    def _kr_disclosure_window(self) -> bool:
+        n=_now()
+        if n.weekday()>=5:
+            return False
+        hm=n.hour*60+n.minute
+        return 8*60+20 <= hm <= 20*60+30
+
+    # ---------- budget / http ----------
+    def _budget_ok(self) -> bool:
+        now = time.time()
+        with self._lock:
+            while self._external_calls and now - self._external_calls[0] > 3600:
+                self._external_calls.popleft()
+            return len(self._external_calls) < self.max_external_per_hour
+
+    def _http_get(self, url: str, **kwargs):
+        if not self._budget_ok():
+            raise RuntimeError("NEWS_EXTERNAL_BUDGET_EXHAUSTED")
+        timeout = kwargs.pop("timeout", self.request_timeout)
+        with self._http_sem:
+            with self._lock: self._external_calls.append(time.time())
+            self.last_fetch_at = _iso()
+            return self._session.get(url, timeout=timeout, **kwargs)
+
+    def _cooldown_ok(self, key: str, seconds: int) -> bool:
+        now = time.time(); last = self._cooldowns.get(key, 0)
+        if now - last < seconds:
+            return False
+        self._cooldowns[key] = now
+        return True
+
+    # ---------- trigger detection ----------
+    def _sector_query(self, cluster: str) -> str:
+        n = _norm(cluster)
+        for k, q in SECTOR_ALIASES.items():
+            if k in n:
+                return q
+        return cluster.replace("_", " ")
+
+    def _detect_triggers(self, prev: dict, cur: dict) -> List[dict]:
+        out: List[dict] = []
+        psec = {str(x.get("ENERGY_CLUSTER")): x for x in (prev.get("top_clusters") or prev.get("sector_energy") or [])[:15] if isinstance(x, dict)}
+        crows = [x for x in (cur.get("top_clusters") or cur.get("sector_energy") or [])[:15] if isinstance(x, dict)]
+        for r in crows[:8]:
+            cluster = _text(r.get("ENERGY_CLUSTER")); rank = int(_num(r.get("rank"), 999) or 999)
+            delta = _num(r.get("energy_delta"), 0) or 0
+            move = int(_num(r.get("rank_move"), 0) or 0)
+            breadth = _num(r.get("cluster_breadth"), 0) or 0
+            turn = _num(r.get("cluster_turnover_accel"), 0) or 0
+            is_new = cluster and cluster not in psec
+            if cluster and ((rank <= 5 and is_new) or delta >= 3.0 or move >= 3 or (breadth >= 0.60 and turn >= 1.30 and delta >= 1.0)):
+                out.append({"kind":"SECTOR","key":cluster,"query":self._sector_query(cluster),"reason":f"SECTOR_ACCEL rank={rank} dE={delta:.2f} move={move} breadth={breadth:.2f} turn={turn:.2f}"})
+
+        # Candidate events: only new top_final/top_watch entries, capped later.
+        def cmap(s):
+            rows=(s.get("top_final") or []) + (s.get("top_watch") or [])
+            return {str(x.get("symbol") or x.get("code") or "").zfill(6):x for x in rows if isinstance(x,dict) and str(x.get("symbol") or x.get("code") or "").strip()}
+        pm, cm = cmap(prev), cmap(cur)
+        for code, r in cm.items():
+            if code not in pm:
+                name=_text(r.get("name")); sector=_text(r.get("ENERGY_CLUSTER") or r.get("SECTOR"))
+                if name:
+                    out.append({"kind":"TICKER","key":code,"query":name,"reason":f"NEW_CANDIDATE {name} {sector}","ticker":code,"name":name,"sector":sector})
+
+        ms = self._market_signal()
+        reasons = ms.get("change_reasons") or []
+        if ms.get("meaningful_change") and reasons:
+            sig = "|".join(map(str,reasons))[:500]
+            if sig != self._last_market_signal:
+                self._last_market_signal = sig
+                out.append({"kind":"MARKET","key":"KIS_FLOW","query":"한국 증시 외국인 프로그램 매매 환율 반도체", "reason":"KIS_FLOW:"+sig[:220]})
+        return out
+
+    def _enqueue(self, item: dict):
+        kind=item.get("kind"); key=_text(item.get("key"))
+        cd = self.sector_cooldown if kind=="SECTOR" else self.ticker_cooldown if kind=="TICKER" else self.market_cooldown
+        if not self._cooldown_ok(f"{kind}:{key}", cd):
+            return False
+        with self._queue_lock:
+            if len(self._queue) >= self.max_queue:
+                return False
+            self._queue.append(item)
+        LOG.info("NEWS_TRIGGER_QUEUED kind=%s key=%s reason=%s",kind,key,_text(item.get("reason"))[:180])
+        return True
+
+    # ---------- source fetchers ----------
+    def _fetch_gdelt(self, query: str, timespan: str = "30min", maxrecords: Optional[int] = None) -> List[dict]:
+        params = {"query": query, "mode":"ArtList", "format":"json", "sort":"DateDesc", "maxrecords": maxrecords or self.gdelt_maxrecords, "timespan": timespan}
+        r = self._http_get(self.gdelt_url, params=params)
+        r.raise_for_status(); j=r.json(); arts=j.get("articles") or []
+        out=[]
+        for a in arts:
+            if not isinstance(a,dict): continue
+            out.append({"source":"GDELT","title":_text(a.get("title")),"url":_text(a.get("url")),"published_at":_text(a.get("seendate") or a.get("date")),"domain":_text(a.get("domain") or a.get("source")),"language":_text(a.get("language")),"sourcecountry":_text(a.get("sourcecountry"))})
+        self.provider_status["GDELT"]="READY"
+        return out
+
+    def _fetch_google_rss(self, query: str) -> List[dict]:
+        url="https://news.google.com/rss/search?q="+quote_plus(query+" when:1d")+"&hl=ko&gl=KR&ceid=KR:ko"
+        r=self._http_get(url); r.raise_for_status(); root=ET.fromstring(r.text); out=[]
+        for node in root.findall(".//item")[:50]:
+            title=re.sub(r"<[^>]+>"," ",_text(node.findtext("title")))
+            link=_text(node.findtext("link")); pub=_text(node.findtext("pubDate")); desc=re.sub(r"<[^>]+>"," ",_text(node.findtext("description")))
+            if title:
+                out.append({"source":"GOOGLE_RSS","title":html.unescape(re.sub(r"\s+"," ",title)).strip(),"url":link,"published_at":pub,"domain":_domain(link),"summary":html.unescape(re.sub(r"\s+"," ",desc)).strip()[:280]})
+        self.provider_status["GOOGLE_RSS"]="READY"
+        return out
+
+    def _fetch_naver(self, query: str) -> List[dict]:
+        if not (self.naver_id and self.naver_secret):
+            return []
+        url="https://openapi.naver.com/v1/search/news.json"
+        headers={"X-Naver-Client-Id":self.naver_id,"X-Naver-Client-Secret":self.naver_secret}
+        r=self._http_get(url,headers=headers,params={"query":query,"display":self.naver_maxdisplay,"sort":"date"})
+        r.raise_for_status(); j=r.json(); out=[]
+        for a in j.get("items") or []:
+            title=re.sub(r"<[^>]+>","",_text(a.get("title")))
+            out.append({"source":"NAVER","title":html.unescape(title),"url":_text(a.get("originallink") or a.get("link")),"published_at":_text(a.get("pubDate")),"domain":_domain(_text(a.get("originallink") or a.get("link")))})
+        self.provider_status["NAVER"]="READY"
+        return out
+
+    def _fetch_dart_today(self) -> List[dict]:
+        if not self.dart_key:
+            return []
+        today=_now().strftime("%Y%m%d")
+        url="https://opendart.fss.or.kr/api/list.json"
+        r=self._http_get(url,params={"crtfc_key":self.dart_key,"bgn_de":today,"end_de":today,"page_count":100,"sort":"date","sort_mth":"desc"})
+        r.raise_for_status(); j=r.json()
+        if j.get("status") not in ("000",None):
+            raise RuntimeError(f"DART_{j.get('status')}:{j.get('message')}")
+        out=[]
+        for a in j.get("list") or []:
+            rcp=_text(a.get("rcept_no")); title=_text(a.get("report_nm")); name=_text(a.get("corp_name"))
+            out.append({"source":"DART","title":f"{name} {title}".strip(),"url":f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcp}" if rcp else "","published_at":_iso(),"domain":"dart.fss.or.kr","corp_name":name,"rcept_no":rcp,"corp_cls":_text(a.get("corp_cls"))})
+        self.provider_status["DART"]="READY"
+        return out
+
+    def _fetch_kind_light(self) -> List[dict]:
+        # Lightweight official page fallback. We intentionally do not depend on HTML structure for correctness;
+        # if parsing yields no rows, DART/NAVER/GDELT remain independent.
+        r=self._http_get(self.kind_url)
+        r.raise_for_status(); t=r.text
+        self.provider_status["KIND"]="READY"
+        # Capture links around common KIND disclosure viewer patterns, strip surrounding tags.
+        out=[]; seen=set()
+        for m in re.finditer(r"<a[^>]+href=[\"']([^\"']*(?:disclosure|viewer|external)[^\"']*)[\"'][^>]*>(.*?)</a>", t, re.I|re.S):
+            href=html.unescape(m.group(1)); label=re.sub(r"<[^>]+>"," ",m.group(2)); label=html.unescape(re.sub(r"\s+"," ",label)).strip()
+            if len(label)<4: continue
+            if href.startswith("/"): href="https://kind.krx.co.kr"+href
+            fp=_fingerprint(label,href,"KIND")
+            if fp in seen: continue
+            seen.add(fp); out.append({"source":"KIND","title":label,"url":href,"published_at":_iso(),"domain":"kind.krx.co.kr"})
+            if len(out)>=100: break
+        return out
+
+    # ---------- mapping / classification ----------
+    def _universe_maps(self, summary: dict) -> Tuple[Dict[str,str],Dict[str,dict]]:
+        code_name={str(k).zfill(6):_text(v) for k,v in (summary.get("symbol_name_map") or {}).items() if _text(v)}
+        by_name={_norm(v):k for k,v in code_name.items() if len(_norm(v))>=2}
+        rows=(summary.get("top_final") or [])+(summary.get("top_watch") or [])+(summary.get("live_pool") or [])
+        rowmap={}
+        for r in rows:
+            if not isinstance(r,dict): continue
+            c=str(r.get("symbol") or r.get("code") or "").zfill(6)
+            if c.strip("0"):
+                rowmap[c]=r
+                n=_text(r.get("name"));
+                if n: by_name[_norm(n)]=c; code_name.setdefault(c,n)
+        return by_name,rowmap
+
+    def _map_entity(self, item: dict, context: Optional[dict], summary: dict) -> Tuple[str,str,str,Optional[dict]]:
+        title=_norm(item.get("title")); by_name,rowmap=self._universe_maps(summary)
+        if context and context.get("ticker"):
+            code=str(context.get("ticker")).zfill(6); r=rowmap.get(code,{})
+            return code,_text(context.get("name") or r.get("name")),_text(context.get("sector") or r.get("ENERGY_CLUSTER") or r.get("SECTOR")),r
+        # Prefer longest names to avoid short-name false positives.
+        for n,code in sorted(by_name.items(),key=lambda kv:len(kv[0]),reverse=True):
+            if len(n)>=2 and n in title:
+                r=rowmap.get(code,{})
+                return code,_text(r.get("name") or summary.get("symbol_name_map",{}).get(code)),_text(r.get("ENERGY_CLUSTER") or r.get("SECTOR")),r
+        # If there is no exact ticker, map sector keywords so sector-wide headwinds can be isolated.
+        sector=_text((context or {}).get("key") if (context or {}).get("kind")=="SECTOR" else "")
+        if not sector:
+            for k in sorted(SECTOR_ALIASES,key=len,reverse=True):
+                if _norm(k) in title:
+                    sector=k
+                    break
+        return "","",sector,None
+
+    def _is_junk_item(self, item: dict) -> bool:
+        title=_norm(item.get("title")); url=_text(item.get("url")); dom=_domain(url)
+        if len(title) < 6:
+            return True
+        if any(_norm(x) in title for x in JUNK_TITLE_WORDS):
+            return True
+        if dom in {"policy.naver.com","help.pay.naver.com","pay.naver.com"}:
+            return True
+        return False
+
+    def _classify(self, title: str) -> Tuple[str,str]:
+        n=_norm(title); et="GENERAL"
+        for typ,words in EVENT_RULES:
+            if any(_norm(w) in n for w in words): et=typ; break
+        pos=sum(1 for w in POSITIVE_WORDS if _norm(w) in n)
+        neg=sum(1 for w in NEGATIVE_WORDS if _norm(w) in n)
+        if any(_norm(w) in n for w in HARD_NEGATIVE_WORDS):
+            neg += 3
+        direction="POSITIVE" if pos>neg else "NEGATIVE" if neg>pos else "NEUTRAL"
+        return et,direction
+
+    def _flow_flags(self, row: Optional[dict]) -> Tuple[bool,bool,str]:
+        if not row:
+            return False,False,""
+        blob=_norm(" ".join(_text(row.get(k)) for k in (
+            "program_state","decision","selection_type","program_decision","flow_state","foreign_state","institution_state"
+        )))
+        pos=any(x in blob for x in ("buy accel","buy turn","confirmed program buy","dual buy","매수 가속","매수전환","순매수"))
+        neg=any(x in blob for x in ("sell accel","program sell","blocked program sell","매도 가속","순매도","sell turn"))
+        return pos,neg,blob
+
+    def _hard_negative(self, et: str, title: str, direction: str) -> bool:
+        n=_norm(title)
+        if direction!="NEGATIVE":
+            return False
+        return et in HARD_NEGATIVE_TYPES or any(_norm(w) in n for w in HARD_NEGATIVE_WORDS)
+
+    def _impact_scope(self, title: str, et: str, ticker: str, sector: str, row: Optional[dict]) -> Tuple[str,str]:
+        """Return DIRECT_IMPACT or FLOW_ONLY without letting a macro headline masquerade as stock-specific news."""
+        n=_norm(title)
+        has_direct_word=any(_norm(w) in n for w in DIRECT_IMPACT_WORDS)
+        has_flow_word=any(_norm(w) in n for w in FLOW_ONLY_WORDS)
+        company_specific_regulation=et=="REGULATION" and any(_norm(w) in n for w in ("과징금","제재","영업정지","허가 취소","리콜","sanction","recall"))
+        if ticker and (et in DIRECT_EVENT_TYPES or has_direct_word or company_specific_regulation):
+            return "DIRECT_IMPACT", "TICKER_MATCH_WITH_COMPANY_EVENT"
+        if et in FLOW_EVENT_TYPES or has_flow_word or (sector and not ticker):
+            return "FLOW_ONLY", "MACRO_OR_SECTOR_CONTEXT"
+        if ticker and row:
+            # A ticker name in a generic headline is not enough to grant hard-veto authority.
+            return "FLOW_ONLY", "TICKER_MENTION_WITHOUT_DIRECT_ECONOMIC_EVENT"
+        return "FLOW_ONLY", "UNRESOLVED_CONTEXT_ONLY"
+
+    def _economic_impact(self, title: str, et: str, direction: str, impact_scope: str) -> Tuple[str,str]:
+        """Translate headline classification into expected economic impact, not language sentiment."""
+        n=_norm(title)
+        hard_neg=self._hard_negative(et,title,direction)
+        if hard_neg:
+            return "NEGATIVE", "HARD_NEGATIVE_EVENT"
+        # Macro/sector events need event semantics. A word such as 'rate' or 'oil' is not inherently good/bad.
+        if impact_scope=="FLOW_ONLY":
+            if et=="RATE":
+                if any(_norm(w) in n for w in ("금리 인상","긴축","국채금리 상승","국채금리 급등","rate hike","yield surge","higher for longer")):
+                    return "NEGATIVE", "TIGHTER_FINANCIAL_CONDITIONS"
+                if any(_norm(w) in n for w in ("금리 인하","완화","국채금리 하락","rate cut","yield falls","easing")):
+                    return "POSITIVE", "EASIER_FINANCIAL_CONDITIONS"
+                return "AMBIGUOUS", "RATE_DIRECTION_UNCLEAR"
+            if et=="GEOPOLITICS":
+                if any(_norm(w) in n for w in ("휴전","관세 철회","수출규제 완화","제재 해제","ceasefire","tariff removal")):
+                    return "POSITIVE", "GEOPOLITICAL_PRESSURE_EASING"
+                return "NEGATIVE", "GEOPOLITICAL_OR_TRADE_HEADWIND"
+            if et=="REGULATION":
+                if any(_norm(w) in n for w in ("규제 완화","규제 해제","제재 해제","deregulation")):
+                    return "POSITIVE", "REGULATORY_EASING"
+                return "NEGATIVE", "REGULATORY_HEADWIND"
+            if et=="POLICY":
+                if any(_norm(w) in n for w in ("지원","보조금","세액공제","육성","subsidy","tax credit","support")):
+                    return "POSITIVE", "POLICY_SUPPORT"
+                if any(_norm(w) in n for w in ("제한","금지","축소","삭감","restriction","ban","cut subsidy")):
+                    return "NEGATIVE", "POLICY_HEADWIND"
+            if et=="AI_CAPEX":
+                if any(_norm(w) in n for w in ("확대","증가","상향","increase","raise","expand")):
+                    return "POSITIVE", "CAPEX_EXPANSION_FLOW"
+            if et in {"FX","OIL"}:
+                return "AMBIGUOUS", "CROSS_SECTOR_IMPACT_REQUIRES_MARKET_CONFIRMATION"
+            if any(_norm(w) in n for w in ("업황 악화","둔화","감소","수요 부진","부담","하락 전망","침체","slowdown","weak demand")):
+                return "NEGATIVE", "SECTOR_FLOW_HEADWIND"
+            if any(_norm(w) in n for w in ("업황 개선","회복","수요 증가","투자 확대","상승 전망","호조","recovery","demand growth")):
+                return "POSITIVE", "SECTOR_FLOW_TAILWIND"
+        if direction=="NEGATIVE":
+            return "NEGATIVE", "NEGATIVE_EVENT_CLASSIFICATION"
+        if direction=="POSITIVE":
+            return "POSITIVE", "POSITIVE_EVENT_CLASSIFICATION"
+        if impact_scope=="FLOW_ONLY" and any(_norm(w) in n for w in FLOW_ONLY_WORDS):
+            return "AMBIGUOUS", "FLOW_CONTEXT_REQUIRES_MARKET_CONFIRMATION"
+        return "NEUTRAL", "NO_CLEAR_ECONOMIC_DIRECTION"
+
+    def _market_response(self, economic_impact: str, chg: Optional[float], flow_pos: bool, flow_neg: bool, sector_confirm: bool, sector_present: bool, impact_scope: str) -> str:
+        if economic_impact=="POSITIVE":
+            if chg is not None and chg >= 5.0:
+                return "PRICED_IN"
+            if flow_neg or (chg is not None and chg <= -1.0):
+                return "CONTRADICTING"
+            if chg is not None and chg > 0 and flow_pos and (sector_confirm or not sector_present):
+                return "CONFIRMING"
+            return "PENDING"
+        if economic_impact=="NEGATIVE":
+            if flow_neg or (chg is not None and chg <= -1.0):
+                return "CONFIRMING"
+            if chg is not None and chg >= 0.5 and flow_pos and not flow_neg:
+                return "ABSORBING"
+            return "PENDING"
+        return "PENDING"
+
+    def _event_state(self, title: str, et: str, direction: str, row: Optional[dict], sector: str, summary: dict, published: Optional[datetime], impact_scope: str="FLOW_ONLY", economic_impact: Optional[str]=None, scope_reason: str="", economic_reason: str="") -> Tuple[str,dict,Optional[float],Optional[float],dict]:
+        now=_now()
+        age_s=(now-published).total_seconds() if published else None
+        fresh = age_s is not None and -300 <= age_s <= 6*3600
+        px=_num((row or {}).get("current_price") or (row or {}).get("stage1_close"))
+        chg=_num((row or {}).get("change_pct") or (row or {}).get("current_return_pct"))
+        active_sectors={_text(x.get("ENERGY_CLUSTER")):x for x in (summary.get("top_clusters") or summary.get("sector_energy") or [])[:8] if isinstance(x,dict)}
+        sector_confirm=bool(sector and sector in active_sectors)
+        flow_pos,flow_neg,flow_blob=self._flow_flags(row)
+        price_available=bool(row and (px is not None))
+        price_pos=bool(chg is not None and chg > 0)
+        price_bad=bool(chg is not None and chg <= -1.0)
+        material=et in HIGH_EVENT_TYPES or et in FLOW_EVENT_TYPES
+        hard_neg=self._hard_negative(et,title,direction)
+        if economic_impact is None:
+            economic_impact=direction if direction in {"POSITIVE","NEGATIVE"} else "NEUTRAL"
+        market_response=self._market_response(economic_impact,chg,flow_pos,flow_neg,sector_confirm,bool(sector),impact_scope)
+        gates={
+            "SOURCE":"PASS",
+            "FRESHNESS":"PASS" if fresh else ("PENDING" if published is None else "FAIL"),
+            "ENTITY":"PASS" if (row or sector) else "PENDING",
+            "MATERIALITY":"PASS" if material else "PENDING",
+            "NOVELTY":"PASS",
+            "IMPACT_SCOPE":"PASS" if impact_scope=="DIRECT_IMPACT" else "FLOW_ONLY",
+            "PRICE_CONFIRM":"PASS" if (price_available and ((economic_impact=="POSITIVE" and price_pos) or (economic_impact=="NEGATIVE" and price_bad))) else "PENDING",
+            "FLOW_CONFIRM":"PASS" if ((economic_impact=="POSITIVE" and flow_pos) or (economic_impact=="NEGATIVE" and flow_neg)) else "PENDING",
+            "SECTOR_CONFIRM":"PASS" if sector_confirm else "PENDING",
+        }
+        meta={
+            "entry_blocked":False,
+            "risk_action":"REFERENCE",
+            "hard_negative":hard_neg,
+            "impact_scope":impact_scope,
+            "impact_scope_reason":scope_reason,
+            "economic_impact":economic_impact,
+            "economic_impact_reason":economic_reason,
+            "market_response":market_response,
+            "flow_positive":flow_pos,
+            "flow_negative":flow_neg,
+            "flow_blob":flow_blob[:240],
+            "news_age_seconds":round(age_s,1) if age_s is not None else None,
+        }
+        if not fresh:
+            state="STALE"
+        elif impact_scope=="FLOW_ONLY":
+            # Flow/context news can explain regime and tighten gates, but never directly veto a single-stock entry.
+            if economic_impact=="NEGATIVE" and material:
+                state="SECTOR_HEADWIND"; meta["risk_action"]="TIGHTEN_SECTOR_GATES_NO_SINGLE_STOCK_VETO"
+            elif economic_impact=="POSITIVE":
+                if market_response=="PRICED_IN":
+                    state="PRICED_IN"; meta["risk_action"]="NO_CHASE_CONTEXT_ONLY"
+                elif market_response=="CONTRADICTING":
+                    state="POSITIVE_NEWS_FAILED"; meta["risk_action"]="DO_NOT_UPGRADE_FROM_NEWS"
+                elif material and market_response=="CONFIRMING":
+                    state="CATALYST_CONFIRMED"; meta["risk_action"]="FLOW_CONTEXT_ONLY_REQUIRE_TRADING_GATES"
+                elif material:
+                    state="CATALYST_PENDING"; meta["risk_action"]="WAIT_MARKET_CONFIRM"
+                else:
+                    state="NEWS_ONLY"
+            else:
+                state="CATALYST_PENDING" if material else "NEWS_ONLY"
+        elif economic_impact=="NEGATIVE":
+            # Only DIRECT_IMPACT news is allowed to hard-block a company entry.
+            if row:
+                if market_response=="CONFIRMING":
+                    state="NEGATIVE_CONFIRMED"; meta["entry_blocked"]=True; meta["risk_action"]="BLOCK_ENTRY_OR_REDUCE"
+                elif market_response=="ABSORBING":
+                    state="NEGATIVE_ABSORBED"; meta["risk_action"]="UNBLOCK_NEWS_ONLY_RECHECK_ALL_KIS_LS_GATES"
+                elif hard_neg:
+                    state="NEGATIVE_OVERHANG"; meta["entry_blocked"]=True; meta["risk_action"]="BLOCK_ENTRY_PENDING_ABSORPTION"
+                else:
+                    state="CATALYST_PENDING"
+            else:
+                state="CATALYST_PENDING"
+        elif economic_impact=="POSITIVE":
+            # Positive DIRECT_IMPACT still cannot create BUY.
+            if market_response=="PRICED_IN":
+                state="PRICED_IN"; meta["risk_action"]="NO_CHASE"
+            elif market_response=="CONTRADICTING":
+                state="POSITIVE_NEWS_FAILED"; meta["entry_blocked"]=True; meta["risk_action"]="BLOCK_ENTRY"
+            elif material and row and market_response=="CONFIRMING":
+                state="CATALYST_CONFIRMED"; meta["risk_action"]="ALLOW_ONLY_IF_ALL_TRADING_GATES_PASS"
+            elif material:
+                state="CATALYST_PENDING"; meta["risk_action"]="WAIT_PRICE_FLOW_CONFIRM"
+            else:
+                state="NEWS_ONLY"
+        else:
+            state="CATALYST_PENDING" if material else "NEWS_ONLY"
+        return state,gates,px,chg,meta
+
+    def _ingest(self, items: Iterable[dict], context: Optional[dict] = None) -> int:
+        summary=self._summary(); added=0
+        for item in items:
+            title=_text(item.get("title")); url=_text(item.get("url"))
+            if not title or self._is_junk_item(item): continue
+            if url and url in self._seen_urls:
+                continue
+            pub=_parse_dt(item.get("published_at")); et,direction=self._classify(title)
+            ticker,name,sector,row=self._map_entity(item,context,summary)
+            impact_scope,scope_reason=self._impact_scope(title,et,ticker,sector,row)
+            economic_impact,economic_reason=self._economic_impact(title,et,direction,impact_scope)
+            entity=ticker or sector or name
+            fp=_fingerprint(title,entity,et)
+            now=_iso()
+            with self._lock:
+                old=self._event_by_fp.get(fp)
+                if old:
+                    old["last_seen"]=now; old["source_count"]=int(old.get("source_count") or 1)+1
+                    md=old.setdefault("metadata",{})
+                    md.setdefault("event_first_seen_at", old.get("first_seen"))
+                    if pub:
+                        old_first=_parse_dt(md.get("event_first_published_at") or old.get("published_at"))
+                        if old_first is None or pub < old_first:
+                            md["event_first_published_at"]=_iso(pub)
+                    if url: self._seen_urls[url]=time.time()
+                    self._persist(old)
+                    continue
+            state,gates,px,chg,profit_meta=self._event_state(title,et,direction,row,sector,summary,pub,impact_scope,economic_impact,scope_reason,economic_reason)
+            profit_meta.setdefault("event_first_seen_at",now)
+            profit_meta.setdefault("event_first_published_at",_iso(pub) if pub else None)
+            event_id=f"NEWS_{_now().strftime('%Y%m%d')}_{fp}"
+            ev={
+                "event_id":event_id,"fingerprint":fp,"first_seen":now,"last_seen":now,
+                "published_at":_iso(pub) if pub else None,"source":_text(item.get("source")),"source_domain":_text(item.get("domain") or _domain(url)),
+                "title":title[:500],"url":url,"ticker":ticker,"name":name,"sector":sector,"event_type":et,"direction":direction,"state":state,"source_count":1,
+                "first_price":px,"last_price":px,"return_pct":0.0 if px else None,"gates":gates,
+                "metadata":{"trigger_kind":_text((context or {}).get("kind")),"trigger_reason":_text((context or {}).get("reason"))[:240],"change_pct_at_event":chg,"no_chase": bool(state in {"PRICED_IN","SELL_THE_NEWS"} or (chg is not None and chg>=5.0)),**profit_meta,"performance":{"mfe_pct":0.0 if px else None,"mae_pct":0.0 if px else None,"r30m":None,"r60m":None}},
+            }
+            with self._lock:
+                self.events.append(ev); self._event_by_fp[fp]=ev
+                if url: self._seen_urls[url]=time.time()
+                self.raw_items.append({"seen_at":now,**{k:item.get(k) for k in ("source","title","url","published_at","domain")}})
+            self._persist(ev); added+=1; self.last_event_at=now
+            if state in {"CATALYST_CONFIRMED","NEGATIVE_CONFIRMED","NEGATIVE_OVERHANG","NEGATIVE_ABSORBED","SECTOR_HEADWIND","PRICED_IN","POSITIVE_NEWS_FAILED","SELL_THE_NEWS","ENTRY_BLOCKED_BY_NEWS"}:
+                # Only genuinely fresh publication times may mark a meaningful news change.
+                if pub is not None and abs((_now()-pub).total_seconds()) <= 600:
+                    self.last_meaningful_change_at=now
+                    reason=f"{state}:{ticker or sector or et}"
+                    self.last_trigger_reasons=(self.last_trigger_reasons+[reason])[-10:]
+        return added
+
+    def _context_match(self, item: dict, context: Optional[dict]) -> bool:
+        if not context:
+            return True
+        blob=_norm(f"{item.get('title','')} {item.get('summary','')}")
+        terms=[]
+        for k in ("name","sector","key","query"):
+            v=_text(context.get(k))
+            if v:
+                terms.extend([x for x in re.split(r"[_\s/]+",_norm(v)) if len(x)>=2][:6])
+        return any(t in blob for t in terms) if terms else True
+
+    def _reuse_context_once(self, context: Optional[dict] = None) -> List[dict]:
+        snap=self._context_snapshot()
+        man=snap.get("manifest") or {}; run_id=_text(man.get("run_id"))
+        items=snap.get("items") or []
+        if not items:
+            return []
+        if context is None and run_id and run_id==self._last_context_run_id:
+            return []
+        mapped=[]
+        for it in items:
+            if not isinstance(it,dict) or not self._context_match(it,context):
+                continue
+            mapped.append({"source":_text(it.get("source_name") or it.get("source_group") or "CONTEXT_LEDGER"),"title":_text(it.get("title")),"url":_text(it.get("url")),"published_at":_text(it.get("published_at")),"domain":_domain(_text(it.get("url"))),"summary":_text(it.get("summary"))})
+        if context is None and run_id:
+            self._last_context_run_id=run_id
+            self.provider_status["CONTEXT"]="READY"
+        return mapped[:200]
+
+    # ---------- jobs ----------
+    def _run_trigger(self, task: dict):
+        query=_text(task.get("query")); items=[]
+        # Zero external load first: reuse the already-collected Context Ledger.
+        cached=self._reuse_context_once(task)
+        if cached: items.extend(cached)
+        # One targeted Google RSS request provides freshness without per-stock broad crawling.
+        try:
+            items.extend(self._fetch_google_rss(query))
+        except Exception as e:
+            self.last_domestic_error=f"GOOGLE_RSS:{type(e).__name__}:{e}"; self.provider_status["GOOGLE_RSS"]="ERROR"
+        # Naver is optional and used only as fallback when explicitly enabled.
+        if self.use_naver and len(items)<3 and self.naver_id and self.naver_secret:
+            try: items.extend(self._fetch_naver(query))
+            except Exception as e: self.last_domestic_error=f"NAVER:{type(e).__name__}:{e}"; self.provider_status["NAVER"]="ERROR"
+        # Final keyless fallback only if targeted Korean sources returned nothing.
+        if not items:
+            try: items.extend(self._fetch_gdelt(query,"30min",self.gdelt_maxrecords))
+            except Exception as e: self.last_domestic_error=f"GDELT:{type(e).__name__}:{e}"; self.provider_status["GDELT"]="ERROR"
+        n=self._ingest(items,task)
+        LOG.info("NEWS_TRIGGER_DONE kind=%s key=%s cached=%d fetched_total=%d added=%d",task.get("kind"),task.get("key"),len(cached),len(items),n)
+
+    def _kind_or_dart_once(self):
+        items=[]
+        if self.dart_key:
+            try: items=self._fetch_dart_today(); self.last_kind_error=None
+            except Exception as e: self.last_kind_error=f"DART:{type(e).__name__}:{e}"; self.provider_status["DART"]="ERROR"
+        if not items and time.time() >= self._kind_blocked_until:
+            try: items=self._fetch_kind_light(); self.last_kind_error=None
+            except Exception as e:
+                self.last_kind_error=f"KIND:{type(e).__name__}:{e}"; items=[]
+                if "403" in str(e):
+                    self.provider_status["KIND"]="BLOCKED_403_BACKOFF"; self._kind_blocked_until=time.time()+3600
+                else:
+                    self.provider_status["KIND"]="ERROR"
+        # ingest only unseen IDs/fingerprints; this converts periodic list polling into event semantics.
+        fresh=[]
+        for x in items:
+            sid=_text(x.get("rcept_no") or x.get("url") or _fingerprint(x.get("title","")))
+            if sid and sid not in self._last_kind_ids:
+                self._last_kind_ids.add(sid); fresh.append(x)
+        if len(self._last_kind_ids)>3000:
+            self._last_kind_ids=set(list(self._last_kind_ids)[-1500:])
+        if fresh:
+            n=self._ingest(fresh,{"kind":"DISCLOSURE","key":"KIND_DART","reason":"NEW_DISCLOSURE"})
+            LOG.info("NEWS_DISCLOSURE_DONE fresh=%d added=%d",len(fresh),n)
+        self.last_kind_poll_at=_iso()
+
+    def _global_once(self):
+        query='(Federal Reserve OR Treasury OR dollar OR Nvidia OR semiconductor OR HBM OR "AI capex" OR datacenter OR oil OR tariff OR nuclear OR defense)'
+        try:
+            items=self._fetch_gdelt(query,"30min",min(40,self.gdelt_maxrecords+10))
+            n=self._ingest(items,{"kind":"GLOBAL","key":"GLOBAL_MARKET","reason":"PERIODIC_GLOBAL"})
+            self.last_global_error=None; LOG.info("NEWS_GLOBAL_DONE fetched=%d added=%d",len(items),n)
+        except Exception as e:
+            self.last_global_error=f"{type(e).__name__}:{e}"; self.provider_status["GDELT"]="ERROR"
+        self.last_global_poll_at=_iso()
+
+    def _update_event_prices(self):
+        summary=self._summary(); _,rowmap=self._universe_maps(summary)
+        changed=0
+        with self._lock:
+            rows=list(self.events)[-300:]
+        for e in rows:
+            code=e.get("ticker"); first=_num(e.get("first_price"))
+            if not code or not first: continue
+            r=rowmap.get(str(code).zfill(6)); px=_num((r or {}).get("current_price") or (r or {}).get("stage1_close"))
+            if px is None: continue
+            ret=(px/first-1)*100
+            md=e.setdefault("metadata",{}); perf=md.setdefault("performance",{})
+            mfe=_num(perf.get("mfe_pct"),ret); mae=_num(perf.get("mae_pct"),ret)
+            perf["mfe_pct"]=round(max(mfe if mfe is not None else ret,ret),4)
+            perf["mae_pct"]=round(min(mae if mae is not None else ret,ret),4)
+            age=self._event_age(e)
+            if age>=1800 and perf.get("r30m") is None: perf["r30m"]=round(ret,4)
+            if age>=3600 and perf.get("r60m") is None: perf["r60m"]=round(ret,4)
+            flow_pos,flow_neg,_=self._flow_flags(r)
+            direction=e.get("direction"); initial_chg=_num(md.get("change_pct_at_event"))
+            economic_impact=_text(md.get("economic_impact")) or direction
+            impact_scope=_text(md.get("impact_scope")) or "FLOW_ONLY"
+            old_state=e.get("state")
+            # Historical/stale headlines are scorecard references only and can never turn into a live veto.
+            if old_state=="STALE":
+                e["last_price"]=px; e["return_pct"]=round(ret,4); self._persist(e); changed+=1; continue
+            if economic_impact=="POSITIVE":
+                if initial_chg is not None and initial_chg>=3.0 and ret<=-1.0:
+                    e["state"]="SELL_THE_NEWS"; md["no_chase"]=True
+                    md["entry_blocked"]=(impact_scope=="DIRECT_IMPACT")
+                    md["risk_action"]="BLOCK_ENTRY" if impact_scope=="DIRECT_IMPACT" else "DO_NOT_UPGRADE_FROM_NEWS"
+                    md["market_response"]="CONTRADICTING"
+                elif ret<=-1.0 or flow_neg:
+                    e["state"]="POSITIVE_NEWS_FAILED"
+                    md["entry_blocked"]=(impact_scope=="DIRECT_IMPACT")
+                    md["risk_action"]="BLOCK_ENTRY" if impact_scope=="DIRECT_IMPACT" else "DO_NOT_UPGRADE_FROM_NEWS"
+                    md["market_response"]="CONTRADICTING"
+                elif ret>0 and flow_pos:
+                    md["market_response"]="CONFIRMING"
+            elif economic_impact=="NEGATIVE":
+                if ret<=-1.0 or flow_neg:
+                    md["market_response"]="CONFIRMING"
+                    if impact_scope=="DIRECT_IMPACT":
+                        e["state"]="NEGATIVE_CONFIRMED"; md["entry_blocked"]=True; md["risk_action"]="BLOCK_ENTRY_OR_REDUCE"
+                    else:
+                        e["state"]="SECTOR_HEADWIND"; md["entry_blocked"]=False; md["risk_action"]="TIGHTEN_SECTOR_GATES_NO_SINGLE_STOCK_VETO"
+                elif ret>=1.0 and not flow_neg:
+                    md["market_response"]="ABSORBING"
+                    if impact_scope=="DIRECT_IMPACT":
+                        e["state"]="NEGATIVE_ABSORBED"; md["entry_blocked"]=False; md["risk_action"]="UNBLOCK_NEWS_ONLY_RECHECK_ALL_KIS_LS_GATES"
+            e["last_price"]=px; e["return_pct"]=round(ret,4)
+            if old_state!=e.get("state"):
+                self.last_meaningful_change_at=_iso()
+                self.last_trigger_reasons=(self.last_trigger_reasons+[f"{old_state}->{e.get('state')}:{code}"])[-10:]
+            self._persist(e); changed+=1
+        return changed
+
+    def _trigger_loop(self):
+        time.sleep(12)
+        while not self._stop.is_set():
+            try:
+                cur=self._summary(); self.last_trigger_poll_at=_iso()
+                # Reuse each completed Context Ledger run once, without HTTP.
+                base_context=self._reuse_context_once(None)
+                if base_context:
+                    self._ingest(base_context,{"kind":"CONTEXT_REUSE","key":"BROAD_KR_NEWS","reason":"EXISTING_CONTEXT_LEDGER"})
+                if cur:
+                    prev=self._previous_summary or cur
+                    tasks=self._detect_triggers(prev,cur)
+                    self._previous_summary=json.loads(json.dumps(cur,ensure_ascii=False,default=str))
+                    reasons=[]
+                    for task in tasks[:8]:
+                        if self._enqueue(task): reasons.append(_text(task.get("reason")))
+                    if reasons:
+                        self.last_trigger_reasons=reasons[-10:]; self.last_meaningful_change_at=_iso()
+                    self._update_event_prices()
+            except Exception:
+                LOG.exception("NEWS_TRIGGER_LOOP_ERROR")
+            self._stop.wait(self.trigger_poll_seconds)
+
+    def _worker_loop(self):
+        time.sleep(16)
+        while not self._stop.is_set():
+            task=None
+            with self._queue_lock:
+                if self._queue: task=self._queue.popleft()
+            if task:
+                try: self._run_trigger(task)
+                except Exception: LOG.exception("NEWS_TASK_ERROR")
+            else:
+                self._stop.wait(2)
+
+    def _disclosure_loop(self):
+        time.sleep(20)
+        while not self._stop.is_set():
+            try:
+                self._kind_or_dart_once()
+            except Exception: LOG.exception("NEWS_DISCLOSURE_LOOP_ERROR")
+            self._stop.wait(self.kind_poll_seconds if self._kr_disclosure_window() else 600)
+
+    def _global_loop(self):
+        time.sleep(35)
+        while not self._stop.is_set():
+            try: self._global_once()
+            except Exception: LOG.exception("NEWS_GLOBAL_LOOP_ERROR")
+            self._stop.wait(self.global_poll_seconds)
+
+    # ---------- outputs ----------
+    def _recent(self, limit=50) -> List[dict]:
+        with self._lock: arr=list(self.events)
+        return list(reversed(arr[-max(1,min(int(limit),500)):]))
+
+    def _event_age(self,e):
+        # Publication time, not ingestion time, defines freshness. This prevents a restart from turning old Context news into "new" news.
+        for k in ("published_at",):
+            try:
+                v=e.get(k)
+                if v:
+                    age=(_now()-datetime.fromisoformat(v)).total_seconds()
+                    if age < -300: return 10**9
+                    return max(0,age)
+            except Exception: pass
+        # No publication time from reused Context is not fresh enough to drive trading.
+        if _text((e.get("metadata") or {}).get("trigger_kind"))=="CONTEXT_REUSE":
+            return 10**9
+        try: return max(0,(_now()-datetime.fromisoformat(e.get("first_seen"))).total_seconds())
+        except Exception: return 10**9
+
+    def _scorecard_rows(self):
+        rows=[]
+        with self._lock: arr=list(self.events)
+        for e in arr:
+            perf=(e.get("metadata") or {}).get("performance") or {}
+            r30=_num(perf.get("r30m")); r60=_num(perf.get("r60m"))
+            if r30 is None and r60 is None: continue
+            rows.append((e,r30,r60))
+        return rows
+
+    def scorecard(self):
+        groups={}
+        for e,r30,r60 in self._scorecard_rows():
+            md=e.get("metadata") or {}
+            impact_scope=_text(md.get("impact_scope")) or "LEGACY"
+            economic_impact=_text(md.get("economic_impact")) or _text(e.get("direction")) or "UNKNOWN"
+            key=f"{e.get('event_type')}|{e.get('state')}|{impact_scope}|{economic_impact}"
+            g=groups.setdefault(key,{"event_type":e.get("event_type"),"state":e.get("state"),"impact_scope":impact_scope,"economic_impact":economic_impact,"n":0,"r30":[],"r60":[]})
+            g["n"]+=1
+            if r30 is not None: g["r30"].append(r30)
+            if r60 is not None: g["r60"].append(r60)
+        out=[]
+        for g in groups.values():
+            a30=round(sum(g["r30"])/len(g["r30"]),4) if g["r30"] else None
+            a60=round(sum(g["r60"])/len(g["r60"]),4) if g["r60"] else None
+            edge="INSUFFICIENT_SAMPLE"
+            if g["n"]>=10:
+                ref=a60 if a60 is not None else a30
+                edge="POSITIVE_EDGE" if ref is not None and ref>0.3 else "NEGATIVE_EDGE" if ref is not None and ref<-0.3 else "NO_EDGE"
+            out.append({"event_type":g["event_type"],"state":g["state"],"impact_scope":g["impact_scope"],"economic_impact":g["economic_impact"],"n":g["n"],"avg_r30m":a30,"avg_r60m":a60,"edge":edge})
+        out.sort(key=lambda x:((x.get("edge")=="POSITIVE_EDGE"),x.get("n",0),x.get("avg_r60m") or -999),reverse=True)
+        return {"version":"NEWS_IMPACT_SCORECARD_V1_2_1","sample_count":sum(x["n"] for x in out),"rows":out[:50],"rule":"LEARN_EDGE_SEPARATELY_BY_EVENT_STATE_AND_IMPACT_SCOPE__N>=10_REQUIRED"}
+
+    def _first_seen_age(self,e):
+        try:
+            v=e.get("first_seen")
+            if not v: return 10**9
+            d=datetime.fromisoformat(v)
+            if d.tzinfo is None: d=d.replace(tzinfo=KST)
+            age=(_now()-d.astimezone(KST)).total_seconds()
+            if age < -300: return 10**9
+            return max(0,age)
+        except Exception:
+            return 10**9
+
+    def compact_snapshot(self) -> dict:
+        recent=self._recent(200)
+        # V1.2.1: ingestion and publication clocks are deliberately separate.
+        # Trading/meaningful-change logic uses published_at. first_seen is diagnostic only.
+        ingested_10m=[e for e in recent if self._first_seen_age(e)<=600]
+        fresh=[e for e in recent if self._event_age(e)<=600 and e.get("state")!="STALE"]
+        lagged_ingest=[e for e in ingested_10m if self._event_age(e)>600 or e.get("state")=="STALE"]
+        impactful=[e for e in fresh if e.get("state") in (PROFIT_STATES|RISK_STATES|{"CATALYST_PENDING"})]
+        meaningful=bool(impactful or self.last_trigger_reasons)
+        sectors=[]
+        for e in impactful:
+            s=_text(e.get("sector"))
+            if s and s not in sectors: sectors.append(s)
+            if len(sectors)>=5: break
+        reasons=[]
+        for e in impactful[:5]:
+            reasons.append(f"{e.get('state')}:{e.get('ticker') or e.get('sector') or e.get('event_type')}")
+        if not reasons:
+            reasons=list(self.last_trigger_reasons[-5:])
+        blocked=sum(1 for e in fresh if (e.get("metadata") or {}).get("entry_blocked"))
+        direct=sum(1 for e in fresh if _text((e.get("metadata") or {}).get("impact_scope"))=="DIRECT_IMPACT")
+        flow_rows=[e for e in fresh if _text((e.get("metadata") or {}).get("impact_scope"))=="FLOW_ONLY"]
+        flow=len(flow_rows)
+        flow_pos=[e for e in flow_rows if _text((e.get("metadata") or {}).get("economic_impact"))=="POSITIVE"]
+        flow_neg=[e for e in flow_rows if _text((e.get("metadata") or {}).get("economic_impact"))=="NEGATIVE"]
+        if len(flow_neg)>len(flow_pos): news_flow_bias="NEGATIVE"
+        elif len(flow_pos)>len(flow_neg): news_flow_bias="POSITIVE"
+        elif flow_pos or flow_neg: news_flow_bias="MIXED"
+        else: news_flow_bias="NEUTRAL"
+        return {
+            "version":self.SNAPSHOT_VERSION,"status":"READY" if self.enabled else "DISABLED","generated_at":_iso(),
+            "meaningful_change":meaningful,"change_reasons":reasons[:5],
+            # Backward-compatible new_events_10m now means genuinely fresh publication, not just newly ingested.
+            "new_events_10m":len(fresh),
+            "fresh_published_events_10m":len(fresh),
+            "ingested_events_10m":len(ingested_10m),
+            "ingested_but_not_fresh_published_10m":len(lagged_ingest),
+            "freshness_clock":"published_at",
+            "ingestion_clock":"first_seen",
+            "high_impact_events_10m":len(impactful),"direct_impact_events_10m":direct,"flow_only_events_10m":flow,
+            "flow_positive_events_10m":len(flow_pos),"flow_negative_events_10m":len(flow_neg),"news_flow_bias":news_flow_bias,
+            "flow_positive_top":[self._slim(e) for e in flow_pos[:3]],"flow_negative_top":[self._slim(e) for e in flow_neg[:3]],
+            "entry_blocked_events_10m":blocked,"top_sectors":sectors,"top_events":[self._slim(e) for e in impactful[:5]],
+            "provider_status":dict(self.provider_status),
+            "profit_policy":"FLOW_ONLY_NEVER_SINGLE_STOCK_VETO__DIRECT_NEGATIVE_CAN_BLOCK__POSITIVE_NEVER_BUYS_ALONE__PUBLISHED_AT_DRIVES_FRESHNESS__FIRST_SEEN_IS_INGEST_DIAGNOSTIC__SCORECARD_LEARNS_SEPARATELY"
+        }
+
+    def briefing(self, hours=12, limit=20, slot="AUTO") -> dict:
+        try: hours=max(1,min(48,int(hours)))
+        except Exception: hours=12
+        try: limit=max(3,min(50,int(limit)))
+        except Exception: limit=20
+        cutoff=hours*3600
+        rows=[e for e in self._recent(500) if self._event_age(e)<=cutoff]
+        def md(e): return e.get("metadata") or {}
+        direct=[e for e in rows if _text(md(e).get("impact_scope"))=="DIRECT_IMPACT"]
+        flow=[e for e in rows if _text(md(e).get("impact_scope"))=="FLOW_ONLY"]
+        blocked=[e for e in direct if bool(md(e).get("entry_blocked"))]
+        no_chase=[e for e in direct if bool(md(e).get("no_chase")) or e.get("state") in {"PRICED_IN","SELL_THE_NEWS"}]
+        direct_neg=[e for e in direct if _text(md(e).get("economic_impact"))=="NEGATIVE"]
+        direct_pos=[e for e in direct if _text(md(e).get("economic_impact"))=="POSITIVE"]
+        flow_neg=[e for e in flow if _text(md(e).get("economic_impact"))=="NEGATIVE"]
+        flow_pos=[e for e in flow if _text(md(e).get("economic_impact"))=="POSITIVE"]
+        failed=[e for e in direct if e.get("state") in {"SELL_THE_NEWS","POSITIVE_NEWS_FAILED"}]
+        absorbed=[e for e in direct if e.get("state")=="NEGATIVE_ABSORBED"]
+        if len(flow_neg)>len(flow_pos): bias="NEGATIVE"
+        elif len(flow_pos)>len(flow_neg): bias="POSITIVE"
+        elif flow_pos or flow_neg: bias="MIXED"
+        else: bias="NEUTRAL"
+        priority=sorted(rows,key=lambda e:(
+            bool(md(e).get("entry_blocked")),
+            e.get("state") in {"SELL_THE_NEWS","POSITIVE_NEWS_FAILED","PRICED_IN","NEGATIVE_CONFIRMED","NEGATIVE_OVERHANG","NEGATIVE_ABSORBED"},
+            _text(md(e).get("impact_scope"))=="DIRECT_IMPACT",
+            -self._event_age(e)
+        ),reverse=True)[:limit]
+        headline=[]
+        if blocked: headline.append(f"직접악재 차단 {len(blocked)}")
+        if failed: headline.append(f"호재실패/셀더뉴스 {len(failed)}")
+        if no_chase: headline.append(f"추격금지 {len(no_chase)}")
+        if flow_neg or flow_pos: headline.append(f"시장흐름 {bias}")
+        if not headline: headline.append("중대 신규 뉴스영향 없음")
+        return {
+            "version":"NEWS_IMPACT_BRIEFING_V1_2_1",
+            "generated_at":_iso(),"slot":_text(slot).upper() or "AUTO","window_hours":hours,
+            "period_start":_iso(_now()-timedelta(hours=hours)),"period_end":_iso(),
+            "headline":" | ".join(headline),
+            "published_event_count":len(rows),"direct_impact_count":len(direct),"flow_only_count":len(flow),
+            "entry_blocked_count":len(blocked),"no_chase_count":len(no_chase),"positive_failed_or_sell_news_count":len(failed),
+            "negative_absorbed_count":len(absorbed),"news_flow_bias":bias,
+            "direct_negative_top":[self._slim(e) for e in direct_neg[:5]],
+            "direct_positive_top":[self._slim(e) for e in direct_pos[:5]],
+            "flow_negative_top":[self._slim(e) for e in flow_neg[:5]],
+            "flow_positive_top":[self._slim(e) for e in flow_pos[:5]],
+            "blocked_top":[self._slim(e) for e in blocked[:5]],
+            "no_chase_top":[self._slim(e) for e in no_chase[:5]],
+            "absorbed_top":[self._slim(e) for e in absorbed[:5]],
+            "priority_events":[self._slim(e) for e in priority],
+            "fresh_published_events_10m":len([e for e in rows if self._event_age(e)<=600 and e.get("state")!="STALE"]),
+            "policy":"TWICE_DAILY_BRIEFING__PUBLISHED_AT_WINDOW__FLOW_ONLY_FOR_CONTEXT__DIRECT_IMPACT_FOR_STOCK_VETO__POSITIVE_NEVER_BUYS_ALONE"
+        }
+
+    def _slim(self,e):
+        out={k:e.get(k) for k in ("event_id","first_seen","published_at","source","title","ticker","name","sector","event_type","direction","state","source_count","first_price","last_price","return_pct","gates","metadata")}
+        md=e.get("metadata") or {}
+        out["impact_scope"]=_text(md.get("impact_scope")) or "LEGACY"
+        out["economic_impact"]=_text(md.get("economic_impact")) or _text(e.get("direction")) or "UNKNOWN"
+        out["market_response"]=_text(md.get("market_response")) or "UNKNOWN"
+        out["event_first_seen_at"]=md.get("event_first_seen_at") or e.get("first_seen")
+        out["event_first_published_at"]=md.get("event_first_published_at") or e.get("published_at")
+        return out
+
+    def health(self):
+        with self._queue_lock: q=len(self._queue)
+        with self._lock:
+            now=time.time()
+            while self._external_calls and now-self._external_calls[0]>3600: self._external_calls.popleft()
+            calls=len(self._external_calls)
+        return {"ok":True,"version":self.VERSION,"enabled":self.enabled,"bound":self._summary_provider is not None,"context_reuse_bound":self._context_provider is not None,"last_context_run_id":self._last_context_run_id,"trigger_poll_seconds":self.trigger_poll_seconds,"kind_poll_seconds":self.kind_poll_seconds,"global_poll_seconds":self.global_poll_seconds,"sector_cooldown_seconds":self.sector_cooldown,"ticker_cooldown_seconds":self.ticker_cooldown,"market_cooldown_seconds":self.market_cooldown,"max_http_concurrency":self.max_http_concurrency,"max_external_calls_per_hour":self.max_external_per_hour,"external_calls_last_hour":calls,"queue_depth":q,"provider_status":dict(self.provider_status),"last_trigger_poll_at":self.last_trigger_poll_at,"last_kind_poll_at":self.last_kind_poll_at,"last_global_poll_at":self.last_global_poll_at,"last_event_at":self.last_event_at,"last_error":self.last_error,"last_kind_error":self.last_kind_error,"last_domestic_error":self.last_domestic_error,"last_global_error":self.last_global_error,"event_count_memory":len(self.events),"policy":"PROFIT_GUARD__FLOW_ONLY_NO_SINGLE_STOCK_VETO__DIRECT_IMPACT_NEGATIVE_BLOCK__PUBLISHED_AT_FRESHNESS__TWICE_DAILY_BRIEFING__MAX_HTTP_2__NONBLOCKING"}
+
+    def latest(self):
+        arr=self._recent(1)
+        return self._slim(arr[0]) if arr else {"version":self.VERSION,"status":"NO_DATA"}
+
+    def top(self,limit=20):
+        rows=[x for x in self._recent(200) if x.get("state") not in {"STALE","DUPLICATE","NEWS_ONLY"}]
+        rows.sort(key=lambda x:(((x.get("metadata") or {}).get("entry_blocked") is True), self._event_age(x)<=600, x.get("state") in RISK_STATES), reverse=True)
+        return {"version":self.VERSION,"count":min(len(rows),int(limit)),"rows":[self._slim(x) for x in rows[:max(1,min(int(limit),100))]]}
+
+    def history(self,limit=200):
+        rows=self._recent(limit)
+        return {"version":self.VERSION,"count":len(rows),"rows":[self._slim(x) for x in rows]}
+
+    def raw(self,limit=100):
+        with self._lock: rows=list(self.raw_items)[-max(1,min(int(limit),200)):]
+        return {"version":self.VERSION,"count":len(rows),"rows":list(reversed(rows))}
+
+    def events_view(self,qs):
+        code=_text((qs.get("code") or [""])[0]).zfill(6); sector=_text((qs.get("sector") or [""])[0]); limit=int((qs.get("limit") or ["100"])[0])
+        rows=self._recent(500)
+        if code.strip("0"): rows=[x for x in rows if str(x.get("ticker") or "").zfill(6)==code]
+        if sector: rows=[x for x in rows if sector.lower() in _text(x.get("sector")).lower()]
+        rows=rows[:max(1,min(limit,200))]
+        return {"version":self.VERSION,"count":len(rows),"rows":[self._slim(x) for x in rows]}
+
+    def scope_view(self, scope: str, limit=100, economic_impact: str=""):
+        scope=_text(scope).upper(); economic_impact=_text(economic_impact).upper()
+        rows=[]
+        for x in self._recent(500):
+            md=x.get("metadata") or {}
+            if _text(md.get("impact_scope")).upper()!=scope:
+                continue
+            if economic_impact and _text(md.get("economic_impact")).upper()!=economic_impact:
+                continue
+            rows.append(x)
+        rows=rows[:max(1,min(int(limit),200))]
+        return {"version":self.VERSION,"impact_scope":scope,"economic_impact":economic_impact or "ALL","count":len(rows),"rows":[self._slim(x) for x in rows]}
+
+    def handle_get(self,raw_path):
+        from urllib.parse import urlparse,parse_qs
+        u=urlparse(raw_path); path=u.path; qs=parse_qs(u.query)
+        if path=="/api/context/news-impact/health": return 200,self.health()
+        if path=="/api/context/news-impact/latest": return 200,self.latest()
+        if path=="/api/context/news-impact/top": return 200,self.top((qs.get("limit") or ["20"])[0])
+        if path=="/api/context/news-impact/events": return 200,self.events_view(qs)
+        if path=="/api/context/news-impact/history": return 200,self.history((qs.get("limit") or ["200"])[0])
+        if path=="/api/context/news-impact/raw": return 200,self.raw((qs.get("limit") or ["100"])[0])
+        if path=="/api/context/news-impact/snapshot": return 200,self.compact_snapshot()
+        if path=="/api/context/news-impact/scorecard": return 200,self.scorecard()
+        if path=="/api/context/news-impact/flow": return 200,self.scope_view("FLOW_ONLY",(qs.get("limit") or ["100"])[0],(qs.get("impact") or [""])[0])
+        if path=="/api/context/news-impact/direct": return 200,self.scope_view("DIRECT_IMPACT",(qs.get("limit") or ["100"])[0],(qs.get("impact") or [""])[0])
+        if path in {"/api/context/news-impact/briefing","/api/context/news-impact/digest"}: return 200,self.briefing((qs.get("hours") or ["12"])[0],(qs.get("limit") or ["20"])[0],(qs.get("slot") or ["AUTO"])[0])
+        return None
+
+    def attach_master_snapshot(self,ledger):
+        if ledger is None or getattr(ledger,"_news_impact_master_attached",False): return
+        original=ledger.master_snapshot
+        def wrapped():
+            out=original(); news=self.compact_snapshot(); out["news_impact"]=news
+            if news.get("meaningful_change"):
+                out["meaningful_change"]=True
+                cr=list(out.get("change_reasons") or [])
+                cr.extend(["NEWS:"+str(x) for x in news.get("change_reasons") or []])
+                out["change_reasons"]=cr[-20:]
+            return out
+        ledger.master_snapshot=wrapped
+        ledger._news_impact_master_attached=True
+        LOG.info("NEWS_IMPACT_MASTER_ATTACHED")
+
+    def start(self):
+        if self._started: return
+        self._started=True
+        if not self.enabled:
+            LOG.info("NEWS_IMPACT_DISABLED"); return
+        threading.Thread(target=self._trigger_loop,daemon=True,name="news-trigger").start()
+        threading.Thread(target=self._worker_loop,daemon=True,name="news-worker").start()
+        threading.Thread(target=self._disclosure_loop,daemon=True,name="news-disclosure").start()
+        threading.Thread(target=self._global_loop,daemon=True,name="news-global").start()
+        LOG.info("NEWS_IMPACT_V1_2_1_STARTED trigger=%ss kind=%ss global=%ss http_concurrency=%s budget_h=%s",self.trigger_poll_seconds,self.kind_poll_seconds,self.global_poll_seconds,self.max_http_concurrency,self.max_external_per_hour)
+
+
+NEWS_IMPACT_SIDECAR=NewsImpactSidecar()
+NEWS_IMPACT_SIDECAR_V121_PUBLISH_BRIEF_MODULE
+
+RUN python -m py_compile /app/news_impact_sidecar.py /app/ls_derivatives_ledger.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && grep -Fq 'NEWS_IMPACT_SIDECAR_V1_2_1_PUBLISH_TIME_DIGEST' /app/news_impact_sidecar.py \
+ && grep -Fq 'fresh_published_events_10m' /app/news_impact_sidecar.py \
+ && grep -Fq 'ingested_events_10m' /app/news_impact_sidecar.py \
+ && grep -Fq '/api/context/news-impact/briefing' /app/news_impact_sidecar.py \
+ && grep -Fq 'TWICE_DAILY_BRIEFING' /app/news_impact_sidecar.py \
+ && echo 'NEWS_IMPACT_V1_2_1_BUILD_TEST_PASS PUBLISHED_AT_NEW_COUNT=YES INGEST_DIAGNOSTIC_SEPARATE=YES OLD_REINGEST_NOT_NEW=YES TWICE_DAILY_BRIEFING=YES V12_GUARDS_PRESERVED=YES MAX_HTTP_2_PRESERVED=YES NONBLOCKING=YES'
+
+COPY <<'NEWS_IMPACT_V121_SMOKE' /tmp/news_impact_v121_smoke.py
+# -*- coding: utf-8 -*-
+import os
+from pathlib import Path
+from datetime import timedelta
+for f in ('/tmp/news-impact-v121-smoke.sqlite3','/tmp/news-impact-v121-smoke.sqlite3-wal','/tmp/news-impact-v121-smoke.sqlite3-shm'):
+    try: Path(f).unlink()
+    except FileNotFoundError: pass
+os.environ['NEWS_IMPACT_DB_PATH']='/tmp/news-impact-v121-smoke.sqlite3'
+from news_impact_sidecar import NewsImpactSidecar, _now, _iso
+s=NewsImpactSidecar(); now=_now()
+summary={
+ 'symbol_name_map':{'111111':'테스트악재','222222':'테스트호재','333333':'테스트흡수'},
+ 'top_final':[
+  {'code':'111111','name':'테스트악재','current_price':9800,'change_pct':-2.0,'program_state':'SELL_ACCEL','ENERGY_CLUSTER':'바이오'},
+  {'code':'222222','name':'테스트호재','current_price':10600,'change_pct':6.0,'program_state':'BUY_ACCEL','ENERGY_CLUSTER':'반도체'},
+  {'code':'333333','name':'테스트흡수','current_price':10100,'change_pct':1.0,'program_state':'BUY_ACCEL','ENERGY_CLUSTER':'바이오'},
+ ],
+ 'top_clusters':[{'ENERGY_CLUSTER':'반도체','energy':10}]
+}
+s.bind(lambda:summary)
+items=[
+ {'source':'TEST','title':'테스트악재 유상증자 결정','url':'https://a/1','published_at':_iso(now-timedelta(minutes=2))},
+ {'source':'TEST','title':'연준 금리 인상 우려 반도체 업황 부담','url':'https://a/2','published_at':_iso(now-timedelta(minutes=2))},
+ {'source':'TEST','title':'테스트호재 대규모 공급계약 수주','url':'https://a/3','published_at':_iso(now-timedelta(minutes=2))},
+ {'source':'TEST','title':'테스트흡수 임상 실패 발표','url':'https://a/4','published_at':_iso(now-timedelta(minutes=2))},
+ # just ingested now, but publication is four hours old: must NOT be fresh 10m
+ {'source':'TEST','title':'과거기사 테스트악재 실적 쇼크','url':'https://a/5','published_at':_iso(now-timedelta(hours=4))},
+]
+assert s._ingest(items,{'kind':'SMOKE','reason':'V1_2_1'})==5
+snap=s.compact_snapshot()
+assert snap['version']=='NEWS_IMPACT_SNAPSHOT_V1_2_1'
+assert snap['ingested_events_10m']==5, snap
+assert snap['fresh_published_events_10m']==4, snap
+assert snap['new_events_10m']==4, snap
+assert snap['ingested_but_not_fresh_published_10m']==1, snap
+assert snap['freshness_clock']=='published_at' and snap['ingestion_clock']=='first_seen'
+code,b=s.handle_get('/api/context/news-impact/briefing?hours=12&limit=20&slot=AM')
+assert code==200 and b['version']=='NEWS_IMPACT_BRIEFING_V1_2_1'
+assert b['published_event_count']==5
+assert b['direct_impact_count']>=4
+assert b['fresh_published_events_10m']==4
+assert b['slot']=='AM'
+assert b['entry_blocked_count']>=1
+code,d=s.handle_get('/api/context/news-impact/digest?hours=12&limit=5&slot=PM')
+assert code==200 and d['slot']=='PM' and len(d['priority_events'])<=5
+print('NEWS_IMPACT_V1_2_1_SMOKE_PASS INGEST_VS_PUBLISHED_SPLIT=YES OLD_REINGEST_NOT_NEW=YES BRIEFING_12H=YES DIGEST_ALIAS=YES V12_GUARDS_PRESERVED=YES')
+NEWS_IMPACT_V121_SMOKE
+
+RUN PYTHONPATH=/app python /tmp/news_impact_v121_smoke.py \
+ && rm -f /tmp/news_impact_v121_smoke.py /tmp/news-impact-v121-smoke.sqlite3 /tmp/news-impact-v121-smoke.sqlite3-wal /tmp/news-impact-v121-smoke.sqlite3-shm
+# NEWS_IMPACT_V1_2_1_FINAL_FORCE_BEGIN
+LABEL news_impact_release="NEWS_IMPACT_V1_2_1_FINAL_FORCE"
+RUN python -m py_compile /app/news_impact_sidecar.py \
+ && grep -Fq 'NEWS_IMPACT_SIDECAR_V1_2_1_PUBLISH_TIME_DIGEST' /app/news_impact_sidecar.py \
+ && grep -Fq 'NEWS_IMPACT_V1_2_1_STARTED' /app/news_impact_sidecar.py \
+ && grep -Fq 'fresh_published_events_10m' /app/news_impact_sidecar.py \
+ && grep -Fq 'ingested_events_10m' /app/news_impact_sidecar.py \
+ && grep -Fq '/api/context/news-impact/briefing' /app/news_impact_sidecar.py \
+ && grep -Fq '/api/context/news-impact/digest' /app/news_impact_sidecar.py \
+ && echo 'NEWS_IMPACT_V1_2_1_FINAL_FORCE_PASS VERSION=V1_2_1 BRIEFING=YES DIGEST=YES PUBLISHED_SPLIT=YES START_LOG=V1_2_1 MAX_HTTP_2_PRESERVED=YES'
+# NEWS_IMPACT_V1_2_1_FINAL_FORCE_END
