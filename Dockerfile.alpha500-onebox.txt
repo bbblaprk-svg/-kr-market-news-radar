@@ -19403,15 +19403,23 @@ class VWAPV11LSBacktest:
         return list(csv.DictReader(io.StringIO(txt)))
 
     def _build_events(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Build the complete +20% event universe from actual published daily rows.
+
+        2026-11-06 is no longer filled from a hand-written seed list.  The final
+        trading day must also exist in the published daily file; otherwise the
+        run stops rather than silently reporting a partial universe.
+        """
         events: list[dict[str, Any]] = []
         audit: list[dict[str, Any]] = []
         d = EVENT_START
-        while d <= date(2026, 11, 5):
+        while d <= EVENT_END:
             if d.weekday() >= 5:
                 d += timedelta(days=1)
                 continue
             try:
                 rows = self._fetch_daily_public(d)
+                if d == EVENT_END and not rows:
+                    raise RuntimeError("FINAL_EVENT_DAY_DAILY_UNAVAILABLE:2026-11-06")
                 n = 0
                 for r in rows:
                     code = str(r.get("종목코드") or r.get("srtnCd") or "").strip().zfill(6)
@@ -19433,39 +19441,15 @@ class VWAPV11LSBacktest:
                             "code": code, "name": name, "market": market,
                             "event_date": d.isoformat(), "prev_close": prev_close,
                             "day_high": high, "peak_pct": peak * 100.0,
-                            "source": "AIK_DAILY_HIGH",
+                            "source": "AIK_DAILY_HIGH_ACTUAL",
                         })
                         n += 1
                 audit.append({"date": d.isoformat(), "status": "OK", "rows": len(rows), "events": n})
             except Exception as exc:
                 audit.append({"date": d.isoformat(), "status": "ERROR", "error": f"{type(exc).__name__}: {exc}"})
+                if d == EVENT_END:
+                    raise
             d += timedelta(days=1)
-
-        # 11/06는 공개 장중 기록 seed -> LS t8410으로 재확인.
-        for code, name, market in KNOWN_1106_COMMON:
-            try:
-                daily = self.client.daily(code, date(2026, 11, 5), date(2026, 11, 6))
-                if daily.empty:
-                    audit.append({"date": "2026-11-06", "code": code, "name": name, "status": "LS_DAILY_EMPTY"})
-                    continue
-                q5 = daily[daily["date"] == "20261105"]
-                q6 = daily[daily["date"] == "20261106"]
-                if q5.empty or q6.empty:
-                    audit.append({"date": "2026-11-06", "code": code, "name": name, "status": "LS_DAILY_DATE_GAP", "dates": daily["date"].tolist()})
-                    continue
-                prev_close = float(q5.iloc[-1]["close"])
-                high = float(q6.iloc[-1]["high"])
-                peak = high / prev_close - 1.0 if prev_close > 0 else -1.0
-                if peak >= THRESHOLD:
-                    events.append({
-                        "code": code, "name": name, "market": market,
-                        "event_date": "2026-11-06", "prev_close": prev_close,
-                        "day_high": high, "peak_pct": peak * 100.0,
-                        "source": "PUBLIC_1106_SEED_REVALIDATED_LS_T8410",
-                    })
-                audit.append({"date": "2026-11-06", "code": code, "name": name, "status": "LS_REVALIDATED", "peak_pct": round(peak * 100.0, 3)})
-            except Exception as exc:
-                audit.append({"date": "2026-11-06", "code": code, "name": name, "status": "LS_REVALIDATE_ERROR", "error": f"{type(exc).__name__}: {exc}"})
 
         # event identity dedupe
         dedup: dict[tuple[str, str], dict[str, Any]] = {}
@@ -19735,19 +19719,1339 @@ p=Path("/app/오백종목_통합엔진_웹서비스_V1_0.py")
 s=p.read_text(encoding="utf-8")
 marker="VWAP_V1_1_LS_T8412_10D_BACKTEST_ROUTE_V1"
 if marker not in s:
-    future="from __future__ import annotations\n"
-    startup=VWAP_V11_LS_BT_PATCH_EOF
+    anchor="    def do_GET(self):\n        path = urlparse(self.path).path\n"
+    if anchor not in s:
+        raise SystemExit("VWAP_V11_ROUTE_ANCHOR_NOT_FOUND")
+    repl="""    def do_GET(self):
+        path = urlparse(self.path).path
+        # VWAP_V1_1_LS_T8412_10D_BACKTEST_ROUTE_V1
+        if path.startswith("/api/research/vwap-v11/"):
+            try:
+                from vwap_v11_ls_t8412_backtest import VWAP_V11_BACKTEST
+                _vw = VWAP_V11_BACKTEST.handle_get(self.path)
+                if _vw is not None:
+                    return self._json(_vw[0], _vw[1])
+            except Exception as _vw_err:
+                return self._json(500, {"error": f"VWAP_V11_BACKTEST: {type(_vw_err).__name__}: {_vw_err}"})
+"""
+    s=s.replace(anchor,repl,1)
+    p.write_text(s,encoding="utf-8")
+print("VWAP_V11_LS_BT_PATCH_APPLIED")
+VWAP_V11_LS_BT_PATCH_EOF
 
 RUN python -m py_compile /app/VWAP_거래량_폭등탐지_V1_1.py /app/vwap_v11_ls_t8412_backtest.py /tmp/apply_vwap_v11_ls_bt.py \
  && python /tmp/apply_vwap_v11_ls_bt.py \
  && python -m py_compile /app/오백종목_통합엔진_웹서비스_V1_0.py \
  && grep -Fq 'VWAP_V1_1_LS_T8412_10D_BACKTEST_ROUTE_V1' /app/오백종목_통합엔진_웹서비스_V1_0.py \
- && grep -Fq 'VWAP_V1_1_LS_T8412_10D_BACKTEST_STARTUP_IMPORT_V1' /app/오백종목_통합엔진_웹서비스_V1_0.py \
- && PYTHONPATH=/app VWAP_V11_BT_AUTORUN_ON_IMPORT=false python -c "from vwap_v11_ls_t8412_backtest import VWAP_V11_BACKTEST,VERSION; c,b=VWAP_V11_BACKTEST.handle_get('/api/research/vwap-v11/health'); assert c==200 and b['version']==VERSION and b['policy']=='READ_ONLY_MANUAL_TRIGGER__NO_ORDER__NO_MAIN_ENGINE_MUTATION'; print('VWAP_V11_LS_T8412_10D_BACKTEST_SMOKE_PASS',b)"
+ && PYTHONPATH=/app python -c "from vwap_v11_ls_t8412_backtest import VWAP_V11_BACKTEST,VERSION; c,b=VWAP_V11_BACKTEST.handle_get('/api/research/vwap-v11/health'); assert c==200 and b['version']==VERSION and b['policy']=='READ_ONLY_MANUAL_TRIGGER__NO_ORDER__NO_MAIN_ENGINE_MUTATION'; print('VWAP_V11_LS_T8412_10D_BACKTEST_SMOKE_PASS',b)"
 
-# Runtime only: one-shot auto backtest. Persistent done-marker prevents repeat on restarts.
-ENV VWAP_V11_BT_AUTORUN_ON_IMPORT=true \
-    VWAP_V11_BT_AUTORUN_DELAY=12 \
-    VWAP_V11_BT_LS_INTERVAL=1.06
 LABEL vwap_v11_ls_10d_backtest="VWAP_V1_1_LS_T8412_10D_BT_V1_0"
 # VWAP_V1_1_LS_T8412_10D_BACKTEST_END
+
+# ============================================================================
+# VWAP V1.2 +20% PRE-DETECTION / LS t8412 RECENT-5D READ-ONLY BACKTEST
+# ============================================================================
+COPY <<'VWAP_V12_ENGINE_EOF' /app/VWAP_거래량_20pct_사전탐지_V1_2.py
+# -*- coding: utf-8 -*-
+"""
+VWAP 거래량 +20% 사전탐지 V1.2
+================================
+
+최상위 목적
+-----------
+이 엔진의 목적은 일반적인 VWAP 매매 신호를 많이 만드는 것이 아니다.
+
+    "전일 종가 대비 장중 +20% 이상 발산할 종목을,
+     가능하면 +0~+10% 구간에서 먼저 찾아낸다."
+
+따라서 V1.2는 V1.1의 구조를 목적에 맞게 재정렬한다.
+
+V1.2 핵심 변경
+--------------
+1) +10/+15/+20 목표를 '신호가격'이 아니라 '전일 종가' 기준으로 계산한다.
+2) 폭등 ACTION에서 일반 VWAP 눌림목/평균회귀 BUY를 완전히 분리한다.
+3) 폭등 단계는 다음 3단계로 분리한다.
+   - PRE_EXPLOSION      : 폭발 준비 관찰
+   - EARLY_ACTION       : +0~+10% 조기 진입 후보
+   - CONFIRMED_ACTION   : 거래량/가격 확장 확인
+4) +10% 초과 신규진입은 NO_CHASE로 차단한다.
+5) 거래량 절대배수뿐 아니라 거래량 증가속도(volume acceleration)를 사용한다.
+6) 가격 방향성(2봉 모멘텀/연속 상승), 응축→해제, PRE 반복발생을 결합한다.
+7) EARLY_ACTION은 점수제가 아니라 필수 게이트 조합으로 만든다.
+8) +20% 도달 직전 신호를 성공으로 과대평가하지 않도록
+   +7% 이하 EARLY_HIT / +10% 이하 GOOD_HIT / 그 이후 LATE/CHASE로 분리한다.
+9) winner-only Recall뿐 아니라 전체 신호의 +20% 도달 Precision을 측정하는
+   backtest_signal_precision() / backtest_universe_precision()을 추가한다.
+10) strict-before-touch 규칙 유지: 목표가를 터치한 동일 봉에서 확정된 신호는
+    사전포착으로 인정하지 않는다.
+
+데이터 요구
+-----------
+- 권장: 5분봉 OHLCV.
+- 여러 거래일 사용 시 session_col(예: date)이 필수에 가깝다.
+- 전일 종가는 다음 우선순위로 확보한다.
+  1) 입력 데이터의 prev_close 컬럼
+  2) session_col이 있을 경우 직전 세션 마지막 close
+- 전일 종가가 없으면 +20% 목적 정렬 신호는 생성하지 않는다.
+
+주의
+----
+- 주문 실행 기능은 포함하지 않는다.
+- 종목별로 evaluate_signals()를 호출하는 것이 기본이다.
+- 여러 종목이 한 DataFrame에 있으면 evaluate_universe()를 사용한다.
+- 거래량/가격만으로 +20%를 보장할 수 없다. 이 엔진은 '후보 압축' 엔진이며,
+  실제 실전 운용 시 섹터 breadth, 수급, 뉴스/재료, 시장상태를 후단 게이트로
+  결합할 수 있다.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Sequence
+import argparse
+import json
+
+import numpy as np
+import pandas as pd
+
+
+ENGINE_NAME = "VWAP_VOLUME_20PCT_PREDETECT"
+ENGINE_VERSION = "V1.2"
+
+
+@dataclass
+class VWAPConfig:
+    # 보조지표
+    rsi_period: int = 14
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+    volume_ma_period: int = 20
+    volume_min_periods: int = 3
+
+    # VWAP 주변 응축/박스
+    box_lookback: int = 8
+    box_max_width_pct: float = 0.035
+    near_vwap_pct: float = 0.012
+
+    # 장초 필터
+    min_bars_after_open: int = 3
+
+    # +20% 목적 정렬
+    event_target10_pct: float = 0.10
+    event_target15_pct: float = 0.15
+    event_target20_pct: float = 0.20
+    new_entry_gain_floor_pct: float = -0.01
+    new_entry_gain_ceiling_pct: float = 0.10
+    pre_gain_floor_pct: float = -0.03
+    pre_gain_ceiling_pct: float = 0.10
+    confirmed_gain_ceiling_pct: float = 0.15
+
+    # 손절/RR: 전일종가 +20% 목표까지의 잔여상승을 기준으로 계산
+    explosion_stop_cap_pct: float = 0.04
+    support_buffer_pct: float = 0.002
+    min_rr_to_event20: float = 1.50
+
+    # PRE_EXPLOSION 필수 게이트
+    pre_volume_ratio_min: float = 1.20
+    pre_rsi_min: float = 48.0
+    pre_near_vwap_ratio_min: float = 0.25
+
+    # EARLY_ACTION 게이트
+    early_volume_ratio_min: float = 1.35
+    volume_accel_min: float = 0.08
+    price_momentum_2bar_min: float = 0.003
+    repeat_window_bars: int = 6
+    repeat_min_count: int = 2
+    box_release_buffer_pct: float = 0.005
+
+    # CONFIRMED_ACTION 게이트
+    confirmed_volume_ratio_min: float = 1.80
+    confirmed_price_momentum_min: float = 0.002
+
+    # 타이밍 평가
+    early_hit_ceiling_pct: float = 0.07
+    good_hit_ceiling_pct: float = 0.10
+    late_hit_ceiling_pct: float = 0.15
+
+
+# -----------------------------------------------------------------------------
+# 기초 지표
+# -----------------------------------------------------------------------------
+
+def _require_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    required = ["open", "high", "low", "close", "volume"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"필수 컬럼 누락: {missing}")
+    out = df.copy()
+    for c in required:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
+
+
+def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50.0)
+
+
+def _macd(close: pd.Series, fast: int, slow: int, signal: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    line = ema_fast - ema_slow
+    sig = line.ewm(span=signal, adjust=False).mean()
+    hist = line - sig
+    return line, sig, hist
+
+
+def _session_vwap(group: pd.DataFrame) -> pd.DataFrame:
+    g = group.copy()
+    tp = (g["high"] + g["low"] + g["close"]) / 3.0
+    vol = g["volume"].clip(lower=0).fillna(0.0)
+    cum_v = vol.cumsum().replace(0, np.nan)
+    cum_pv = (tp * vol).cumsum()
+    cum_p2v = ((tp ** 2) * vol).cumsum()
+    vwap = cum_pv / cum_v
+    variance = (cum_p2v / cum_v) - (vwap ** 2)
+    sd = np.sqrt(variance.clip(lower=0))
+    g["typical_price"] = tp
+    g["vwap"] = vwap
+    g["vwap_sd"] = sd
+    g["vwap_u1"] = vwap + sd
+    g["vwap_l1"] = vwap - sd
+    g["vwap_u2"] = vwap + 2 * sd
+    g["vwap_l2"] = vwap - 2 * sd
+    return g
+
+
+def _group_shift(x: pd.DataFrame, col: str, periods: int, session_col: Optional[str]) -> pd.Series:
+    if session_col and session_col in x.columns:
+        return x.groupby(session_col, sort=False)[col].shift(periods)
+    return x[col].shift(periods)
+
+
+def _group_rolling_mean(
+    x: pd.DataFrame, col: str, window: int, min_periods: int, session_col: Optional[str]
+) -> pd.Series:
+    if session_col and session_col in x.columns:
+        return x.groupby(session_col, sort=False)[col].transform(
+            lambda s: s.rolling(window, min_periods=min_periods).mean()
+        )
+    return x[col].rolling(window, min_periods=min_periods).mean()
+
+
+def _group_prev_rolling(
+    x: pd.DataFrame,
+    col: str,
+    window: int,
+    session_col: Optional[str],
+    kind: str,
+) -> pd.Series:
+    minp = max(3, window // 2)
+    def calc(s: pd.Series) -> pd.Series:
+        z = s.shift(1).rolling(window, min_periods=minp)
+        return z.max() if kind == "max" else z.min()
+    if session_col and session_col in x.columns:
+        return x.groupby(session_col, sort=False)[col].transform(calc)
+    return calc(x[col])
+
+
+def _previous_session_close(x: pd.DataFrame, session_col: str) -> pd.Series:
+    sessions = list(pd.unique(x[session_col]))
+    closes = x.groupby(session_col, sort=False)["close"].last()
+    prev_map: Dict[object, float] = {}
+    for i, s in enumerate(sessions):
+        prev_map[s] = np.nan if i == 0 else float(closes.loc[sessions[i - 1]])
+    return x[session_col].map(prev_map).astype(float)
+
+
+def add_indicators(
+    df: pd.DataFrame,
+    config: Optional[VWAPConfig] = None,
+    session_col: Optional[str] = None,
+) -> pd.DataFrame:
+    cfg = config or VWAPConfig()
+    x = _require_ohlcv(df)
+
+    if session_col and session_col in x.columns:
+        parts = []
+        for _, g in x.groupby(session_col, sort=False, group_keys=False):
+            parts.append(_session_vwap(g))
+        x = pd.concat(parts).sort_index()
+        x["bar_no"] = x.groupby(session_col, sort=False).cumcount() + 1
+        x["vwap_slope"] = x.groupby(session_col, sort=False)["vwap"].diff()
+    else:
+        x = _session_vwap(x)
+        x["bar_no"] = np.arange(1, len(x) + 1)
+        x["vwap_slope"] = x["vwap"].diff()
+
+    # 전일 종가: 입력 prev_close 우선, 없으면 직전 세션 종가
+    if "prev_close" in x.columns:
+        x["prev_close_ref"] = pd.to_numeric(x["prev_close"], errors="coerce")
+    elif session_col and session_col in x.columns:
+        x["prev_close_ref"] = _previous_session_close(x, session_col)
+    else:
+        x["prev_close_ref"] = np.nan
+
+    x["gain_from_prev_close"] = x["close"] / x["prev_close_ref"].replace(0, np.nan) - 1.0
+    x["gain_from_prev_close_pct"] = x["gain_from_prev_close"] * 100.0
+
+    # 분봉 거래량 지표는 세션 경계에서 리셋해 전일 종가 직전 거래량과 섞이지 않게 함
+    x["volume_ma20"] = _group_rolling_mean(
+        x, "volume", cfg.volume_ma_period, cfg.volume_min_periods, session_col
+    )
+    x["volume_ratio"] = x["volume"] / x["volume_ma20"].replace(0, np.nan)
+    vr1 = _group_shift(x, "volume_ratio", 1, session_col)
+    vr2 = _group_shift(x, "volume_ratio", 2, session_col)
+    x["volume_accel_1"] = x["volume_ratio"] - vr1
+    x["volume_accel_2"] = x["volume_ratio"] - vr2
+    x["volume_speed_up"] = (
+        (x["volume_accel_1"] >= cfg.volume_accel_min)
+        | (x["volume_accel_2"] >= cfg.volume_accel_min * 1.5)
+    )
+
+    # RSI/MACD는 거래일 사이 연속성을 보존
+    x["rsi14"] = _rsi(x["close"], cfg.rsi_period)
+    macd, macd_sig, macd_hist = _macd(x["close"], cfg.macd_fast, cfg.macd_slow, cfg.macd_signal)
+    x["macd"] = macd
+    x["macd_signal"] = macd_sig
+    x["macd_hist"] = macd_hist
+    x["macd_hist_delta"] = x["macd_hist"] - _group_shift(x, "macd_hist", 1, session_col)
+
+    x["bullish"] = x["close"] > x["open"]
+    x["bearish"] = x["close"] < x["open"]
+    body = (x["close"] - x["open"]).abs()
+    candle_range = (x["high"] - x["low"]).replace(0, np.nan)
+    lower_wick = np.minimum(x["open"], x["close"]) - x["low"]
+    upper_wick = x["high"] - np.maximum(x["open"], x["close"])
+    x["doji"] = (body / candle_range) <= 0.15
+    x["hammer"] = (lower_wick >= body * 2.0) & (upper_wick <= body * 1.2)
+    x["shooting_star"] = (upper_wick >= body * 2.0) & (lower_wick <= body * 1.2)
+
+    x["rsi_cross_up_50"] = (x["rsi14"] > 50) & (x["rsi14"].shift(1) <= 50)
+    x["rsi_exit_oversold"] = (x["rsi14"] > 30) & (x["rsi14"].shift(1) <= 30)
+    x["macd_golden"] = (x["macd"] > x["macd_signal"]) & (
+        x["macd"].shift(1) <= x["macd_signal"].shift(1)
+    )
+
+    near = ((x["close"] - x["vwap"]).abs() / x["vwap"].replace(0, np.nan)) <= cfg.near_vwap_pct
+    x["near_vwap"] = near
+    x["box_high_prev"] = _group_prev_rolling(x, "high", cfg.box_lookback, session_col, "max")
+    x["box_low_prev"] = _group_prev_rolling(x, "low", cfg.box_lookback, session_col, "min")
+    roll_mid = ((x["box_high_prev"] + x["box_low_prev"]) / 2).replace(0, np.nan)
+    x["box_width_pct"] = (x["box_high_prev"] - x["box_low_prev"]) / roll_mid
+    x["box_compressed"] = x["box_width_pct"] <= cfg.box_max_width_pct
+
+    if session_col and session_col in x.columns:
+        x["near_vwap_ratio"] = x.groupby(session_col, sort=False)["near_vwap"].transform(
+            lambda s: s.astype(float).shift(1).rolling(cfg.box_lookback, min_periods=3).mean()
+        )
+    else:
+        x["near_vwap_ratio"] = x["near_vwap"].astype(float).shift(1).rolling(
+            cfg.box_lookback, min_periods=3
+        ).mean()
+
+    c1 = _group_shift(x, "close", 1, session_col)
+    c2 = _group_shift(x, "close", 2, session_col)
+    x["price_momentum_1bar"] = x["close"] / c1.replace(0, np.nan) - 1.0
+    x["price_momentum_2bar"] = x["close"] / c2.replace(0, np.nan) - 1.0
+    x["price_direction_up"] = (
+        (x["price_momentum_2bar"] >= cfg.price_momentum_2bar_min)
+        & (x["close"] >= c1)
+    )
+
+    # 직전 박스 상단 근접/돌파: 너무 늦은 완전 돌파만 기다리지 않기 위한 조기 구조
+    x["near_box_release"] = (
+        x["box_high_prev"].notna()
+        & (x["close"] >= x["box_high_prev"] * (1 - cfg.box_release_buffer_pct))
+    )
+    x["vwap_strength"] = (x["close"] >= x["vwap"]) & (x["vwap_slope"] > 0)
+
+    return x
+
+
+# -----------------------------------------------------------------------------
+# 위험/목표 계산
+# -----------------------------------------------------------------------------
+
+def _rr(entry: float, stop: float, target: float, side: str = "LONG") -> float:
+    vals = [entry, stop, target]
+    if not all(np.isfinite(v) for v in vals):
+        return np.nan
+    if side == "LONG":
+        risk = entry - stop
+        reward = target - entry
+    else:
+        risk = stop - entry
+        reward = entry - target
+    if risk <= 0 or reward <= 0:
+        return np.nan
+    return reward / risk
+
+
+def _explosion_stop_row(r: pd.Series, cfg: VWAPConfig) -> float:
+    entry = float(r["close"])
+    candidates = [entry * (1 - cfg.explosion_stop_cap_pct)]
+    if pd.notna(r.get("vwap")) and float(r["vwap"]) < entry:
+        candidates.append(float(r["vwap"]) * (1 - cfg.support_buffer_pct))
+    if pd.notna(r.get("box_low_prev")) and float(r["box_low_prev"]) < entry:
+        candidates.append(float(r["box_low_prev"]) * (1 - cfg.support_buffer_pct))
+    stop = max(candidates)
+    return min(stop, entry * 0.999)
+
+
+def _rolling_bool_count(mask: pd.Series, x: pd.DataFrame, window: int, session_col: Optional[str]) -> pd.Series:
+    z = mask.fillna(False).astype(int)
+    if session_col and session_col in x.columns:
+        tmp = pd.DataFrame({"_z": z, "_s": x[session_col]}, index=x.index)
+        return tmp.groupby("_s", sort=False)["_z"].transform(
+            lambda s: s.rolling(window, min_periods=1).sum()
+        )
+    return z.rolling(window, min_periods=1).sum()
+
+
+# -----------------------------------------------------------------------------
+# +20% 사전탐지 본체
+# -----------------------------------------------------------------------------
+
+def evaluate_signals(
+    df: pd.DataFrame,
+    config: Optional[VWAPConfig] = None,
+    session_col: Optional[str] = None,
+) -> pd.DataFrame:
+    cfg = config or VWAPConfig()
+    x = add_indicators(df, cfg, session_col=session_col)
+
+    x["time_gate"] = x["bar_no"] >= cfg.min_bars_after_open
+    x["has_prev_close"] = x["prev_close_ref"].notna() & x["prev_close_ref"].gt(0)
+
+    # 전일 종가 기준 절대 목표가. V1.1의 신호가 기준 +20% 목표를 폐기한다.
+    x["event_target10"] = x["prev_close_ref"] * (1 + cfg.event_target10_pct)
+    x["event_target15"] = x["prev_close_ref"] * (1 + cfg.event_target15_pct)
+    x["event_target20"] = x["prev_close_ref"] * (1 + cfg.event_target20_pct)
+    x["upside_remaining_to20_pct"] = (x["event_target20"] / x["close"] - 1.0) * 100.0
+
+    x["explosion_stop"] = x.apply(lambda r: _explosion_stop_row(r, cfg), axis=1)
+    x["event_rr10"] = [
+        _rr(e, s, t, "LONG") for e, s, t in zip(x["close"], x["explosion_stop"], x["event_target10"])
+    ]
+    x["event_rr15"] = [
+        _rr(e, s, t, "LONG") for e, s, t in zip(x["close"], x["explosion_stop"], x["event_target15"])
+    ]
+    x["event_rr20"] = [
+        _rr(e, s, t, "LONG") for e, s, t in zip(x["close"], x["explosion_stop"], x["event_target20"])
+    ]
+    x["rr20_gate"] = x["event_rr20"].fillna(-np.inf) >= cfg.min_rr_to_event20
+
+    gain = x["gain_from_prev_close"]
+    x["pre_zone"] = gain.between(cfg.pre_gain_floor_pct, cfg.pre_gain_ceiling_pct, inclusive="both")
+    x["new_entry_zone"] = gain.between(
+        cfg.new_entry_gain_floor_pct, cfg.new_entry_gain_ceiling_pct, inclusive="both"
+    )
+    x["confirmed_zone"] = gain.between(0.0, cfg.confirmed_gain_ceiling_pct, inclusive="both")
+    x["no_chase"] = gain > cfg.new_entry_gain_ceiling_pct
+
+    compression_ready = (
+        x["box_compressed"].fillna(False)
+        | (x["near_vwap_ratio"].fillna(0) >= cfg.pre_near_vwap_ratio_min)
+    )
+    oscillator_ready = (x["rsi14"] >= cfg.pre_rsi_min) & (x["macd_hist"] >= 0)
+    volume_pre_ready = x["volume_ratio"].fillna(0) >= cfg.pre_volume_ratio_min
+
+    # PRE_EXPLOSION: 단순 VWAP 터치가 아니라, 목적 정렬 조건을 모두 통과해야 한다.
+    x["pre_explosion_long"] = (
+        x["time_gate"]
+        & x["has_prev_close"]
+        & x["pre_zone"]
+        & x["vwap_strength"].fillna(False)
+        & volume_pre_ready
+        & oscillator_ready
+        & compression_ready
+    )
+    x["pre_repeat_count"] = _rolling_bool_count(
+        x["pre_explosion_long"], x, cfg.repeat_window_bars, session_col
+    )
+    x["pre_repeated"] = x["pre_repeat_count"] >= cfg.repeat_min_count
+
+    # EARLY_ACTION: 거래량 증가속도 + 가격 방향성을 반드시 요구한다.
+    # 단, 거래량이 이미 강하게 폭발한 경우에는 accel 한 번의 노이즈를 완화한다.
+    early_volume_gate = (
+        (x["volume_ratio"].fillna(0) >= cfg.early_volume_ratio_min)
+        & (
+            x["volume_speed_up"].fillna(False)
+            | (x["volume_ratio"].fillna(0) >= cfg.confirmed_volume_ratio_min)
+        )
+    )
+    structure_release = (
+        x["near_box_release"].fillna(False)
+        | (x["close"] > x["vwap_u1"])
+        | x["pre_repeated"].fillna(False)
+    )
+    x["early_action_long"] = (
+        x["pre_explosion_long"]
+        & x["new_entry_zone"]
+        & early_volume_gate
+        & x["price_direction_up"].fillna(False)
+        & structure_release
+        & x["rr20_gate"]
+    )
+
+    # CONFIRMED_ACTION: 돌파 확정. +10% 이하면 신규진입 가능하지만,
+    # +10% 초과부터는 상태만 표시하고 NO_CHASE로 차단한다.
+    confirmed_breakout = (
+        (x["close"] > x["vwap_u1"])
+        & x["bullish"]
+        & (x["volume_ratio"].fillna(0) >= cfg.confirmed_volume_ratio_min)
+        & (x["price_momentum_2bar"].fillna(-np.inf) >= cfg.confirmed_price_momentum_min)
+        & (
+            x["box_compressed"].fillna(False)
+            | x["near_box_release"].fillna(False)
+            | x["pre_repeated"].fillna(False)
+        )
+    )
+    x["confirmed_action_long"] = (
+        x["time_gate"]
+        & x["has_prev_close"]
+        & x["confirmed_zone"]
+        & confirmed_breakout
+        & (x["event_rr20"].fillna(-np.inf) >= 1.0)
+    )
+
+    # 신규진입은 +10% 이하에서만. 일반 VWAP/평균회귀는 여기 섞지 않는다.
+    x["new_entry_eligible"] = (
+        (x["early_action_long"] | x["confirmed_action_long"])
+        & x["new_entry_zone"]
+        & (~x["no_chase"])
+    )
+
+    # V1.1 호환 컬럼. 의미는 V1.2 목적에 맞게 좁혀졌다.
+    x["explosion_setup_long"] = x["pre_explosion_long"]
+    x["explosion_watch_long"] = (
+        x["pre_explosion_long"] | x["early_action_long"] | x["confirmed_action_long"]
+    )
+    x["explosion_action_long"] = x["new_entry_eligible"]
+    x["action_long_breakout"] = x["confirmed_action_long"] & x["new_entry_zone"]
+    x["action_long_standard"] = False
+    x["action_long"] = x["new_entry_eligible"]
+
+    # 기존 일반 VWAP 구조는 진단용으로만 남기고 폭등 신호에는 사용하지 않는다.
+    x["legacy_vwap_touch_long"] = (
+        (x["low"] <= x["vwap"] * 1.002)
+        & (x["close"] >= x["vwap"])
+        & x["bullish"]
+        & (x["vwap_slope"] > 0)
+    )
+    x["legacy_meanrev_long"] = (
+        (x["low"] <= x["vwap_l2"])
+        & (x["close"] > x["vwap_l2"])
+        & (x["bullish"] | x["hammer"] | x["doji"])
+    )
+
+    stages: List[str] = []
+    signals: List[str] = []
+    reasons: List[str] = []
+
+    for _, r in x.iterrows():
+        if bool(r["confirmed_action_long"]) and bool(r["no_chase"]):
+            stage = "CONFIRMED_LATE_NO_CHASE"
+            signal = "NO_CHASE"
+        elif bool(r["confirmed_action_long"]):
+            stage = "CONFIRMED_ACTION"
+            signal = "BUY" if bool(r["new_entry_eligible"]) else "WATCH"
+        elif bool(r["early_action_long"]):
+            stage = "EARLY_ACTION"
+            signal = "BUY"
+        elif bool(r["pre_explosion_long"]):
+            stage = "PRE_EXPLOSION"
+            signal = "WATCH"
+        else:
+            stage = "NONE"
+            signal = "NONE"
+
+        why: List[str] = []
+        if not bool(r["has_prev_close"]): why.append("NO_PREV_CLOSE")
+        if bool(r["vwap_strength"]): why.append("VWAP_HOLD_UP")
+        if pd.notna(r["volume_ratio"]): why.append(f"VOLx{float(r['volume_ratio']):.2f}")
+        if bool(r["volume_speed_up"]): why.append("VOL_ACCEL")
+        if bool(r["price_direction_up"]): why.append("PRICE_DIR_UP")
+        if bool(r["box_compressed"]): why.append("COMPRESSED")
+        if bool(r["near_box_release"]): why.append("BOX_RELEASE_NEAR")
+        if bool(r["pre_repeated"]): why.append(f"PRE_REPEAT:{int(r['pre_repeat_count'])}")
+        if pd.notna(r["event_rr20"]): why.append(f"RR20:{float(r['event_rr20']):.2f}")
+        if pd.notna(r["gain_from_prev_close_pct"]):
+            why.append(f"GAIN:{float(r['gain_from_prev_close_pct']):.2f}%")
+        if bool(r["no_chase"]): why.append("NO_CHASE_GT10")
+
+        stages.append(stage)
+        signals.append(signal)
+        reasons.append("|".join(why))
+
+    x["explosion_stage"] = stages
+    x["signal"] = signals
+    x["strategy"] = x["explosion_stage"]
+    x["reason"] = reasons
+    return x
+
+
+def evaluate_universe(
+    df: pd.DataFrame,
+    symbol_col: str,
+    session_col: Optional[str] = None,
+    config: Optional[VWAPConfig] = None,
+) -> pd.DataFrame:
+    if symbol_col not in df.columns:
+        raise ValueError(f"symbol_col 누락: {symbol_col}")
+    parts: List[pd.DataFrame] = []
+    for _, g in df.groupby(symbol_col, sort=False):
+        parts.append(evaluate_signals(g.copy(), config=config, session_col=session_col))
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+
+# -----------------------------------------------------------------------------
+# 현재 의사결정/기록
+# -----------------------------------------------------------------------------
+
+def _safe_float(v):
+    try:
+        if pd.isna(v):
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def latest_decision(
+    df: pd.DataFrame,
+    config: Optional[VWAPConfig] = None,
+    session_col: Optional[str] = None,
+) -> Dict:
+    x = evaluate_signals(df, config=config, session_col=session_col)
+    if x.empty:
+        return {"engine": ENGINE_NAME, "version": ENGINE_VERSION, "signal": "NONE"}
+    r = x.iloc[-1]
+    return {
+        "engine": ENGINE_NAME,
+        "version": ENGINE_VERSION,
+        "objective": "전일종가 대비 +20% 발산 종목을 +0~+10%에서 사전포착",
+        "signal": str(r["signal"]),
+        "stage": str(r["explosion_stage"]),
+        "new_entry_eligible": bool(r["new_entry_eligible"]),
+        "no_chase": bool(r["no_chase"]),
+        "entry": _safe_float(r["close"]),
+        "prev_close": _safe_float(r["prev_close_ref"]),
+        "gain_from_prev_close_pct": _safe_float(r["gain_from_prev_close_pct"]),
+        "vwap": _safe_float(r["vwap"]),
+        "rsi14": _safe_float(r["rsi14"]),
+        "macd_hist": _safe_float(r["macd_hist"]),
+        "volume_ratio": _safe_float(r["volume_ratio"]),
+        "volume_accel_1": _safe_float(r["volume_accel_1"]),
+        "price_momentum_2bar_pct": None if _safe_float(r["price_momentum_2bar"]) is None else _safe_float(r["price_momentum_2bar"]) * 100,
+        "pre_repeat_count": int(r["pre_repeat_count"]) if pd.notna(r["pre_repeat_count"]) else 0,
+        "stop": _safe_float(r["explosion_stop"]),
+        "target10_prevclose": _safe_float(r["event_target10"]),
+        "target15_prevclose": _safe_float(r["event_target15"]),
+        "target20_prevclose": _safe_float(r["event_target20"]),
+        "rr_to20": _safe_float(r["event_rr20"]),
+        "upside_remaining_to20_pct": _safe_float(r["upside_remaining_to20_pct"]),
+        "reason": str(r["reason"]),
+    }
+
+
+def signal_history(
+    df: pd.DataFrame,
+    config: Optional[VWAPConfig] = None,
+    session_col: Optional[str] = None,
+    include_watch: bool = True,
+) -> pd.DataFrame:
+    x = evaluate_signals(df, config=config, session_col=session_col)
+    wanted = ["BUY", "NO_CHASE"] + (["WATCH"] if include_watch else [])
+    y = x[x["signal"].isin(wanted)].copy()
+    cols = [c for c in [
+        "datetime", "date", "time", "symbol", "code", "name",
+        "open", "high", "low", "close", "volume",
+        "prev_close_ref", "gain_from_prev_close_pct",
+        "vwap", "vwap_u1", "vwap_u2", "box_high_prev", "box_low_prev", "box_width_pct",
+        "volume_ratio", "volume_accel_1", "volume_accel_2",
+        "price_momentum_1bar", "price_momentum_2bar",
+        "rsi14", "macd_hist", "macd_hist_delta",
+        "pre_explosion_long", "early_action_long", "confirmed_action_long",
+        "new_entry_eligible", "no_chase", "pre_repeat_count",
+        "explosion_stage", "signal", "reason",
+        "explosion_stop", "event_target10", "event_target15", "event_target20",
+        "event_rr10", "event_rr15", "event_rr20", "upside_remaining_to20_pct",
+    ] if c in y.columns]
+    return y[cols]
+
+
+def checklist_latest(
+    df: pd.DataFrame,
+    config: Optional[VWAPConfig] = None,
+    session_col: Optional[str] = None,
+) -> Dict[str, object]:
+    x = evaluate_signals(df, config=config, session_col=session_col)
+    if x.empty:
+        return {}
+    r = x.iloc[-1]
+    return {
+        "전일종가 확보": bool(r["has_prev_close"]),
+        "+10% 이하 신규진입 구간": bool(r["new_entry_zone"]),
+        "VWAP HOLD + 상승": bool(r["vwap_strength"]),
+        "거래량 PRE 기준": bool(pd.notna(r["volume_ratio"]) and r["volume_ratio"] >= (config or VWAPConfig()).pre_volume_ratio_min),
+        "거래량 증가속도": bool(r["volume_speed_up"]),
+        "가격 방향성": bool(r["price_direction_up"]),
+        "응축/박스해제": bool(r["box_compressed"] or r["near_box_release"]),
+        "PRE 반복": bool(r["pre_repeated"]),
+        "+20% 잔여 RR": bool(r["rr20_gate"]),
+        "PRE_EXPLOSION": bool(r["pre_explosion_long"]),
+        "EARLY_ACTION": bool(r["early_action_long"]),
+        "CONFIRMED_ACTION": bool(r["confirmed_action_long"]),
+        "신규진입 가능": bool(r["new_entry_eligible"]),
+        "NO_CHASE": bool(r["no_chase"]),
+    }
+
+
+# -----------------------------------------------------------------------------
+# 백테스트: winner recall + 전체시장 precision
+# -----------------------------------------------------------------------------
+
+def _first_pos_where(mask: pd.Series) -> Optional[int]:
+    arr = np.flatnonzero(mask.fillna(False).astype(bool).to_numpy())
+    return int(arr[0]) if len(arr) else None
+
+
+def _signal_before_touch(day: pd.DataFrame, touch_pos: Optional[int], signal_col: str) -> Tuple[bool, Optional[int]]:
+    if touch_pos is None or touch_pos <= 0 or signal_col not in day.columns:
+        return False, None
+    before = day.iloc[:touch_pos]
+    pos = _first_pos_where(before[signal_col])
+    return (pos is not None), pos
+
+
+def _timing_class(gain_pct: Optional[float], cfg: VWAPConfig) -> str:
+    if gain_pct is None or not np.isfinite(gain_pct):
+        return "MISS"
+    g = gain_pct / 100.0
+    if g <= cfg.early_hit_ceiling_pct:
+        return "EARLY_HIT"
+    if g <= cfg.good_hit_ceiling_pct:
+        return "GOOD_HIT"
+    if g <= cfg.late_hit_ceiling_pct:
+        return "LATE_HIT"
+    return "CHASE_HIT"
+
+
+def backtest_target_detection(
+    df: pd.DataFrame,
+    session_col: str,
+    config: Optional[VWAPConfig] = None,
+    event_threshold_pct: float = 0.20,
+    target_pcts: Sequence[float] = (0.10, 0.15, 0.20),
+    prior_lookback_sessions: int = 5,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """+20% winner-only Recall과 조기 타이밍을 검증한다. 한 종목 기준 함수."""
+    if not session_col or session_col not in df.columns:
+        raise ValueError("backtest_target_detection에는 session_col이 필요합니다.")
+    cfg = config or VWAPConfig()
+    x = evaluate_signals(df, cfg, session_col=session_col).copy()
+    sessions = list(pd.unique(x[session_col]))
+    rows: List[Dict] = []
+
+    for i in range(1, len(sessions)):
+        session = sessions[i]
+        prev_session = sessions[i - 1]
+        day = x[x[session_col] == session].copy().reset_index(drop=True)
+        prev_day = x[x[session_col] == prev_session]
+        if day.empty or prev_day.empty:
+            continue
+        prev_close = float(prev_day.iloc[-1]["close"])
+        if not np.isfinite(prev_close) or prev_close <= 0:
+            continue
+        peak = float(day["high"].max())
+        peak_pct = peak / prev_close - 1.0
+        if peak_pct < event_threshold_pct:
+            continue
+
+        prior_sessions = sessions[max(0, i - prior_lookback_sessions):i]
+        prior = x[x[session_col].isin(prior_sessions)]
+        prior_pre = bool(prior["pre_explosion_long"].fillna(False).any())
+        prior_early = bool(prior["early_action_long"].fillna(False).any())
+        prior_confirmed = bool(prior["confirmed_action_long"].fillna(False).any())
+
+        row: Dict = {
+            "session": session,
+            "prev_session": prev_session,
+            "prev_close": prev_close,
+            "day_peak": peak,
+            "day_peak_pct": peak_pct * 100.0,
+            "prior5_pre": prior_pre,
+            "prior5_early_action": prior_early,
+            "prior5_confirmed": prior_confirmed,
+        }
+        for c in ["symbol", "code", "name"]:
+            if c in day.columns:
+                row[c] = day.iloc[0][c]
+
+        for pct in target_pcts:
+            label = str(int(round(pct * 100)))
+            threshold_price = prev_close * (1 + pct)
+            touch_pos = _first_pos_where(day["high"] >= threshold_price)
+            row[f"target{label}_price"] = threshold_price
+            row[f"target{label}_reached"] = touch_pos is not None
+            if touch_pos is not None:
+                tr = day.iloc[touch_pos]
+                row[f"target{label}_touch_bar_no"] = int(tr["bar_no"])
+                row[f"target{label}_touch_time"] = tr.get("time", tr.get("datetime", touch_pos))
+            else:
+                row[f"target{label}_touch_bar_no"] = None
+                row[f"target{label}_touch_time"] = None
+
+            for kind, col in [
+                ("pre", "pre_explosion_long"),
+                ("early_action", "early_action_long"),
+                ("confirmed", "confirmed_action_long"),
+                ("new_entry", "new_entry_eligible"),
+            ]:
+                hit, pos = _signal_before_touch(day, touch_pos, col)
+                row[f"pre{label}_{kind}"] = hit
+                if pos is None:
+                    row[f"pre{label}_{kind}_time"] = None
+                    row[f"pre{label}_{kind}_price"] = None
+                    row[f"pre{label}_{kind}_gain_pct"] = None
+                else:
+                    sr = day.iloc[pos]
+                    px = float(sr["close"])
+                    gp = (px / prev_close - 1.0) * 100.0
+                    row[f"pre{label}_{kind}_time"] = sr.get("time", sr.get("datetime", pos))
+                    row[f"pre{label}_{kind}_price"] = px
+                    row[f"pre{label}_{kind}_gain_pct"] = gp
+
+        primary_gain = row.get("pre20_new_entry_gain_pct")
+        row["primary_timing_class"] = _timing_class(primary_gain, cfg)
+        row["primary_success"] = row["primary_timing_class"] in {"EARLY_HIT", "GOOD_HIT"}
+        rows.append(row)
+
+    events = pd.DataFrame(rows)
+    summary_rows: List[Dict] = []
+    n = len(events)
+    if n:
+        summary_rows.append({"metric": "EVENTS_20PCT", "count": n, "denominator": n, "rate_pct": 100.0})
+        for label in ["10", "15", "20"]:
+            reached = events[f"target{label}_reached"].fillna(False)
+            denom = int(reached.sum())
+            for kind in ["pre", "early_action", "confirmed", "new_entry"]:
+                col = f"pre{label}_{kind}"
+                hits = int((events[col].fillna(False) & reached).sum())
+                summary_rows.append({
+                    "metric": f"PRE_{label}_{kind.upper()}",
+                    "count": hits,
+                    "denominator": denom,
+                    "rate_pct": 100.0 * hits / denom if denom else np.nan,
+                })
+        for cls in ["EARLY_HIT", "GOOD_HIT", "LATE_HIT", "CHASE_HIT", "MISS"]:
+            hits = int((events["primary_timing_class"] == cls).sum())
+            summary_rows.append({
+                "metric": f"TIMING_{cls}", "count": hits, "denominator": n,
+                "rate_pct": 100.0 * hits / n if n else np.nan,
+            })
+        for kind in ["pre", "early_action", "confirmed"]:
+            col = f"prior5_{kind}"
+            hits = int(events[col].fillna(False).sum())
+            summary_rows.append({
+                "metric": f"PRIOR_{prior_lookback_sessions}D_{kind.upper()}",
+                "count": hits, "denominator": n, "rate_pct": 100.0 * hits / n,
+            })
+    return events, pd.DataFrame(summary_rows)
+
+
+def backtest_signal_precision(
+    df: pd.DataFrame,
+    session_col: str,
+    config: Optional[VWAPConfig] = None,
+    horizon_sessions: int = 5,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    한 종목의 모든 EARLY/신규진입 신호를 분모로 두고 실제 +20% 이벤트 도달률을 계산한다.
+    same_day_20: 신호 발생 이후 같은 날 전일종가+20% 도달
+    future_Nd_20: 신호일 포함 향후 N거래일 이내 어느 날이든 그 날의 전일종가 대비 +20% 이벤트 발생
+    """
+    if session_col not in df.columns:
+        raise ValueError("backtest_signal_precision에는 session_col이 필요합니다.")
+    cfg = config or VWAPConfig()
+    x = evaluate_signals(df, cfg, session_col=session_col).copy()
+    sessions = list(pd.unique(x[session_col]))
+
+    event_by_session: Dict[object, bool] = {}
+    for i, s in enumerate(sessions):
+        day = x[x[session_col] == s]
+        if day.empty or i == 0:
+            event_by_session[s] = False
+            continue
+        prev = x[x[session_col] == sessions[i - 1]]
+        pc = float(prev.iloc[-1]["close"])
+        event_by_session[s] = bool(float(day["high"].max()) >= pc * 1.20)
+
+    rows: List[Dict] = []
+    for i, s in enumerate(sessions):
+        day = x[x[session_col] == s].copy().reset_index(drop=True)
+        if day.empty:
+            continue
+        hits = day[day["new_entry_eligible"].fillna(False)]
+        if hits.empty:
+            continue
+        sr = hits.iloc[0]
+        pos = int(hits.index[0])
+        target20 = float(sr["event_target20"]) if pd.notna(sr["event_target20"]) else np.nan
+        after = day.iloc[pos + 1:]
+        same_day = bool(np.isfinite(target20) and not after.empty and (after["high"] >= target20).any())
+        future_sessions = sessions[i:min(len(sessions), i + horizon_sessions + 1)]
+        future_event = any(bool(event_by_session.get(fs, False)) for fs in future_sessions)
+        row: Dict = {
+            "signal_session": s,
+            "signal_price": float(sr["close"]),
+            "signal_gain_pct": float(sr["gain_from_prev_close_pct"]),
+            "signal_stage": str(sr["explosion_stage"]),
+            "same_day_20": same_day,
+            f"future_{horizon_sessions}d_20": future_event,
+        }
+        for c in ["symbol", "code", "name"]:
+            if c in sr.index:
+                row[c] = sr[c]
+        rows.append(row)
+
+    detail = pd.DataFrame(rows)
+    if detail.empty:
+        return detail, pd.DataFrame(columns=["metric", "count", "denominator", "rate_pct"])
+    n = len(detail)
+    fcol = f"future_{horizon_sessions}d_20"
+    summary = pd.DataFrame([
+        {"metric": "SIGNALS", "count": n, "denominator": n, "rate_pct": 100.0},
+        {"metric": "PRECISION_SAME_DAY_20", "count": int(detail["same_day_20"].sum()), "denominator": n,
+         "rate_pct": 100.0 * float(detail["same_day_20"].mean())},
+        {"metric": f"PRECISION_FUTURE_{horizon_sessions}D_20", "count": int(detail[fcol].sum()), "denominator": n,
+         "rate_pct": 100.0 * float(detail[fcol].mean())},
+    ])
+    return detail, summary
+
+
+def backtest_universe_precision(
+    df: pd.DataFrame,
+    symbol_col: str,
+    session_col: str,
+    config: Optional[VWAPConfig] = None,
+    horizon_sessions: int = 5,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if symbol_col not in df.columns:
+        raise ValueError(f"symbol_col 누락: {symbol_col}")
+    details: List[pd.DataFrame] = []
+    for _, g in df.groupby(symbol_col, sort=False):
+        d, _ = backtest_signal_precision(
+            g.copy(), session_col=session_col, config=config, horizon_sessions=horizon_sessions
+        )
+        if not d.empty:
+            details.append(d)
+    detail = pd.concat(details, ignore_index=True) if details else pd.DataFrame()
+    if detail.empty:
+        return detail, pd.DataFrame(columns=["metric", "count", "denominator", "rate_pct"])
+    n = len(detail)
+    fcol = f"future_{horizon_sessions}d_20"
+    summary = pd.DataFrame([
+        {"metric": "UNIVERSE_SIGNALS", "count": n, "denominator": n, "rate_pct": 100.0},
+        {"metric": "UNIVERSE_PRECISION_SAME_DAY_20", "count": int(detail["same_day_20"].sum()), "denominator": n,
+         "rate_pct": 100.0 * float(detail["same_day_20"].mean())},
+        {"metric": f"UNIVERSE_PRECISION_FUTURE_{horizon_sessions}D_20", "count": int(detail[fcol].sum()), "denominator": n,
+         "rate_pct": 100.0 * float(detail[fcol].mean())},
+    ])
+    return detail, summary
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+
+def load_csv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    aliases = {
+        "시가": "open", "고가": "high", "저가": "low", "종가": "close", "거래량": "volume",
+        "전일종가": "prev_close",
+        "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume",
+    }
+    return df.rename(columns={k: v for k, v in aliases.items() if k in df.columns})
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="VWAP 거래량 +20% 사전탐지 V1.2")
+    p.add_argument("--csv", required=True, help="OHLCV CSV")
+    p.add_argument("--session-col", default=None, help="거래일 컬럼(예: date)")
+    p.add_argument("--symbol-col", default=None, help="여러 종목 CSV의 종목코드 컬럼")
+    p.add_argument("--out", default=None, help="전체 판정 CSV")
+    p.add_argument("--backtest", action="store_true", help="+20% winner Recall 백테스트")
+    p.add_argument("--precision-backtest", action="store_true", help="전체 신호 Precision 백테스트")
+    p.add_argument("--event-threshold", type=float, default=20.0)
+    p.add_argument("--lookback", type=int, default=5)
+    p.add_argument("--horizon", type=int, default=5)
+    p.add_argument("--backtest-out", default=None)
+    p.add_argument("--summary-out", default=None)
+    args = p.parse_args()
+
+    df = load_csv(args.csv)
+    if args.symbol_col:
+        result = evaluate_universe(df, symbol_col=args.symbol_col, session_col=args.session_col)
+        decision = {"engine": ENGINE_NAME, "version": ENGINE_VERSION, "rows": len(result), "mode": "UNIVERSE"}
+    else:
+        result = evaluate_signals(df, session_col=args.session_col)
+        decision = latest_decision(df, session_col=args.session_col)
+
+    print("=" * 84)
+    print(f"{ENGINE_NAME} {ENGINE_VERSION}")
+    print("OBJECTIVE: +20% 종목을 +0~+10%에서 사전포착 / +10% 초과 NO_CHASE")
+    print("=" * 84)
+    print(json.dumps(decision, ensure_ascii=False, indent=2, default=str))
+
+    if not args.symbol_col:
+        print("\n[체크리스트]")
+        for k, v in checklist_latest(df, session_col=args.session_col).items():
+            print(f"- {k}: {'PASS' if v else 'FAIL'}")
+
+    if args.out:
+        result.to_csv(args.out, index=False, encoding="utf-8-sig")
+        print(f"\n판정 저장: {args.out}")
+
+    if args.backtest:
+        if not args.session_col:
+            raise SystemExit("--backtest에는 --session-col이 필요합니다.")
+        if args.symbol_col:
+            ev_parts: List[pd.DataFrame] = []
+            for _, g in df.groupby(args.symbol_col, sort=False):
+                e, _ = backtest_target_detection(
+                    g.copy(), session_col=args.session_col,
+                    event_threshold_pct=args.event_threshold / 100.0,
+                    prior_lookback_sessions=args.lookback,
+                )
+                if not e.empty: ev_parts.append(e)
+            events = pd.concat(ev_parts, ignore_index=True) if ev_parts else pd.DataFrame()
+            # universe winner recall summary 재계산
+            if events.empty:
+                summary = pd.DataFrame()
+            else:
+                n = len(events)
+                summary = pd.DataFrame([
+                    {"metric": "EVENTS_20PCT", "count": n, "denominator": n, "rate_pct": 100.0},
+                    {"metric": "PRE_20_NEW_ENTRY", "count": int(events["pre20_new_entry"].fillna(False).sum()), "denominator": n,
+                     "rate_pct": 100.0 * float(events["pre20_new_entry"].fillna(False).mean())},
+                    {"metric": "EARLY_OR_GOOD_HIT", "count": int(events["primary_success"].fillna(False).sum()), "denominator": n,
+                     "rate_pct": 100.0 * float(events["primary_success"].fillna(False).mean())},
+                ])
+        else:
+            events, summary = backtest_target_detection(
+                df, session_col=args.session_col,
+                event_threshold_pct=args.event_threshold / 100.0,
+                prior_lookback_sessions=args.lookback,
+            )
+        print("\n[+20% WINNER RECALL]")
+        print("이벤트 없음" if summary.empty else summary.to_string(index=False))
+        if args.backtest_out:
+            events.to_csv(args.backtest_out, index=False, encoding="utf-8-sig")
+
+    if args.precision_backtest:
+        if not args.session_col:
+            raise SystemExit("--precision-backtest에는 --session-col이 필요합니다.")
+        if args.symbol_col:
+            detail, psum = backtest_universe_precision(
+                df, symbol_col=args.symbol_col, session_col=args.session_col, horizon_sessions=args.horizon
+            )
+        else:
+            detail, psum = backtest_signal_precision(
+                df, session_col=args.session_col, horizon_sessions=args.horizon
+            )
+        print("\n[전체 신호 PRECISION]")
+        print("신호 없음" if psum.empty else psum.to_string(index=False))
+
+    if args.summary_out:
+        # backtest와 precision을 동시에 켠 경우 마지막 계산 summary를 쓰지 않도록 명시적 통합
+        blocks = []
+        if args.backtest and 'summary' in locals() and not summary.empty:
+            q = summary.copy(); q.insert(0, "section", "WINNER_RECALL"); blocks.append(q)
+        if args.precision_backtest and 'psum' in locals() and not psum.empty:
+            q = psum.copy(); q.insert(0, "section", "SIGNAL_PRECISION"); blocks.append(q)
+        pd.concat(blocks, ignore_index=True).to_csv(args.summary_out, index=False, encoding="utf-8-sig") if blocks else pd.DataFrame().to_csv(args.summary_out, index=False)
+        print(f"요약 저장: {args.summary_out}")
+
+
+if __name__ == "__main__":
+    main()
+VWAP_V12_ENGINE_EOF
+
+COPY <<'VWAP_V12_LS_5D_BT_EOF' /app/vwap_v12_ls_t8412_5d_backtest.py
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import csv, io, json, os, re, threading, time, traceback
+from collections import Counter, defaultdict
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+import numpy as np
+import pandas as pd
+import requests
+
+KST=timezone(timedelta(hours=9))
+VERSION='VWAP_V1_2_LS_T8412_5D_BT_V1_0'
+EVENT_START=date(2026,11,2); EVENT_END=date(2026,11,6)
+FETCH_START=date(2026,10,23); FETCH_END=EVENT_END
+THRESHOLD=0.20
+DAILY_URL='https://aikstockdata.com/data/public/daily/quotes_{date}.csv'
+RESULT_ROOT=Path(os.getenv('VWAP_V12_BT_RESULT_DIR','/data/results/vwap_v12_ls_5d_backtest'))
+ENGINE_PATHS=[Path('/app/VWAP_거래량_20pct_사전탐지_V1_2.py'),Path('/app/vwap_v12.py')]
+EXCLUDE_TOKENS=('ETF','ETN','스팩','SPAC','리츠','REIT','인버스','레버리지')
+KNOWN_1106_COMMON=[
+ ('004540','깨끗한나라','KOSPI'),('335870','윙스풋','KOSDAQ'),('900100','파이온엑스','KOSDAQ'),
+ ('128540','에코캡','KOSDAQ'),('181710','NHN','KOSPI'),('004830','덕성','KOSPI')]
+
+def _num(v,default=None):
+    try:return float(str(v).replace(',','').strip()) if v not in (None,'') else default
+    except:return default
+
+def _ordinary(name):
+    s=str(name or '').strip(); u=s.upper().replace(' ','')
+    if not s or any(t.upper() in u for t in EXCLUDE_TOKENS): return False
+    if re.search(r'(우|우B|우C|우선주)$',s): return False
+    return True
+
+def _json_safe(v):
+    if isinstance(v,np.bool_): return bool(v)
+    if isinstance(v,np.integer): return int(v)
+    if isinstance(v,np.floating): return None if not np.isfinite(v) else float(v)
+    if isinstance(v,(pd.Timestamp,datetime,date)): return str(v)
+    if isinstance(v,dict): return {str(k):_json_safe(x) for k,x in v.items()}
+    if isinstance(v,(list,tuple)): return [_json_safe(x) for x in v]
+    try:
+        if pd.isna(v): return None
+    except: pass
+    return v
+
+class LSReadOnlyClient:
+    def __init__(self):
+        self.app_key=os.getenv('LS_APP_KEY','').strip(); self.app_secret=os.getenv('LS_APP_SECRET','').strip()
+        self.base=os.getenv('LS_BASE_URL','https://openapi.ls-sec.co.kr:8080').rstrip('/')
+        self.chart_path=os.getenv('LS_CHART_PATH','/stock/chart')
+        self.timeout=max(5.0,float(os.getenv('VWAP_V12_BT_LS_TIMEOUT','20')))
+        self.interval=max(1.02,float(os.getenv('VWAP_V12_BT_LS_INTERVAL','1.06')))
+        self.session=requests.Session(); self.token=None; self.expire_mono=0.0; self.last_call_mono=0.0; self.lock=threading.RLock()
+    @property
+    def configured(self): return bool(self.app_key and self.app_secret)
+    def _wait(self):
+        with self.lock:
+            gap=time.monotonic()-self.last_call_mono
+            if gap<self.interval: time.sleep(self.interval-gap)
+            self.last_call_mono=time.monotonic()
+    def _ensure_token(self):
+        with self.lock:
+            if self.token and time.monotonic()<self.expire_mono-60:return
+            if not self.configured: raise RuntimeError('LS_APP_KEY/LS_APP_SECRET 미설정')
+            last=None
+            for url in [self.base+'/oauth2/token',self.base+'/oauth2/tokenP']:
+                try:
+                    self._wait(); r=self.session.post(url,headers={'content-type':'application/x-www-form-urlencoded'},data={
+                        'grant_type':'client_credentials','appkey':self.app_key,'appsecretkey':self.app_secret,'scope':'oob'},timeout=self.timeout)
+                    if r.status_code!=200: last=f'{url} HTTP {r.status_code}: {r.text[:180]}'; continue
+                    j=r.json(); tok=j.get('access_token')
+                    if not tok: last=f'token missing:{j}'; continue
+                    self.token=str(tok); self.expire_mono=time.monotonic()+max(600,int(j.get('expires_in') or 86400)); return
+                except Exception as exc:last=f'{type(exc).__name__}:{exc}'
+            raise RuntimeError('LS token failure:'+str(last))
+    def _post(self,tr_cd,body,*,tr_cont='N',tr_cont_key=''):
+        self._ensure_token(); self._wait()
+        h={'content-type':'application/json; charset=UTF-8','authorization':f'Bearer {self.token}','tr_cd':tr_cd,'tr_cont':tr_cont,'tr_cont_key':tr_cont_key}
+        mac=os.getenv('LS_MAC_ADDRESS','').strip()
+        if mac:h['mac_address']=mac
+        r=self.session.post(self.base+self.chart_path,headers=h,json=body,timeout=self.timeout)
+        if r.status_code!=200: raise RuntimeError(f'LS {tr_cd} HTTP {r.status_code}: {r.text[:300]}')
+        j=r.json(); return j,{k.lower():v for k,v in r.headers.items()}
+    def daily(self,code,start,end):
+        body={'t8410InBlock':{'shcode':code,'gubun':'2','qrycnt':100,'sdate':start.strftime('%Y%m%d'),'edate':end.strftime('%Y%m%d'),'cts_date':'','comp_yn':'N','sujung':'Y'}}
+        j,_=self._post('t8410',body); out=[]
+        for z in j.get('t8410OutBlock1') or []:
+            try:out.append({'date':str(z.get('date') or ''),'open':float(z.get('open') or 0),'high':float(z.get('high') or 0),'low':float(z.get('low') or 0),'close':float(z.get('close') or 0),'volume':float(z.get('jdiff_vol') or 0)})
+            except:pass
+        return pd.DataFrame(out).sort_values('date').drop_duplicates('date') if out else pd.DataFrame()
+    def minute5(self,code,start,end,max_pages=3):
+        cts_date=cts_time=tr_cont_key=''; all_rows=[]; pages=[]; seen=set()
+        for page in range(1,max_pages+1):
+            body={'t8412InBlock':{'shcode':code,'ncnt':5,'qrycnt':500,'nday':'1','sdate':start.strftime('%Y%m%d'),'stime':'','edate':end.strftime('%Y%m%d'),'etime':'','cts_date':cts_date,'cts_time':cts_time,'comp_yn':'N'}}
+            j,h=self._post('t8412',body,tr_cont='Y' if cts_date or cts_time else 'N',tr_cont_key=tr_cont_key)
+            rows=j.get('t8412OutBlock1') or []; head=j.get('t8412OutBlock') or {}
+            for z in rows:
+                ds=str(z.get('date') or ''); ts=str(z.get('time') or '').zfill(6)
+                if len(ds)!=8 or len(ts)<4: continue
+                try:
+                    dt=pd.Timestamp(f'{ds[:4]}-{ds[4:6]}-{ds[6:]} {ts[:2]}:{ts[2:4]}:{ts[4:6]}',tz='Asia/Seoul')
+                    all_rows.append({'datetime':dt,'date':dt.strftime('%Y-%m-%d'),'time':dt.strftime('%H:%M'),'symbol':code,'code':code,
+                      'open':float(z.get('open') or 0),'high':float(z.get('high') or 0),'low':float(z.get('low') or 0),'close':float(z.get('close') or 0),'volume':float(z.get('jdiff_vol') or z.get('volume') or 0)})
+                except: continue
+            ncd=str(head.get('cts_date') or ''); nct=str(head.get('cts_time') or ''); nkey=str(h.get('tr_cont_key') or '')
+            pages.append({'page':page,'rows':len(rows),'cts_date':ncd,'cts_time':nct})
+            cur=(ncd,nct,nkey)
+            if not rows or (not ncd and not nct) or cur in seen: break
+            seen.add(cur); cts_date,cts_time,tr_cont_key=ncd,nct,nkey
+        df=pd.DataFrame(all_rows)
+        if not df.empty:
+            df=df[(df['date']>=start.isoformat())&(df['date']<=end.isoformat())].sort_values('datetime').drop_duplicates(['datetime'])
+        return df,{'pages':pages,'rows':int(len(df)),'min':None if df.empty else str(df['datetime'].min()),'max':None if df.empty else str(df['datetime'].max())}
+
+class VWAPV12LSBacktest:
+    def __init__(self):
+        self.lock=threading.Lock(); self.state_lock=threading.RLock(); self.client=LSReadOnlyClient()
+        self.state={'version':VERSION,'status':'IDLE','progress':None,'started_at':None,'finished_at':None,'error':None,'summary':None,'details':[],'data_audit':{}}
+    def _set(self,**kw):
+        with self.state_lock:self.state.update(kw)
+    def snapshot(self):
+        with self.state_lock:return _json_safe(dict(self.state))
+    @staticmethod
+    def _load_engine():
+        import importlib.util,sys
+        for p in ENGINE_PATHS:
+            if p.exists():
+                sp=importlib.util.spec_from_file_location('vwap_v12_runtime',p); mod=importlib.util.module_from_spec(sp); sys.modules['vwap_v12_runtime']=mod; sp.loader.exec_module(mod); return mod,str(p)
+        raise RuntimeError('VWAP V1.2 engine not found')
+    def _fetch_daily_public(self,ds):
+        r=requests.get(DAILY_URL.format(date=ds.strftime('%Y%m%d')),timeout=25,headers={'User-Agent':'VWAP-V1.2-LS-backtest/1.0'})
+        if r.status_code==404:return []
+        r.raise_for_status(); return list(csv.DictReader(io.StringIO(r.content.decode('utf-8-sig',errors='replace'))))
+    def _rows_to_events(self,rows,ds):
+        out=[]
+        for r in rows:
+            code=str(r.get('종목코드') or r.get('srtnCd') or '').strip().zfill(6); name=str(r.get('종목명') or r.get('itmsNm') or '').strip(); market=str(r.get('mrktCtg') or '').strip().upper()
+            if not re.fullmatch(r'\d{6}',code) or market not in {'KOSPI','KOSDAQ'} or not _ordinary(name):continue
+            close=_num(r.get('clpr')); vs=_num(r.get('vs')); high=_num(r.get('hipr'))
+            if close is None or vs is None or high is None:continue
+            pc=close-vs
+            if pc>0 and high/pc-1>=THRESHOLD: out.append({'code':code,'name':name,'market':market,'event_date':ds.isoformat(),'prev_close':pc,'day_high':high,'peak_pct':(high/pc-1)*100,'source':'AIK_DAILY_HIGH_ACTUAL'})
+        return out
+    def _fallback_1106(self):
+        out=[]
+        for code,name,market in KNOWN_1106_COMMON:
+            d=self.client.daily(code,date(2026,11,5),date(2026,11,6))
+            if len(d)<2:continue
+            prev=float(d[d['date']=='20261105']['close'].iloc[-1]) if (d['date']=='20261105').any() else float(d.iloc[-2]['close'])
+            cur=d[d['date']=='20261106'] if (d['date']=='20261106').any() else d.tail(1)
+            high=float(cur.iloc[-1]['high'])
+            if prev>0 and high/prev-1>=THRESHOLD:out.append({'code':code,'name':name,'market':market,'event_date':'2026-11-06','prev_close':prev,'day_high':high,'peak_pct':(high/prev-1)*100,'source':'LS_T8410_1106_FALLBACK'})
+        return out
+    def _build_events(self):
+        events=[]; audit=[]; complete=True; d=EVENT_START
+        while d<=EVENT_END:
+            if d.weekday()>=5:d+=timedelta(days=1);continue
+            try:
+                rows=self._fetch_daily_public(d)
+                ev=self._rows_to_events(rows,d)
+                if d==EVENT_END and not rows:
+                    ev=self._fallback_1106(); complete=False
+                    audit.append({'date':d.isoformat(),'status':'PARTIAL_FALLBACK','events':len(ev),'reason':'public daily file unavailable; six known common-stock limit-up names revalidated by LS t8410'})
+                else:audit.append({'date':d.isoformat(),'status':'OK','rows':len(rows),'events':len(ev)})
+                events.extend(ev)
+            except Exception as exc:
+                if d==EVENT_END:
+                    try:ev=self._fallback_1106(); events.extend(ev); complete=False; audit.append({'date':d.isoformat(),'status':'PARTIAL_FALLBACK','events':len(ev),'error':str(exc)})
+                    except Exception as exc2:audit.append({'date':d.isoformat(),'status':'ERROR','error':str(exc2)}); complete=False
+                else:audit.append({'date':d.isoformat(),'status':'ERROR','error':str(exc)}); complete=False
+            d+=timedelta(days=1)
+        ded={(e['event_date'],e['code']):e for e in events}
+        return sorted(ded.values(),key=lambda z:(z['event_date'],z['code'])),audit,complete
+    def _evaluate_event(self,mod,bars,event):
+        base=dict(event); base['bars5']=int(len(bars)); base['sessions']=int(bars['date'].nunique()) if not bars.empty else 0
+        if bars.empty or event['event_date'] not in set(bars['date']):return base|{'coverage':'DATA_GAP_EVENT_DAY','primary_timing_class':'MISS','primary_success':False}
+        bars=bars.copy(); bars['name']=event['name']
+        try:ev,_=mod.backtest_target_detection(bars,session_col='date',config=mod.VWAPConfig(),event_threshold_pct=0.20,target_pcts=(0.10,0.15,0.20),prior_lookback_sessions=5)
+        except Exception as exc:return base|{'coverage':'ENGINE_ERROR','error':f'{type(exc).__name__}:{exc}','primary_timing_class':'MISS','primary_success':False}
+        if ev.empty:return base|{'coverage':'EVENT_NOT_REPRODUCED_FROM_MINUTE','primary_timing_class':'MISS','primary_success':False}
+        z=ev[ev['session'].astype(str)==event['event_date']]
+        if z.empty:return base|{'coverage':'EVENT_NOT_REPRODUCED_FROM_MINUTE','primary_timing_class':'MISS','primary_success':False}
+        r=_json_safe(z.iloc[0].to_dict()); r.update(base); r['coverage']='A_REAL_5M'; return r
+    def run(self):
+        if not self.lock.acquire(blocking=False):return
+        try:
+            self._set(status='RUNNING',progress='event universe',started_at=datetime.now(KST).isoformat(),finished_at=None,error=None,summary=None,details=[],data_audit={})
+            mod,ep=self._load_engine(); events,da,complete=self._build_events()
+            if not events:raise RuntimeError('+20% event universe empty')
+            by=defaultdict(list)
+            for e in events:by[e['code']].append(e)
+            details=[]; ma=[]
+            for i,(code,es) in enumerate(sorted(by.items()),1):
+                self._set(progress=f'LS t8412 {i}/{len(by)} {code} {es[0]["name"]}')
+                try:bars,a=self.client.minute5(code,FETCH_START,FETCH_END,max_pages=3); ma.append({'code':code,'name':es[0]['name'],**a})
+                except Exception as exc:bars=pd.DataFrame();ma.append({'code':code,'name':es[0]['name'],'error':f'{type(exc).__name__}:{exc}'})
+                for e in es:details.append(self._evaluate_event(mod,bars,e))
+            usable=[r for r in details if r.get('coverage')=='A_REAL_5M']; n=len(usable)
+            timing=Counter(str(r.get('primary_timing_class') or 'MISS') for r in usable)
+            def metric(col):
+                h=sum(bool(r.get(col)) for r in usable); return {'metric':col,'hits':h,'n':n,'rate_pct':round(h/n*100,2) if n else None}
+            metrics=[metric('pre10_early_action'),metric('pre10_new_entry'),metric('pre15_new_entry'),metric('pre20_new_entry')]
+            success=sum(bool(r.get('primary_success')) for r in usable)
+            summary={'version':VERSION,'engine_version':getattr(mod,'ENGINE_VERSION','V1.2'),'engine_path':ep,'period':[str(EVENT_START),str(EVENT_END)],'fetch_period':[str(FETCH_START),str(FETCH_END)],'event_rule':'regular-session high / previous close - 1 >=20%','event_universe_complete':complete,'event_count':len(events),'unique_stocks':len(by),'usable_real_5m':n,'minute_coverage_pct':round(n/len(events)*100,2) if events else None,'early_or_good_hits':success,'early_or_good_recall_pct':round(success/n*100,2) if n else None,'timing_counts':dict(timing),'metrics':metrics,'completed_at':datetime.now(KST).isoformat()}
+            RESULT_ROOT.mkdir(parents=True,exist_ok=True); run_id=datetime.now(KST).strftime('%Y%m%d_%H%M%S'); out=RESULT_ROOT/run_id; out.mkdir(parents=True,exist_ok=True)
+            pd.DataFrame(details).to_csv(out/'detail.csv',index=False,encoding='utf-8-sig'); (out/'report.json').write_text(json.dumps(_json_safe(summary),ensure_ascii=False,indent=2),encoding='utf-8'); (out/'daily_audit.json').write_text(json.dumps(_json_safe(da),ensure_ascii=False,indent=2),encoding='utf-8'); (out/'minute_audit.json').write_text(json.dumps(_json_safe(ma),ensure_ascii=False,indent=2),encoding='utf-8')
+            self._set(status='READY',progress='done',finished_at=datetime.now(KST).isoformat(),summary=summary,details=details,data_audit={'daily':da,'minute':ma,'output_dir':str(out)})
+            print('VWAP_V12_LS_5D_BACKTEST_READY '+json.dumps(_json_safe(summary),ensure_ascii=False),flush=True)
+        except Exception as exc:
+            self._set(status='ERROR',finished_at=datetime.now(KST).isoformat(),error=f'{type(exc).__name__}: {exc}\n{traceback.format_exc()[-5000:]}')
+            print('VWAP_V12_LS_5D_BACKTEST_ERROR '+str(exc),flush=True)
+        finally:self.lock.release()
+    def trigger(self):
+        if self.lock.locked() or self.snapshot().get('status')=='RUNNING':return {'accepted':False,'reason':'ALREADY_RUNNING','state':self.snapshot()}
+        threading.Thread(target=self.run,daemon=True,name='vwap-v12-ls-5d-backtest').start(); return {'accepted':True,'version':VERSION,'status':'STARTING'}
+    def handle_get(self,raw_path):
+        u=urlparse(raw_path); path=u.path; qs=parse_qs(u.query)
+        if path=='/api/research/vwap-v12/health':
+            s=self.snapshot(); return 200,{'ok':s.get('status')!='ERROR','version':VERSION,'status':s.get('status'),'progress':s.get('progress'),'ls_configured':self.client.configured,'policy':'READ_ONLY_MANUAL_TRIGGER__NO_ORDER__NO_MAIN_ENGINE_MUTATION'}
+        if path=='/api/research/vwap-v12/run':return 202,self.trigger()
+        if path=='/api/research/vwap-v12/result':
+            s=self.snapshot(); details=str((qs.get('details') or ['0'])[0]).lower() in {'1','true','yes'}
+            if not details:s.pop('details',None)
+            return 200,s
+        if path=='/api/research/vwap-v12/detail':
+            s=self.snapshot(); limit=max(1,min(int((qs.get('limit') or ['500'])[0]),5000)); return 200,{'status':s.get('status'),'rows':(s.get('details') or [])[:limit]}
+        return None
+
+VWAP_V12_BACKTEST=VWAPV12LSBacktest()
+VWAP_V12_LS_5D_BT_EOF
+
+COPY <<'VWAP_V12_ROUTE_PATCH_EOF' /tmp/apply_vwap_v12_route.py
+from pathlib import Path
+p=Path("/app/오백종목_통합엔진_웹서비스_V1_0.py")
+s=p.read_text(encoding="utf-8")
+marker="VWAP_V1_2_LS_T8412_5D_BACKTEST_ROUTE_V1"
+if marker not in s:
+    anchor='        if path.startswith("/api/research/vwap-v11/"):\n'
+    if anchor not in s:
+        raise SystemExit("VWAP_V12_ROUTE_ANCHOR_NOT_FOUND")
+    block=(
+        '        # VWAP_V1_2_LS_T8412_5D_BACKTEST_ROUTE_V1\n'
+        '        if path.startswith("/api/research/vwap-v12/"):\n'
+        '            try:\n'
+        '                from vwap_v12_ls_t8412_5d_backtest import VWAP_V12_BACKTEST\n'
+        '                _v12 = VWAP_V12_BACKTEST.handle_get(self.path)\n'
+        '                if _v12 is not None:\n'
+        '                    return self._json(_v12[0], _v12[1])\n'
+        '            except Exception as _v12_err:\n'
+        '                return self._json(500, {"error": f"VWAP_V12_BACKTEST: {type(_v12_err).__name__}: {_v12_err}"})\n'
+    )
+    s=s.replace(anchor,block+anchor,1)
+    p.write_text(s,encoding="utf-8")
+print("VWAP_V12_ROUTE_PATCH_APPLIED")
+VWAP_V12_ROUTE_PATCH_EOF
+
+RUN python -m py_compile /app/VWAP_거래량_20pct_사전탐지_V1_2.py /app/vwap_v12_ls_t8412_5d_backtest.py /tmp/apply_vwap_v12_route.py \
+ && python /tmp/apply_vwap_v12_route.py \
+ && python -m py_compile /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && grep -Fq 'VWAP_V1_2_LS_T8412_5D_BACKTEST_ROUTE_V1' /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && PYTHONPATH=/app python -c "from vwap_v12_ls_t8412_5d_backtest import VWAP_V12_BACKTEST,VERSION; c,b=VWAP_V12_BACKTEST.handle_get('/api/research/vwap-v12/health'); assert c==200 and b['version']==VERSION and b['policy']=='READ_ONLY_MANUAL_TRIGGER__NO_ORDER__NO_MAIN_ENGINE_MUTATION'; print('VWAP_V12_LS_T8412_5D_BACKTEST_SMOKE_PASS',b)"
+
+ENV VWAP_V12_BT_LS_INTERVAL=1.06
+LABEL vwap_v12_ls_5d_backtest="VWAP_V1_2_LS_T8412_5D_BT_V1_0"
+# VWAP_V1_2_LS_T8412_5D_BACKTEST_END
