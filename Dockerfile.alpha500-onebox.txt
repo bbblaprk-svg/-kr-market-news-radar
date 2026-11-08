@@ -1,3 +1,4 @@
+# LS_PROGRAM_RELEASE=V1_5_SESSION_GUARD_RATE_LIMIT
 # NEWS_IMPACT_RELEASE=V1_2_1_FINAL_FORCE
 # REQUIRED_RENDER_DOCKERFILE_PATH=Dockerfile.alpha500-onebox.txt
 # DO_NOT_UPLOAD_OLDER_V1_2_FILE
@@ -12107,13 +12108,26 @@ def _hms(v):
     except Exception: return None
 
 class LSProgramTrendLedger:
-    VERSION = 'LS_PROGRAM_TREND_V1_4'
+    VERSION = 'LS_PROGRAM_TREND_V1_5_SESSION_GUARD_RATE_LIMIT'
     def __init__(self):
         self.enabled = _bool('LS_PROGRAM_LEDGER_ENABLED', True)
         self.interval = max(60, _int('LS_PROGRAM_LEDGER_INTERVAL_SECONDS', 600))
         self.stock_limit = max(1, min(60, _int('LS_PROGRAM_STOCK_LIMIT_PER_MARKET', 18)))
         self.retention_runs = max(12, _int('LS_PROGRAM_RETENTION_RUNS', 144))
         self.start_delay = max(0, _int('LS_PROGRAM_START_DELAY_SECONDS', 20))
+        # V1.5: 장전/장후 불필요한 프로그램 TR 호출을 차단하고, 0행을 장애로 오판하지 않는다.
+        self.session_guard = _bool('LS_PROGRAM_SESSION_GUARD_ENABLED', True)
+        self.krx_start = os.getenv('LS_PROGRAM_KRX_START_HHMM', '0900')
+        self.krx_end = os.getenv('LS_PROGRAM_KRX_END_HHMM', '1540')
+        self.nxt_start = os.getenv('LS_PROGRAM_NXT_START_HHMM', '0800')
+        self.nxt_end = os.getenv('LS_PROGRAM_NXT_END_HHMM', '2005')
+        self.empty_grace_minutes = max(0, _int('LS_PROGRAM_EMPTY_GRACE_MINUTES', 15))
+        self.rate_limit_cooldown_seconds = max(60, _int('LS_PROGRAM_RATE_LIMIT_COOLDOWN_SECONDS', 600))
+        self._rate_limit_until = 0.0
+        self.runtime_state = {
+            'KRX': {'status':'INIT','reason':'STARTUP'},
+            'NXT': {'status':'INIT','reason':'STARTUP'},
+        }
         self.db_path = Path(os.getenv('LS_PROGRAM_DB_PATH', '/data/context_ledger/ls_program_trend.db'))
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.ls_provider = None
@@ -12190,6 +12204,65 @@ class LSProgramTrendLedger:
             LOG.warning('candidate provider failed market=%s err=%s', market, e)
             return {}
 
+    def _hm_min(self, value, default):
+        s = re.sub(r'\D', '', str(value or default))
+        if len(s) != 4: s = default
+        try:
+            h, m = int(s[:2]), int(s[2:])
+            if 0 <= h <= 23 and 0 <= m <= 59: return h*60 + m
+        except Exception:
+            pass
+        d = re.sub(r'\D', '', str(default))
+        return int(d[:2])*60 + int(d[2:])
+
+    def _rate_limited(self, err):
+        t = str(err or '')
+        return ('IGW00201' in t or '호출 거래건수를 초과' in t or 'RATE_LIMIT' in t.upper() or 'HTTP 429' in t.upper())
+
+    def _session_hint(self, market):
+        s = self._summary(market)
+        text = ' '.join(str(s.get(k) or '') for k in ('session','status','market_status','phase','reason')).upper()
+        if any(x in text for x in ('NON_TRADING_DAY','HOLIDAY','MARKET_HOLIDAY')):
+            return 'NON_TRADING_DAY'
+        return None
+
+    def _session_state(self, market):
+        now = _now()
+        # API 유량제한이 한 번 확인되면 KRX/NXT 공통으로 쿨다운하여 retry storm을 막는다.
+        remain = int(max(0, self._rate_limit_until - time.monotonic()))
+        if remain > 0:
+            return {'allowed':False,'status':'PENDING','reason':'RATE_LIMIT_COOLDOWN','retry_after_seconds':remain,'now_kst':_iso()}
+        if not self.session_guard:
+            return {'allowed':True,'status':'ACTIVE','reason':'SESSION_GUARD_DISABLED','now_kst':_iso()}
+        hint = self._session_hint(market)
+        if hint:
+            return {'allowed':False,'status':'PENDING','reason':hint,'now_kst':_iso()}
+        if now.weekday() >= 5:
+            return {'allowed':False,'status':'PENDING','reason':'NON_TRADING_DAY','now_kst':_iso()}
+        start_s, end_s = ((self.nxt_start,self.nxt_end) if market == 'NXT' else (self.krx_start,self.krx_end))
+        start = self._hm_min(start_s, '0800' if market == 'NXT' else '0900')
+        end = self._hm_min(end_s, '2005' if market == 'NXT' else '1540')
+        cur = now.hour*60 + now.minute
+        if cur < start:
+            return {'allowed':False,'status':'PENDING','reason':'WAITING_SESSION','session_start_hhmm':f'{start//60:02d}{start%60:02d}','now_kst':_iso()}
+        if cur > end:
+            return {'allowed':False,'status':'PENDING','reason':'SESSION_CLOSED','session_end_hhmm':f'{end//60:02d}{end%60:02d}','now_kst':_iso()}
+        return {'allowed':True,'status':'ACTIVE','reason':'IN_SESSION','session_start_minute':start,'now_minute':cur,'now_kst':_iso()}
+
+    def _record_status(self, market, status, reason, run_id=None, started=None, errors=None):
+        run_id = run_id or (_now().strftime('%Y%m%d_%H%M%S') + f'_LSPROG_{market}')
+        started = started or _iso()
+        payload = [f'{status}:{reason}'] + list(errors or [])
+        try:
+            with self._con() as c:
+                c.execute('INSERT OR REPLACE INTO ls_program_runs VALUES(?,?,?,?,?,?,?,?,?,?)',
+                          (run_id,market,status,started,_iso(),0,0,0,0,json.dumps(payload,ensure_ascii=False)))
+                c.commit()
+        except Exception as e:
+            LOG.warning('LS_PROGRAM_STATUS_SAVE_FAILED market=%s status=%s err=%s', market, status, e)
+        self.runtime_state[market] = {'status':status,'reason':reason,'run_id':run_id,'updated_at':_iso()}
+        return run_id
+
     def _extract_candidates(self, market, ranking_rows):
         codes, seen, names = [], set(), {}
         def add(c, n=''):
@@ -12219,6 +12292,7 @@ class LSProgramTrendLedger:
                     for z in j.get('t1632OutBlock1') or []:
                         q = dict(z); q['_segment']=segment; q['_unit']=unit; rows.append(q)
                 except Exception as e:
+                    if self._rate_limited(e): raise
                     errors.append(f't1632:{segment}:{unit}:{type(e).__name__}:{e}')
         return rows, errors
 
@@ -12231,6 +12305,7 @@ class LSProgramTrendLedger:
                 for z in j.get('t1636OutBlock1') or []:
                     q = dict(z); q['_segment']=segment; rows.append(q)
             except Exception as e:
+                if self._rate_limited(e): raise
                 errors.append(f't1636:{segment}:{type(e).__name__}:{e}')
         return rows, errors
 
@@ -12258,6 +12333,15 @@ class LSProgramTrendLedger:
     def collect_market(self, market):
         market = str(market or 'KRX').upper()
         if market not in {'KRX','NXT'}: return {'status':'INVALID_MARKET','market':market}
+
+        gate = self._session_state(market)
+        if not gate.get('allowed'):
+            status, reason = gate.get('status','PENDING'), gate.get('reason','WAITING_SESSION')
+            rid = self._record_status(market, status, reason)
+            self.runtime_state[market] = {**gate,'run_id':rid,'updated_at':_iso()}
+            LOG.info('LS_PROGRAM_LEDGER_PENDING market=%s status=%s reason=%s retry_after=%s', market,status,reason,gate.get('retry_after_seconds'))
+            return {'status':status,'market':market,'run_id':rid,'reason':reason,**{k:v for k,v in gate.items() if k not in {'allowed','status','reason'}}}
+
         if not self.run_lock.acquire(blocking=False): return {'status':'SKIPPED_BUSY','market':market}
         exchgubun = 'N' if market == 'NXT' else 'K'
         run_id = _now().strftime('%Y%m%d_%H%M%S') + f'_LSPROG_{market}'
@@ -12273,8 +12357,19 @@ class LSProgramTrendLedger:
                     if rows: stock_data.append((code,names.get(code,''),rows)); success += 1
                     else: errors.append(f't1637:{code}:EMPTY')
                 except Exception as e:
+                    if self._rate_limited(e): raise
                     errors.append(f't1637:{code}:{type(e).__name__}:{e}')
-            status = 'READY' if (market_rows or success) else ('PARTIAL' if rank_rows else 'FAILED')
+
+            if market_rows or success:
+                status = 'READY' if not errors else 'PARTIAL'
+            elif rank_rows:
+                status = 'PARTIAL'
+            else:
+                # 200/정상응답이지만 데이터가 아직 없는 경우를 장애로 오판하지 않는다.
+                start_min = int(gate.get('session_start_minute') or 0)
+                now_min = int(gate.get('now_minute') or 0)
+                status = 'PENDING_DATA' if (now_min - start_min) <= self.empty_grace_minutes else 'DEGRADED_EMPTY'
+
             with self._con() as c:
                 c.execute('INSERT OR REPLACE INTO ls_program_runs VALUES(?,?,?,?,?,?,?,?,?,?)', (run_id,market,status,started,_iso(),len(codes),success,len(market_rows),len(rank_rows),json.dumps(errors,ensure_ascii=False)))
                 self._save_market(c,run_id,market,market_rows); self._save_rank(c,run_id,market,rank_rows)
@@ -12285,11 +12380,19 @@ class LSProgramTrendLedger:
                     for t in ('ls_program_market','ls_program_ranking','ls_program_stock'): c.execute(f'DELETE FROM {t} WHERE run_id=?',(rid,))
                     c.execute('DELETE FROM ls_program_runs WHERE run_id=?',(rid,))
                 c.commit()
-            self.last_error = None
+            self.last_error = None if status in {'READY','PARTIAL','PENDING_DATA'} else f'{status}: empty program output'
+            self.runtime_state[market] = {'status':status,'reason':'DATA_OK' if status in {'READY','PARTIAL'} else 'EMPTY_PROGRAM_OUTPUT','run_id':run_id,'updated_at':_iso()}
             LOG.info('LS_PROGRAM_LEDGER_DONE market=%s run=%s status=%s candidates=%s stock_ok=%s market_rows=%s rank_rows=%s errors=%s', market,run_id,status,len(codes),success,len(market_rows),len(rank_rows),len(errors))
             return {'status':status,'market':market,'run_id':run_id,'candidates':len(codes),'stock_success':success,'market_rows':len(market_rows),'ranking_rows':len(rank_rows),'errors':errors[:20]}
         except Exception as e:
             self.last_error = f'{type(e).__name__}: {e}'
+            if self._rate_limited(e):
+                self._rate_limit_until = time.monotonic() + self.rate_limit_cooldown_seconds
+                rid = self._record_status(market, 'RATE_LIMITED', 'IGW00201_OR_429', run_id=run_id, started=started, errors=[self.last_error])
+                self.runtime_state[market] = {'status':'RATE_LIMITED','reason':'IGW00201_OR_429','run_id':rid,'cooldown_seconds':self.rate_limit_cooldown_seconds,'updated_at':_iso()}
+                LOG.warning('LS_PROGRAM_RATE_LIMITED market=%s cooldown=%ss err=%s', market,self.rate_limit_cooldown_seconds,self.last_error[:240])
+                return {'status':'RATE_LIMITED','market':market,'run_id':rid,'error':self.last_error,'cooldown_seconds':self.rate_limit_cooldown_seconds}
+            self._record_status(market, 'FAILED', 'EXCEPTION', run_id=run_id, started=started, errors=[self.last_error])
             LOG.exception('LS_PROGRAM_LEDGER_FAILED market=%s', market)
             return {'status':'FAILED','market':market,'run_id':run_id,'error':self.last_error}
         finally:
@@ -12299,7 +12402,8 @@ class LSProgramTrendLedger:
         time.sleep(self.start_delay)
         while True:
             started = time.monotonic()
-            for market in ('KRX','NXT'):
+            # NXT를 먼저 확인하면 08:00~09:00에는 NXT만 활성화되고 KRX는 무호출 PENDING이 된다.
+            for market in ('NXT','KRX'):
                 try: self.collect_market(market)
                 except Exception: LOG.exception('LS_PROGRAM loop market=%s', market)
             time.sleep(max(60, self.interval - (time.monotonic()-started)))
@@ -12307,7 +12411,7 @@ class LSProgramTrendLedger:
     def start(self):
         if self.enabled:
             threading.Thread(target=self._loop, daemon=True, name='ls-program-ledger').start()
-            LOG.info('LS_PROGRAM_LEDGER_STARTED interval=%ss stock_limit=%s', self.interval, self.stock_limit)
+            LOG.info('LS_PROGRAM_LEDGER_STARTED version=%s interval=%ss stock_limit=%s session_guard=%s NXT=%s-%s KRX=%s-%s cooldown=%ss', self.VERSION,self.interval,self.stock_limit,self.session_guard,self.nxt_start,self.nxt_end,self.krx_start,self.krx_end,self.rate_limit_cooldown_seconds)
 
     def latest_run(self, market):
         with self._con() as c:
@@ -12377,7 +12481,18 @@ class LSProgramTrendLedger:
         return {'version':self.VERSION,'market':market,'run':run,'buy':sorted(items,key=score,reverse=True)[:n],'sell':sorted(items,key=score)[:n]}
 
     def health(self):
-        return {'ok':True,'version':self.VERSION,'enabled':self.enabled,'interval_seconds':self.interval,'stock_limit_per_market':self.stock_limit,'db_path':str(self.db_path),'latest':{'KRX':self.latest_run('KRX'),'NXT':self.latest_run('NXT')},'last_error':self.last_error,'policy':'LS_INDEPENDENT_AUXILIARY__NEVER_OVERWRITE_KIS_AUTHORITY'}
+        remain = int(max(0, self._rate_limit_until - time.monotonic()))
+        return {
+            'ok':True,'version':self.VERSION,'enabled':self.enabled,
+            'interval_seconds':self.interval,'stock_limit_per_market':self.stock_limit,'db_path':str(self.db_path),
+            'session_guard_enabled':self.session_guard,
+            'session_windows':{'NXT':f'{self.nxt_start}-{self.nxt_end}','KRX':f'{self.krx_start}-{self.krx_end}'},
+            'rate_limit_cooldown_remaining_seconds':remain,
+            'runtime_state':self.runtime_state,
+            'latest':{'KRX':self.latest_run('KRX'),'NXT':self.latest_run('NXT')},
+            'last_error':self.last_error,
+            'policy':'LS_INDEPENDENT_AUXILIARY__NEVER_OVERWRITE_KIS_AUTHORITY__PREOPEN_NO_TR__ZERO_ROWS_NOT_FATAL'
+        }
 
     def handle_get(self, raw_path):
         u=urlparse(raw_path); path=u.path; qs=parse_qs(u.query); market=(qs.get('market') or ['KRX'])[0].upper()
@@ -12424,6 +12539,7 @@ COPY <<'LS_PROGRAM_TREND_V14_SMOKE' /tmp/ls_program_trend_v14_smoke.py
 import os, sys
 os.environ['LS_PROGRAM_DB_PATH']='/tmp/ls-program-v14-smoke.db'
 os.environ['LS_PROGRAM_LEDGER_ENABLED']='false'
+os.environ['LS_PROGRAM_SESSION_GUARD_ENABLED']='false'
 os.environ['LS_PROGRAM_STOCK_LIMIT_PER_MARKET']='2'
 sys.path.insert(0,'/tmp')
 from ls_program_trend_sidecar import LSProgramTrendLedger
@@ -12456,6 +12572,14 @@ LS_PROGRAM_TREND_V14_SMOKE
 
 RUN PYTHONPATH=/app python /tmp/ls_program_trend_v14_smoke.py \
  && rm -f /tmp/ls_program_trend_v14_smoke.py /tmp/ls-program-v14-smoke.db /tmp/ls-program-v14-smoke.db-wal /tmp/ls-program-v14-smoke.db-shm
+
+# LS PROGRAM V1.5 session/rate-limit guard verification
+RUN grep -Fq 'LS_PROGRAM_TREND_V1_5_SESSION_GUARD_RATE_LIMIT' /app/ls_program_trend_sidecar.py \
+ && grep -Fq 'LS_PROGRAM_SESSION_GUARD_ENABLED' /app/ls_program_trend_sidecar.py \
+ && grep -Fq 'LS_PROGRAM_RATE_LIMITED' /app/ls_program_trend_sidecar.py \
+ && grep -Fq 'PENDING_DATA' /app/ls_program_trend_sidecar.py \
+ && grep -Fq 'DEGRADED_EMPTY' /app/ls_program_trend_sidecar.py \
+ && echo 'LS_PROGRAM_V1_5_GUARD_BUILD_PASS PREOPEN_NO_TR=YES NXT_0800=YES KRX_0900=YES RATE_LIMIT_COOLDOWN=YES ZERO_ROWS_NOT_FATAL=YES'
 
 # ===== LS DERIVATIVES LEDGER V1.0 · shared AdaptiveLSProvider · NO NEW OAUTH =====
 COPY <<'LS_DERIVATIVES_LEDGER_V10_MODULE' /app/ls_derivatives_ledger.py
