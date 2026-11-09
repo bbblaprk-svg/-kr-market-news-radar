@@ -29302,3 +29302,240 @@ for mark in [
     assert s.count(mark) == 1, (mark, s.count(mark))
 print('FULLMARKET_V3_AND_EOD_NEXTDAY_V4_BUILD_VALIDATION_PASS')
 PY
+
+# V17_HISTORY_SELFHEAL_PATCH_V1
+# Scope: V1.7 ORIGINAL only.
+# Does NOT modify KIS ledger, LS t1632/t1636/t1637, Context ledger,
+# KRX/NXT separation, or the existing alpha500_bars.sqlite3 cache.
+ENV V17_ORIGINAL_HISTORY_DB=/data/v17_original_history.sqlite3 \
+    V17_ORIGINAL_HISTORY_BOOTSTRAP_ENABLED=true \
+    V17_ORIGINAL_HISTORY_BOOTSTRAP_BATCH=20 \
+    V17_ORIGINAL_HISTORY_BOOTSTRAP_RPM=90 \
+    V17_ORIGINAL_HISTORY_BOOTSTRAP_RETRY_SECONDS=300
+
+RUN python - <<'PY'
+from pathlib import Path
+
+p = Path("/app/v17_original_ls_bridge.py")
+s = p.read_text(encoding="utf-8")
+original = s
+
+
+def replace_once(old: str, new: str, label: str) -> None:
+    global s
+    n = s.count(old)
+    if n != 1:
+        raise SystemExit(f"SELFHEAL_PATCH_ANCHOR_ERROR {label}: expected=1 actual={n}")
+    s = s.replace(old, new, 1)
+
+
+replace_once(
+'''        self.history_max = max(20, _env_int("V17_ORIGINAL_SNAPSHOT_HISTORY_MAX", 200))
+        self.provider = os.getenv("V17_ORIGINAL_HISTORY_PROVIDER", "LS").strip() or "LS"
+        self.venue = os.getenv("V17_ORIGINAL_VENUE", "KRX").strip().upper() or "KRX"
+''',
+'''        self.history_max = max(20, _env_int("V17_ORIGINAL_SNAPSHOT_HISTORY_MAX", 200))
+        self.autofill_enabled = _env_bool("V17_ORIGINAL_HISTORY_BOOTSTRAP_ENABLED", True)
+        self.autofill_batch = max(1, _env_int("V17_ORIGINAL_HISTORY_BOOTSTRAP_BATCH", 20))
+        self.autofill_rpm = max(10, _env_int("V17_ORIGINAL_HISTORY_BOOTSTRAP_RPM", 90))
+        self.autofill_retry_seconds = max(60, _env_int("V17_ORIGINAL_HISTORY_BOOTSTRAP_RETRY_SECONDS", 300))
+        self.provider = os.getenv("V17_ORIGINAL_HISTORY_PROVIDER", "V17_ORIGINAL").strip() or "V17_ORIGINAL"
+        self.venue = os.getenv("V17_ORIGINAL_VENUE", "KRX").strip().upper() or "KRX"
+''',
+"init_autofill",
+)
+
+replace_once(
+'''        # Reuse the exact LS cache path already used by FastHistory500.
+        default_db = str(result_root.parent / "alpha500_bars.sqlite3")
+        self.db_path = Path(os.getenv("V17_ORIGINAL_HISTORY_DB", os.getenv("CACHE_DB", default_db)))
+''',
+'''        # V1.7 owns a dedicated persistent DB. Do not mutate Alpha500/LS caches.
+        default_db = str(result_root.parent / "v17_original_history.sqlite3")
+        self.db_path = Path(os.getenv("V17_ORIGINAL_HISTORY_DB", default_db))
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+''',
+"dedicated_db",
+)
+
+replace_once(
+'''        self._quote_provider: Optional[Callable[[Sequence[str]], Mapping[str, Mapping[str, Any]]]] = None
+        self._universe_provider: Optional[Callable[[], Tuple[List[dict], dict]]] = None
+''',
+'''        self._quote_provider: Optional[Callable[[Sequence[str]], Mapping[str, Mapping[str, Any]]]] = None
+        self._universe_provider: Optional[Callable[[], Tuple[List[dict], dict]]] = None
+        self._autofill_limiter = V17.MinuteRateLimiter(self.autofill_rpm) if V17 is not None else None
+        self._autofill_retry_after: Dict[str, float] = {}
+''',
+"autofill_runtime",
+)
+
+replace_once(
+'''            "history_pending_count": 0,
+            "history_coverage_pct": 0.0,
+''',
+'''            "history_pending_count": 0,
+            "history_autofill_enabled": self.autofill_enabled,
+            "history_autofill_batch": self.autofill_batch,
+            "history_autofill_attempted": 0,
+            "history_autofill_succeeded": 0,
+            "history_autofill_failed": 0,
+            "history_autofill_last_error": None,
+            "history_coverage_pct": 0.0,
+''',
+"state_fields",
+)
+
+start = s.find("    def _connect_ro(self) -> sqlite3.Connection:\n")
+end = s.find("    @staticmethod\n    def _overlay_quote", start)
+if start < 0 or end < 0 or end <= start:
+    raise SystemExit("SELFHEAL_PATCH_ANCHOR_ERROR history_methods")
+
+history_methods = '''    def _connect_db(self) -> sqlite3.Connection:
+        """Open the dedicated ORIGINAL V1.7 cache using the engine's own schema."""
+        if V17 is None:
+            raise RuntimeError(f"V1.7 engine import failed: {_IMPORT_ERROR}")
+        return V17.init_db(str(self.db_path))
+
+    def _read_history(self, con: sqlite3.Connection, code: str, limit: int = 260) -> pd.DataFrame:
+        """Read ORIGINAL V1.7 daily_ohlcv without touching Alpha500 bars."""
+        if V17 is None:
+            return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+        return V17.load_cached(con, str(code), int(limit))
+
+'''
+s = s[:start] + history_methods + s[end:]
+
+replace_once(
+'''            con = self._connect_ro()
+            cfg = V17.Config(min_rows=self.min_rows)
+            rows: List[dict] = []
+            pending: List[dict] = []
+            ready = 0
+            for item in universe:
+''',
+'''            con = self._connect_db()
+            cfg = V17.Config(
+                min_rows=self.min_rows,
+                bootstrap_count=200,
+                requests_per_minute=self.autofill_rpm,
+                request_timeout=max(3, int(self.request_timeout)),
+            )
+            rows: List[dict] = []
+            pending: List[dict] = []
+            ready = 0
+            autofill_attempted = 0
+            autofill_succeeded = 0
+            autofill_failed = 0
+            autofill_last_error = None
+            for item in universe:
+''',
+"scan_setup",
+)
+
+replace_once(
+'''                hist = self._read_history(con, code, 260)
+                cached_rows = len(hist)
+                if cached_rows < self.min_rows:
+                    pending.append({"code": code, "name": name, "cached_rows": cached_rows, "state": "HISTORY_PENDING"})
+                    continue
+''',
+'''                hist = self._read_history(con, code, 260)
+                cached_rows = len(hist)
+
+                if cached_rows < self.min_rows and self.autofill_enabled and autofill_attempted < self.autofill_batch:
+                    now_mono = time.monotonic()
+                    retry_at = float(self._autofill_retry_after.get(code, 0.0) or 0.0)
+                    if now_mono >= retry_at:
+                        autofill_attempted += 1
+                        try:
+                            rr = V17.collect_one(
+                                con,
+                                self._session,
+                                self._autofill_limiter,
+                                code,
+                                cfg,
+                                force_bootstrap=True,
+                                refresh_count=cfg.refresh_count,
+                            )
+                            hist = self._read_history(con, code, 260)
+                            cached_rows = len(hist)
+                            if bool(rr.get("ok")) and cached_rows >= self.min_rows:
+                                autofill_succeeded += 1
+                                self._autofill_retry_after.pop(code, None)
+                            else:
+                                autofill_failed += 1
+                                autofill_last_error = str(rr.get("error") or f"cached_rows={cached_rows}")
+                                self._autofill_retry_after[code] = now_mono + self.autofill_retry_seconds
+                        except Exception as exc:
+                            autofill_failed += 1
+                            autofill_last_error = f"{type(exc).__name__}: {exc}"
+                            self._autofill_retry_after[code] = now_mono + self.autofill_retry_seconds
+
+                if cached_rows < self.min_rows:
+                    pending.append({"code": code, "name": name, "cached_rows": cached_rows, "state": "HISTORY_PENDING"})
+                    continue
+''',
+"missing_history_selfheal",
+)
+
+replace_once(
+'''                "history_pending_count": len(pending),
+                "history_coverage_pct": coverage_pct,
+''',
+'''                "history_pending_count": len(pending),
+                "history_autofill_attempted": autofill_attempted,
+                "history_autofill_succeeded": autofill_succeeded,
+                "history_autofill_failed": autofill_failed,
+                "history_autofill_last_error": autofill_last_error,
+                "history_coverage_pct": coverage_pct,
+''',
+"snapshot_autofill",
+)
+
+replace_once(
+'''                action_count=len(actions), pre_count=len(pres), active_count=len(active), watch_count=len(watch),
+                round_id=meta.get("round_id"), last_error=None,
+''',
+'''                action_count=len(actions), pre_count=len(pres), active_count=len(active), watch_count=len(watch),
+                history_autofill_attempted=autofill_attempted,
+                history_autofill_succeeded=autofill_succeeded,
+                history_autofill_failed=autofill_failed,
+                history_autofill_last_error=autofill_last_error,
+                round_id=meta.get("round_id"), last_error=None,
+''',
+"health_autofill",
+)
+
+replace_once(
+'''                "V17_ORIGINAL_SCAN_DONE status=READY eligible=%d history_ready=%d history_pending=%d action=%d pre=%d active=%d round=%s duration=%.3f",
+                len(universe), ready, len(pending), len(actions), len(pres), len(active), meta.get("round_id"), duration,
+''',
+'''                "V17_ORIGINAL_SCAN_DONE status=READY eligible=%d history_ready=%d history_pending=%d autofill=%d/%d fail=%d action=%d pre=%d active=%d round=%s duration=%.3f",
+                len(universe), ready, len(pending), autofill_succeeded, autofill_attempted, autofill_failed,
+                len(actions), len(pres), len(active), meta.get("round_id"), duration,
+''',
+"log_summary",
+)
+
+if s == original:
+    raise SystemExit("SELFHEAL_PATCH_NO_CHANGE")
+
+p.write_text(s, encoding="utf-8")
+compile(s, str(p), "exec")
+
+required = [
+    "v17_original_history.sqlite3",
+    "V17.collect_one(",
+    "bootstrap_count=200",
+    "history_autofill_attempted",
+    "history_autofill_succeeded",
+]
+for token in required:
+    if token not in s:
+        raise SystemExit(f"SELFHEAL_VALIDATION_MISSING {token}")
+
+print("V17_HISTORY_SELFHEAL_PATCH_PASS")
+PY
+
+RUN python -m py_compile /app/v17_original_ls_bridge.py /app/v17_original_engine.py
