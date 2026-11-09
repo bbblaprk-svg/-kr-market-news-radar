@@ -27859,7 +27859,997 @@ p.write_text(s,encoding='utf-8')
 print('FULLMARKET_V3_PATCH_PASS')
 FULLMARKET_V3_PATCH_PY
 
+
+# ============================================================================
+# EOD -> NEXT SESSION time-axis controller V4.0 (preserves V3 discovery)
+# ============================================================================
+COPY <<'EOD_NEXTDAY_V4_CONTROLLER_PY_7D4E' /app/ALPHA_EOD_NEXTDAY_SELECT_THEN_ENTRY_V4_0.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ALPHA_EOD_NEXTDAY_SELECT_THEN_ENTRY_V4_0
+========================================
+
+목적
+- 기존 ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_1의 A(V1.7 ORIGINAL) + C(HYBRID/ROTATION)
+  발견 로직과 X2/REVERSAL_CONFIRM 검증 로직을 그대로 보존한다.
+- 시간축만 분리한다.
+
+운용 원칙
+1) EOD_SELECT
+   장 마감 후 전 종목 Zero-Base 재검색 → 최대 3종목을 NEXT_SESSION_BOARD에 고정한다.
+2) NEXTDAY_CONFIRM
+   다음 거래일에는 BOARD 종목만 가격/VWAP/수급/분봉으로 진입 여부를 판정한다.
+   종목 자체는 장중 재선정하지 않는다.
+3) SHADOW_DISCOVERY
+   장중 전체시장 신규 후보는 별도 SHADOW에만 기록하고 BOARD를 덮어쓰지 않는다.
+4) NEXT_EOD_RESET
+   다음 장 마감 후에만 전체시장 Zero-Base로 BOARD를 새로 만든다.
+
+중요
+- HYBRID는 V1.7 ORIGINAL을 삭제하지 않는다.
+- KIS가 권위원장이고 LS는 보조/역사/섹터 원장이다.
+- 장후 EOD_REFERENCE는 익일 후보 선정 근거이며, 장중 BUY 신호로 위장하지 않는다.
+- 실제 분봉/Delta가 없으면 BUY로 확정하지 않는다.
+- 기존 V3.1 파일은 수정하지 않는다. 이 파일은 상위 컨트롤러다.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import math
+import os
+import sys
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+try:
+    import psycopg
+    from psycopg.types.json import Jsonb
+except Exception:
+    psycopg = None
+    Jsonb = None
+
+ENGINE_VERSION = "ALPHA_EOD_NEXTDAY_SELECT_THEN_ENTRY_V4_0"
+BOARD_VERSION = "NEXT_SESSION_BOARD_V1"
+KST = timezone(timedelta(hours=9))
+
+
+def _load_module(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, str(path))
+    if spec is None or spec.loader is None:
+        raise ImportError(path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _now_kst() -> datetime:
+    return datetime.now(KST)
+
+
+def _iso_kst(dt: Optional[datetime] = None) -> str:
+    return (dt or _now_kst()).isoformat()
+
+
+def _code(v: Any) -> str:
+    s = str(v or "").strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s.zfill(6) if s.isdigit() and len(s) <= 6 else s
+
+
+def _f(v: Any, default: float = math.nan) -> float:
+    try:
+        if v is None or v == "":
+            return default
+        x = float(str(v).replace(",", "").replace("%", ""))
+        return x if math.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def _next_weekday(d: datetime) -> str:
+    # 휴장일은 외부 거래일 캘린더가 있으면 --next-trade-date로 덮어쓴다.
+    x = d.date() + timedelta(days=1)
+    while x.weekday() >= 5:
+        x += timedelta(days=1)
+    return x.isoformat()
+
+
+def _auto_mode(now: Optional[datetime] = None) -> str:
+    now = now or _now_kst()
+    hm = now.hour * 60 + now.minute
+    if hm >= 15 * 60 + 30:
+        return "EOD_SELECT"
+    if hm >= 8 * 60 + 30:
+        return "NEXTDAY_CONFIRM"
+    return "PREOPEN_STATUS"
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception:
+        return {}
+
+
+def _write_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _board_db_dsn() -> str:
+    return (
+        os.getenv("ALPHA500_STATE_DATABASE_URL")
+        or os.getenv("DATABASE_URL")
+        or os.getenv("POSTGRES_URL")
+        or ""
+    ).strip()
+
+
+def _db_save_board(board: Mapping[str, Any]) -> Tuple[bool, Optional[str]]:
+    dsn = _board_db_dsn()
+    if not dsn or psycopg is None:
+        return False, "POSTGRES_NOT_CONFIGURED"
+    try:
+        with psycopg.connect(dsn, connect_timeout=max(1, int(os.getenv("V4_DB_CONNECT_TIMEOUT", "3"))), autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS alpha_eod_nextday_board_v4 (
+                        singleton_id SMALLINT PRIMARY KEY CHECK (singleton_id = 1),
+                        selection_trade_date TEXT,
+                        next_trade_date TEXT,
+                        payload JSONB NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                payload = Jsonb(dict(board)) if Jsonb is not None else json.dumps(dict(board), ensure_ascii=False, default=str)
+                cur.execute(
+                    """
+                    INSERT INTO alpha_eod_nextday_board_v4
+                        (singleton_id, selection_trade_date, next_trade_date, payload, updated_at)
+                    VALUES (1, %s, %s, %s, NOW())
+                    ON CONFLICT (singleton_id) DO UPDATE SET
+                        selection_trade_date = EXCLUDED.selection_trade_date,
+                        next_trade_date = EXCLUDED.next_trade_date,
+                        payload = EXCLUDED.payload,
+                        updated_at = NOW()
+                    """,
+                    (board.get("selection_trade_date"), board.get("next_trade_date"), payload),
+                )
+        return True, None
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _db_load_board() -> Tuple[dict, Optional[str]]:
+    dsn = _board_db_dsn()
+    if not dsn or psycopg is None:
+        return {}, "POSTGRES_NOT_CONFIGURED"
+    try:
+        with psycopg.connect(dsn, connect_timeout=max(1, int(os.getenv("V4_DB_CONNECT_TIMEOUT", "3"))), autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT to_regclass('public.alpha_eod_nextday_board_v4')"
+                )
+                row = cur.fetchone()
+                if not row or not row[0]:
+                    return {}, "POSTGRES_TABLE_NOT_READY"
+                cur.execute(
+                    "SELECT payload FROM alpha_eod_nextday_board_v4 WHERE singleton_id = 1"
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {}, "POSTGRES_BOARD_EMPTY"
+                payload = row[0]
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+                return dict(payload or {}), None
+    except Exception as exc:
+        return {}, f"{type(exc).__name__}: {exc}"
+
+
+def _load_board(board_path: Path) -> dict:
+    local = _read_json(board_path)
+    if local and local.get("board_state") == "FROZEN_FOR_NEXT_SESSION":
+        local.setdefault("board_restore_source", "LOCAL_FILE")
+        return local
+    remote, err = _db_load_board()
+    if remote:
+        remote["board_restore_source"] = "POSTGRES"
+        try:
+            _write_json(board_path, remote)
+        except Exception:
+            pass
+        return remote
+    if local:
+        local.setdefault("board_restore_source", "LOCAL_FILE")
+        if err:
+            local["board_restore_db_error"] = err
+        return local
+    return {}
+
+
+def _selection_priority(z: Mapping[str, Any]) -> Tuple[int, float, str]:
+    state = str(z.get("selection_state") or "")
+    p = {
+        "PRIMARY_SELECTED": 0,
+        "PRIMARY_RESERVE": 1,
+        "PRIMARY_ARMED": 2,
+        "PRIMARY_WAIT_HISTORY": 3,
+        "WATCH_NOT_CONFIRMED": 4,
+        "NO_CHASE": 8,
+        "REJECT_RISK": 9,
+    }.get(state, 7)
+    return (p, -_f(z.get("fusion_rank"), 0.0), _code(z.get("code")))
+
+
+def _compact_candidate(z: Mapping[str, Any]) -> dict:
+    keep = [
+        "code", "name", "lanes", "fusion_rank", "freshness", "signal_level",
+        "selection_state", "final_state", "x2_state", "x2_core_support",
+        "reversal_state", "reversal_confirmed", "risk_block", "no_chase",
+        "current_price", "day_change_pct", "market_cap_100m", "turnover",
+        "session_vwap", "vwap_hold", "close_location", "foreign_level",
+        "institution_level", "program_level", "program_decision", "sector",
+        "sector_state", "sector_energy", "sector_energy_delta", "sector_breadth",
+        "stock_market_rs", "stock_turnover_accel", "volume_reaccel",
+        "turnover_reaccel", "source_timestamp",
+    ]
+    out = {k: z.get(k) for k in keep if k in z}
+    out["code"] = _code(out.get("code"))
+    return out
+
+
+def build_eod_board(
+    discovery: Mapping[str, Any],
+    selection_trade_date: str,
+    next_trade_date: str,
+    board_file: str,
+    max_slots: int = 3,
+) -> dict:
+    rows = [dict(x) for x in (discovery.get("candidates") or [])]
+    rows.sort(key=_selection_priority)
+
+    # No forced fill. Risk/NO_CHASE는 board에 넣지 않는다.
+    chosen: List[dict] = []
+    for z in rows:
+        st = str(z.get("selection_state") or "")
+        if st in {"REJECT_RISK", "NO_CHASE", "WATCH_NOT_CONFIRMED"}:
+            continue
+        if bool(z.get("risk_block")) or bool(z.get("no_chase")):
+            continue
+        if st not in {"PRIMARY_SELECTED", "PRIMARY_RESERVE", "PRIMARY_ARMED", "PRIMARY_WAIT_HISTORY"}:
+            continue
+        chosen.append(_compact_candidate(z))
+        if len(chosen) >= max_slots:
+            break
+
+    roles = ["EOD_PRIMARY", "EOD_BACKUP", "EOD_WATCH"]
+    for i, z in enumerate(chosen):
+        z["eod_role"] = roles[i] if i < len(roles) else "EOD_WATCH"
+        z["eod_close"] = z.get("current_price")
+        z["eod_selected_at_kst"] = _iso_kst()
+        z["entry_state"] = "WAIT_NEXT_SESSION"
+
+    board = {
+        "engine_version": ENGINE_VERSION,
+        "board_version": BOARD_VERSION,
+        "board_state": "FROZEN_FOR_NEXT_SESSION",
+        "selection_trade_date": selection_trade_date,
+        "next_trade_date": next_trade_date,
+        "created_at_kst": _iso_kst(),
+        "source_engine": discovery.get("engine_version"),
+        "source_generated_at": discovery.get("generated_at"),
+        "source_counts": discovery.get("counts", {}),
+        "history": discovery.get("history", {}),
+        "candidate_count": len(chosen),
+        "candidates": chosen,
+        "rules": [
+            "BOARD candidates are frozen until next EOD reset.",
+            "Intraday discovery cannot replace BOARD candidates.",
+            "Intraday hard invalidation may CANCEL a candidate but never substitutes another stock.",
+            "BUY requires the original entry engine/minute evidence; no fake BUY from EOD_REFERENCE.",
+        ],
+        "board_file": board_file,
+    }
+    return board
+
+
+def save_eod_board(board: Mapping[str, Any], board_path: Path, force: bool = False) -> dict:
+    old = _load_board(board_path)
+    same_day = old.get("selection_trade_date") == board.get("selection_trade_date")
+    if same_day and old.get("board_state") == "FROZEN_FOR_NEXT_SESSION" and not force:
+        old["write_status"] = "KEPT_EXISTING_FROZEN_BOARD"
+        return old
+    out = dict(board)
+    out["write_status"] = "NEW_BOARD_WRITTEN" if not same_day else "BOARD_RESELECTED_FORCE"
+    _write_json(board_path, out)
+    db_ok, db_err = _db_save_board(out)
+    out["durable_store"] = "POSTGRES+LOCAL" if db_ok else "LOCAL_ONLY"
+    if db_err and db_err != "POSTGRES_NOT_CONFIGURED":
+        out["durable_store_error"] = db_err
+    # persist metadata update locally too
+    _write_json(board_path, out)
+    return out
+
+
+def _board_code_set(board: Mapping[str, Any]) -> set[str]:
+    return {_code(x.get("code")) for x in (board.get("candidates") or []) if _code(x.get("code"))}
+
+
+def _live_overlay(v3: Any, src: Mapping[str, Any], code: str) -> dict:
+    maps = v3.build_maps(dict(src))
+    c = _code(code)
+    x = dict(maps.get("live", {}).get(c) or {})
+    rk = dict(maps.get("rank", {}).get(c) or {})
+    pg = dict(maps.get("program", {}).get(c) or {})
+    af = dict(maps.get("alpha_stock", {}).get(c) or {})
+    cluster = str(af.get("ENERGY_CLUSTER") or "")
+    se = dict(maps.get("sector_energy", {}).get(cluster) or {}) if cluster else {}
+    df = v3.delta_features(maps.get("deltas", {}).get(c, []))
+
+    price = _f(x.get("price"))
+    turnover = _f(x.get("turnover"))
+    volume = _f(x.get("volume"))
+    vwap = turnover / volume if math.isfinite(turnover) and math.isfinite(volume) and volume > 0 else math.nan
+    hi, lo = _f(x.get("high_price")), _f(x.get("low_price"))
+    close_location = (price - lo) / (hi - lo) if math.isfinite(price) and math.isfinite(hi) and math.isfinite(lo) and hi > lo else math.nan
+
+    return {
+        "code": c,
+        "name": x.get("name"),
+        "current_price": price,
+        "day_change_pct": _f(x.get("change_rate")),
+        "turnover": turnover,
+        "volume": volume,
+        "session_vwap": vwap,
+        "vwap_hold": None if not (math.isfinite(price) and math.isfinite(vwap)) else price >= vwap * 0.997,
+        "close_location": close_location,
+        "price_hold": None if not math.isfinite(close_location) else close_location >= 0.50,
+        "foreign_level": rk.get("foreign_level"),
+        "institution_level": rk.get("institution_level"),
+        "program_level": pg.get("program_net_qty"),
+        "program_delta": pg.get("program_net_change"),
+        "program_decision": pg.get("program_decision"),
+        "program_strong_conflict": pg.get("program_strong_conflict"),
+        "sector": cluster,
+        "sector_state": se.get("cluster_state"),
+        "sector_energy": _f(se.get("cluster_energy")),
+        "sector_energy_delta": _f(se.get("energy_delta")),
+        "sector_breadth": _f(se.get("cluster_breadth")),
+        "stock_market_rs": _f(af.get("market_rs")),
+        "stock_turnover_accel": _f(af.get("turnover_accel")),
+        "turnover_reaccel": df.get("turnover_reaccel"),
+        "volume_reaccel": df.get("volume_reaccel"),
+        "price_momentum": df.get("price_momentum"),
+        "source_timestamp": x.get("source_timestamp"),
+    }
+
+
+def _hard_invalidation(board_row: Mapping[str, Any], live: Mapping[str, Any]) -> Tuple[bool, List[str]]:
+    reasons: List[str] = []
+    p = _f(live.get("current_price"))
+    eod = _f(board_row.get("eod_close"))
+    day = _f(live.get("day_change_pct"))
+    prog = str(live.get("program_decision") or "")
+    vwap_hold = live.get("vwap_hold")
+
+    if bool(live.get("program_strong_conflict")) or prog == "BLOCKED_PROGRAM_SELL_ACCEL":
+        reasons.append("PROGRAM_STRONG_SELL_CONFLICT")
+    if math.isfinite(day) and day <= -8.0:
+        reasons.append("DAY_LOSS_LE_-8")
+    if math.isfinite(p) and math.isfinite(eod) and eod > 0 and (p / eod - 1.0) * 100 <= -6.0:
+        reasons.append("BELOW_EOD_CLOSE_-6")
+    if vwap_hold is False and math.isfinite(day) and day < -3.0:
+        reasons.append("VWAP_BREAK_WITH_WEAK_PRICE")
+    return bool(reasons), reasons
+
+
+def _advisory_entry_state(board_row: Mapping[str, Any], live: Mapping[str, Any]) -> Tuple[str, List[str]]:
+    """분봉 진입엔진이 없을 때 BUY를 만들지 않는 보조 상태."""
+    invalid, reasons = _hard_invalidation(board_row, live)
+    if invalid:
+        return "CANCEL", reasons
+
+    tests = {
+        "VWAP_HOLD": live.get("vwap_hold") is True,
+        "PRICE_HOLD": live.get("price_hold") is True,
+        "REACCEL": bool(live.get("turnover_reaccel") or live.get("volume_reaccel")),
+        "RS_POSITIVE": math.isfinite(_f(live.get("stock_market_rs"))) and _f(live.get("stock_market_rs")) > 0,
+        "SECTOR_BREADTH": math.isfinite(_f(live.get("sector_breadth"))) and _f(live.get("sector_breadth")) >= 0.5,
+        "FLOW_2OF3": sum(1 for k in ["foreign_level", "institution_level", "program_level"] if math.isfinite(_f(live.get(k))) and _f(live.get(k)) > 0) >= 2,
+    }
+    passed = sum(tests.values())
+    ev = [k for k, v in tests.items() if v]
+    if passed >= 5:
+        return "ENTRY_ARMED_WAIT_MINUTE", ev
+    if passed >= 3:
+        return "CONFIRM_WAIT", ev
+    return "WAIT", ev
+
+
+def run_eod_select(
+    v3: Any,
+    args: argparse.Namespace,
+    force: bool = False,
+) -> dict:
+    now = _now_kst()
+    trade_date = args.trade_date or now.date().isoformat()
+    next_trade_date = args.next_trade_date or _next_weekday(now)
+    board_path = Path(args.board_file)
+
+    # Same-day EOD board is immutable. Do not rerun the expensive full-market discovery.
+    existing = _load_board(board_path)
+    if (
+        not force
+        and existing.get("selection_trade_date") == trade_date
+        and existing.get("board_state") == "FROZEN_FOR_NEXT_SESSION"
+    ):
+        existing["write_status"] = "KEPT_EXISTING_FROZEN_BOARD"
+        return {
+            "engine_version": ENGINE_VERSION,
+            "mode": "EOD_SELECT",
+            "generated_at_kst": _iso_kst(),
+            "board": existing,
+            "discovery_counts": existing.get("source_counts", {}),
+            "v17_meta": existing.get("v17_meta", {}),
+            "discovery_source": "FROZEN_BOARD_NO_RESCAN",
+            "note": "Same-day board already frozen; full-market rescan skipped.",
+        }
+
+    # Prefer the already-running V3 discovery snapshot to avoid duplicate API/CPU load.
+    discovery = {}
+    discovery_source = "V3_LATEST_FILE"
+    latest_path = Path(getattr(args, "v3_latest_file", "/data/results/fullmarket_v3/FULLMARKET_V3_LATEST.json"))
+    max_age = max(60, int(getattr(args, "v3_latest_max_age", 600)))
+    try:
+        if latest_path.exists():
+            age = max(0.0, now.timestamp() - latest_path.stat().st_mtime)
+            if age <= max_age:
+                discovery = _read_json(latest_path)
+            else:
+                discovery_source = f"V3_LATEST_STALE_{int(age)}S"
+    except Exception:
+        discovery = {}
+
+    if not discovery or not isinstance(discovery.get("candidates"), list):
+        discovery_source = "V3_FRESH_FALLBACK_RUN"
+        discovery = v3.run_live_once(
+            args.kis_base,
+            args.ls_base,
+            args.history_db,
+            args.discovery_state_file,
+            args.discovery_output_dir,
+            None,  # EOD does not create BUY from minute data.
+            base_dir=args.base_dir,
+        )
+
+    board = build_eod_board(
+        discovery,
+        selection_trade_date=trade_date,
+        next_trade_date=next_trade_date,
+        board_file=args.board_file,
+        max_slots=args.max_slots,
+    )
+    board["discovery_source"] = discovery_source
+    board["v17_meta"] = discovery.get("v17_meta", {})
+    saved = save_eod_board(board, board_path, force=force)
+    return {
+        "engine_version": ENGINE_VERSION,
+        "mode": "EOD_SELECT",
+        "generated_at_kst": _iso_kst(),
+        "board": saved,
+        "discovery_counts": discovery.get("counts", {}),
+        "v17_meta": discovery.get("v17_meta", {}),
+        "discovery_source": discovery_source,
+        "note": "EOD board frozen. Intraday runs must not replace its stock codes.",
+    }
+
+
+def run_nextday_confirm(v3: Any, args: argparse.Namespace, preopen: bool = False) -> dict:
+    board_path = Path(args.board_file)
+    board = _load_board(board_path)
+    if not board or not board.get("candidates"):
+        return {
+            "engine_version": ENGINE_VERSION,
+            "mode": "PREOPEN_STATUS" if preopen else "NEXTDAY_CONFIRM",
+            "generated_at_kst": _iso_kst(),
+            "status": "NO_FROZEN_BOARD",
+            "board_file": str(board_path),
+            "candidates": [],
+        }
+
+    client = v3.SourceClient(args.kis_base, args.ls_base, timeout=25)
+    src = client.fetch_all(need_v17_fallback=False)
+    out_rows: List[dict] = []
+    for b in board.get("candidates") or []:
+        c = _code(b.get("code"))
+        live = _live_overlay(v3, src, c)
+        state, evidence = _advisory_entry_state(b, live)
+        z = dict(b)
+        z.update({f"live_{k}": v for k, v in live.items() if k not in {"code", "name"}})
+        z["entry_state"] = "PREOPEN_WAIT" if preopen else state
+        z["entry_evidence"] = [] if preopen else evidence
+        z["board_code_frozen"] = True
+        z["confirmed_at_kst"] = _iso_kst()
+        out_rows.append(z)
+
+    # 실제 분봉 파일이 있으면 기존 entry engine을 그대로 적용한다.
+    entry_events: List[dict] = []
+    if not preopen and args.minute_bars:
+        entry_mod = _load_module(Path(args.base_dir) / "ALPHA_SELECT_THEN_ENTRY_V1_1_POC_DELTA.py", "v4_entry")
+        temp = []
+        role_to_sel = {"EOD_PRIMARY": "PRIMARY_SELECTED", "EOD_BACKUP": "PRIMARY_RESERVE", "EOD_WATCH": "PRIMARY_RESERVE"}
+        for z in out_rows:
+            temp.append({
+                "code": _code(z.get("code")),
+                "name": z.get("name"),
+                "selection_state": role_to_sel.get(str(z.get("eod_role")), "PRIMARY_RESERVE"),
+                "final_state": z.get("entry_state", "WAIT_MINUTE_DATA"),
+            })
+        temp, entry_events = v3.apply_entry(temp, args.minute_bars, entry_mod, Path(args.base_dir))
+        emap = {_code(x.get("code")): x for x in temp}
+        for z in out_rows:
+            e = emap.get(_code(z.get("code")))
+            if e and e.get("entry_event"):
+                z["entry_state"] = e.get("final_state")
+                z["entry_event"] = e.get("entry_event")
+
+    result = {
+        "engine_version": ENGINE_VERSION,
+        "mode": "PREOPEN_STATUS" if preopen else "NEXTDAY_CONFIRM",
+        "generated_at_kst": _iso_kst(),
+        "selection_trade_date": board.get("selection_trade_date"),
+        "next_trade_date": board.get("next_trade_date"),
+        "board_state": board.get("board_state"),
+        "candidate_count": len(out_rows),
+        "candidates": out_rows,
+        "entry_events": entry_events,
+        "source_errors": src.get("_errors", {}),
+        "principle": "BOARD stock codes are immutable intraday; only entry state can change.",
+    }
+    out = Path(args.confirm_output)
+    _write_json(out, result)
+    return result
+
+
+def run_shadow_discovery(v3: Any, args: argparse.Namespace) -> dict:
+    board = _load_board(Path(args.board_file))
+    board_codes = _board_code_set(board)
+    shadow = v3.run_live_once(
+        args.kis_base,
+        args.ls_base,
+        args.history_db,
+        args.shadow_state_file,
+        args.shadow_output_dir,
+        None,
+        base_dir=args.base_dir,
+    )
+    rows = []
+    for z in shadow.get("candidates") or []:
+        c = _code(z.get("code"))
+        if c in board_codes:
+            continue
+        x = _compact_candidate(z)
+        x["shadow_only"] = True
+        x["promotion_allowed_intraday"] = False
+        rows.append(x)
+        if len(rows) >= args.shadow_limit:
+            break
+    result = {
+        "engine_version": ENGINE_VERSION,
+        "mode": "SHADOW_DISCOVERY",
+        "generated_at_kst": _iso_kst(),
+        "board_codes": sorted(board_codes),
+        "shadow_count": len(rows),
+        "shadow_candidates": rows,
+        "rule": "SHADOW never replaces frozen BOARD; it competes only at next EOD reset.",
+    }
+    _write_json(Path(args.shadow_result), result)
+    return result
+
+
+def selftest() -> dict:
+    fake = {
+        "engine_version": "V3",
+        "generated_at": "X",
+        "counts": {},
+        "candidates": [
+            {"code": "111111", "name": "A", "selection_state": "PRIMARY_SELECTED", "fusion_rank": 90, "current_price": 10000},
+            {"code": "222222", "name": "B", "selection_state": "PRIMARY_RESERVE", "fusion_rank": 80, "current_price": 20000},
+            {"code": "333333", "name": "C", "selection_state": "PRIMARY_ARMED", "fusion_rank": 70, "current_price": 30000},
+            {"code": "444444", "name": "D", "selection_state": "NO_CHASE", "fusion_rank": 999, "current_price": 40000},
+        ],
+    }
+    b = build_eod_board(fake, "2026-11-09", "2026-11-10", "/tmp/x.json", 3)
+    assert [x["code"] for x in b["candidates"]] == ["111111", "222222", "333333"]
+    assert [x["eod_role"] for x in b["candidates"]] == ["EOD_PRIMARY", "EOD_BACKUP", "EOD_WATCH"]
+    assert b["board_state"] == "FROZEN_FOR_NEXT_SESSION"
+
+    # Same-day EOD rerun must keep the first frozen board unless force=True.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        bp = Path(td) / "board.json"
+        first = save_eod_board(b, bp, force=False)
+        fake2 = dict(fake)
+        fake2["candidates"] = [{"code":"999999","name":"NEW","selection_state":"PRIMARY_SELECTED","fusion_rank":999,"current_price":9999}]
+        b2 = build_eod_board(fake2, "2026-11-09", "2026-11-10", str(bp), 3)
+        kept = save_eod_board(b2, bp, force=False)
+        assert [x["code"] for x in kept["candidates"]] == ["111111","222222","333333"]
+        assert kept["write_status"] == "KEPT_EXISTING_FROZEN_BOARD"
+        # Next EOD (new trade date) is allowed to replace the board.
+        b3 = build_eod_board(fake2, "2026-11-10", "2026-11-11", str(bp), 3)
+        nxt = save_eod_board(b3, bp, force=False)
+        assert [x["code"] for x in nxt["candidates"]] == ["999999"]
+        assert nxt["selection_trade_date"] == "2026-11-10"
+
+    # Auto mode separates intraday confirm from EOD selection.
+    assert _auto_mode(datetime(2026,11,9,15,31,tzinfo=KST)) == "EOD_SELECT"
+    assert _auto_mode(datetime(2026,11,10,9,5,tzinfo=KST)) == "NEXTDAY_CONFIRM"
+
+    s, _ = _advisory_entry_state(b["candidates"][0], {
+        "current_price": 10100, "day_change_pct": 1.0, "vwap_hold": True, "price_hold": True,
+        "turnover_reaccel": True, "stock_market_rs": 2.0, "sector_breadth": 0.7,
+        "foreign_level": 1, "institution_level": 1, "program_level": -1,
+    })
+    assert s == "ENTRY_ARMED_WAIT_MINUTE"
+    s2, _ = _advisory_entry_state(b["candidates"][0], {
+        "current_price": 9300, "day_change_pct": -7.0, "vwap_hold": False, "price_hold": False,
+        "program_decision": "BLOCKED_PROGRAM_SELL_ACCEL",
+    })
+    assert s2 == "CANCEL"
+    return {
+        "engine": ENGINE_VERSION,
+        "eod_freeze": "PASS",
+        "no_force_fill_no_chase": "PASS",
+        "roles": "PASS",
+        "same_day_board_freeze": "PASS",
+        "next_eod_reset": "PASS",
+        "auto_time_axis": "PASS",
+        "nextday_entry_only": "PASS",
+        "hard_cancel_no_substitute": "PASS",
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description=ENGINE_VERSION)
+    ap.add_argument("--mode", choices=["auto", "eod", "live", "shadow", "status"], default="auto")
+    ap.add_argument("--base-dir", default=os.getenv("V4_BASE_DIR", str(Path(__file__).resolve().parent)))
+    ap.add_argument("--v3-file", default=os.getenv("V4_V3_FILE", "ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_1.py"))
+    ap.add_argument("--kis-base", default=os.getenv("V3_KIS_BASE", "https://quant-signal-v3-7-51-clean2.onrender.com"))
+    ap.add_argument("--ls-base", default=os.getenv("V3_LS_BASE", "https://kr-market-news-radar.onrender.com"))
+    ap.add_argument("--history-db", default=os.getenv("V3_HISTORY_DB", "/data/alpha500_bars.sqlite3"))
+    ap.add_argument("--board-file", default=os.getenv("V4_BOARD_FILE", "/data/eod_nextday_board.json"))
+    ap.add_argument("--discovery-state-file", default=os.getenv("V4_DISCOVERY_STATE", "/data/fullmarket_v4_eod_state.json"))
+    ap.add_argument("--discovery-output-dir", default=os.getenv("V4_DISCOVERY_OUTPUT", "/data/results/fullmarket_v4_eod"))
+    ap.add_argument("--confirm-output", default=os.getenv("V4_CONFIRM_OUTPUT", "/data/results/fullmarket_v4_nextday_confirm.json"))
+    ap.add_argument("--shadow-state-file", default=os.getenv("V4_SHADOW_STATE", "/data/fullmarket_v4_shadow_state.json"))
+    ap.add_argument("--shadow-output-dir", default=os.getenv("V4_SHADOW_OUTPUT", "/data/results/fullmarket_v4_shadow"))
+    ap.add_argument("--shadow-result", default=os.getenv("V4_SHADOW_RESULT", "/data/results/fullmarket_v4_shadow_latest.json"))
+    ap.add_argument("--v3-latest-file", default=os.getenv("V4_V3_LATEST_FILE", "/data/results/fullmarket_v3/FULLMARKET_V3_LATEST.json"))
+    ap.add_argument("--v3-latest-max-age", type=int, default=int(os.getenv("V4_V3_LATEST_MAX_AGE_SECONDS", "600")))
+    ap.add_argument("--minute-bars", default=os.getenv("V3_MINUTE_BARS", "") or None)
+    ap.add_argument("--trade-date", default="")
+    ap.add_argument("--next-trade-date", default="")
+    ap.add_argument("--max-slots", type=int, default=3)
+    ap.add_argument("--shadow-limit", type=int, default=10)
+    ap.add_argument("--force-reselect", action="store_true")
+    ap.add_argument("--selftest", action="store_true")
+    return ap.parse_args()
+
+
+def main() -> None:
+    a = parse_args()
+    if a.selftest:
+        print(json.dumps(selftest(), ensure_ascii=False, indent=2))
+        return
+
+    root = Path(a.base_dir)
+    v3_path = Path(a.v3_file)
+    if not v3_path.is_absolute():
+        v3_path = root / v3_path
+    v3 = _load_module(v3_path, "v4_v3")
+
+    mode = a.mode
+    if mode == "auto":
+        mode = {"EOD_SELECT": "eod", "NEXTDAY_CONFIRM": "live", "PREOPEN_STATUS": "status"}[_auto_mode()]
+
+    if mode == "eod":
+        result = run_eod_select(v3, a, force=a.force_reselect)
+    elif mode == "live":
+        result = run_nextday_confirm(v3, a, preopen=False)
+    elif mode == "status":
+        result = run_nextday_confirm(v3, a, preopen=True)
+    elif mode == "shadow":
+        result = run_shadow_discovery(v3, a)
+    else:
+        raise SystemExit(mode)
+
+    compact = {
+        "engine_version": result.get("engine_version"),
+        "mode": result.get("mode"),
+        "generated_at_kst": result.get("generated_at_kst"),
+    }
+    if result.get("board"):
+        compact["board_state"] = result["board"].get("board_state")
+        compact["selection_trade_date"] = result["board"].get("selection_trade_date")
+        compact["next_trade_date"] = result["board"].get("next_trade_date")
+        compact["candidates"] = [
+            {"code": x.get("code"), "name": x.get("name"), "role": x.get("eod_role"), "state": x.get("entry_state")}
+            for x in result["board"].get("candidates", [])
+        ]
+    elif result.get("candidates") is not None:
+        compact["selection_trade_date"] = result.get("selection_trade_date")
+        compact["next_trade_date"] = result.get("next_trade_date")
+        compact["candidates"] = [
+            {"code": x.get("code"), "name": x.get("name"), "role": x.get("eod_role"), "entry": x.get("entry_state")}
+            for x in result.get("candidates", [])
+        ]
+    else:
+        compact["shadow_candidates"] = [
+            {"code": x.get("code"), "name": x.get("name")}
+            for x in result.get("shadow_candidates", [])
+        ]
+    print(json.dumps(compact, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+EOD_NEXTDAY_V4_CONTROLLER_PY_7D4E
+
+COPY <<'EOD_NEXTDAY_V4_HTTP_BRIDGE_PY_7D4E' /app/eod_nextday_v4_http_bridge.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Time-axis HTTP bridge for EOD -> next-session entry workflow."""
+from __future__ import annotations
+import json
+import os
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Dict, Optional, Tuple
+
+import ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_1 as v3
+import ALPHA_EOD_NEXTDAY_SELECT_THEN_ENTRY_V4_0 as v4
+
+
+class EodNextdayV4Bridge:
+    VERSION = "EOD_NEXTDAY_V4_HTTP_BRIDGE_V1_0"
+
+    def __init__(self) -> None:
+        self.enabled = os.getenv("EOD_NEXTDAY_V4_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        self.interval = max(60, int(os.getenv("EOD_NEXTDAY_V4_INTERVAL_SECONDS", "120")))
+        self.start_delay = max(10, int(os.getenv("EOD_NEXTDAY_V4_START_DELAY_SECONDS", "45")))
+        self.base_dir = os.getenv("V4_BASE_DIR", str(Path(__file__).resolve().parent))
+        self.board_file = os.getenv("V4_BOARD_FILE", "/data/eod_nextday_board.json")
+        self.latest_file = os.getenv("V4_LATEST_FILE", "/data/results/eod_nextday_v4_latest.json")
+        self.runtime: Dict[str, Any] = {
+            "status": "INIT", "started_at": None, "last_started_at": None,
+            "last_completed_at": None, "last_reason": None, "last_mode": None, "last_error": None,
+        }
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+
+    def _now(self) -> str:
+        return v4._iso_kst()
+
+    def _args(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            base_dir=self.base_dir,
+            v3_file=os.getenv("V4_V3_FILE", "ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_1.py"),
+            kis_base=os.getenv("V3_KIS_BASE", "https://quant-signal-v3-7-51-clean2.onrender.com"),
+            ls_base=os.getenv("V3_LS_BASE", "https://kr-market-news-radar.onrender.com"),
+            history_db=os.getenv("V3_HISTORY_DB", "/data/alpha500_bars.sqlite3"),
+            board_file=self.board_file,
+            discovery_state_file=os.getenv("V4_DISCOVERY_STATE", "/data/fullmarket_v4_eod_state.json"),
+            discovery_output_dir=os.getenv("V4_DISCOVERY_OUTPUT", "/data/results/fullmarket_v4_eod"),
+            confirm_output=os.getenv("V4_CONFIRM_OUTPUT", "/data/results/fullmarket_v4_nextday_confirm.json"),
+            shadow_state_file=os.getenv("V4_SHADOW_STATE", "/data/fullmarket_v4_shadow_state.json"),
+            shadow_output_dir=os.getenv("V4_SHADOW_OUTPUT", "/data/results/fullmarket_v4_shadow"),
+            shadow_result=os.getenv("V4_SHADOW_RESULT", "/data/results/fullmarket_v4_shadow_latest.json"),
+            v3_latest_file=os.getenv("V4_V3_LATEST_FILE", "/data/results/fullmarket_v3/FULLMARKET_V3_LATEST.json"),
+            v3_latest_max_age=int(os.getenv("V4_V3_LATEST_MAX_AGE_SECONDS", "600")),
+            minute_bars=os.getenv("V3_MINUTE_BARS", "") or None,
+            trade_date="", next_trade_date="",
+            max_slots=max(1, min(3, int(os.getenv("V4_MAX_SLOTS", "3")))),
+            shadow_limit=max(1, int(os.getenv("V4_SHADOW_LIMIT", "10"))),
+            force_reselect=False,
+        )
+
+    def _persist_latest(self, result: Dict[str, Any]) -> None:
+        p = Path(self.latest_file)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        tmp.replace(p)
+
+    def run_once(self, reason: str = "interval", requested_mode: str = "auto", force: bool = False) -> Dict[str, Any]:
+        if not self.enabled:
+            return {"status": "DISABLED", "engine": v4.ENGINE_VERSION, "bridge": self.VERSION}
+        if not self._lock.acquire(blocking=False):
+            return {"status": "BUSY", "engine": v4.ENGINE_VERSION, "bridge": self.VERSION}
+        try:
+            mode = requested_mode
+            if mode == "auto":
+                mode = {"EOD_SELECT": "eod", "NEXTDAY_CONFIRM": "live", "PREOPEN_STATUS": "status"}[v4._auto_mode()]
+            self.runtime.update(status="RUNNING", last_started_at=self._now(), last_reason=reason, last_mode=mode, last_error=None)
+            args = self._args()
+            if mode == "eod":
+                result = v4.run_eod_select(v3, args, force=force)
+            elif mode == "live":
+                result = v4.run_nextday_confirm(v3, args, preopen=False)
+            elif mode == "status":
+                result = v4.run_nextday_confirm(v3, args, preopen=True)
+            elif mode == "shadow":
+                result = v4.run_shadow_discovery(v3, args)
+            else:
+                result = {"status": "ERROR", "error": f"UNKNOWN_MODE:{mode}", "engine_version": v4.ENGINE_VERSION}
+            self._persist_latest(result)
+            self.runtime.update(status="READY", last_completed_at=self._now())
+            return result
+        except Exception as exc:
+            msg = f"{type(exc).__name__}: {exc}"
+            self.runtime.update(status="ERROR", last_completed_at=self._now(), last_error=msg)
+            return {"status": "ERROR", "engine": v4.ENGINE_VERSION, "bridge": self.VERSION, "error": msg}
+        finally:
+            self._lock.release()
+
+    def _read_json(self, path: str) -> Dict[str, Any]:
+        p = Path(path)
+        if not p.exists():
+            return {}
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return {"status": "ERROR", "error": f"READ:{type(exc).__name__}: {exc}"}
+
+    def latest(self) -> Dict[str, Any]:
+        obj = self._read_json(self.latest_file)
+        if not obj:
+            obj = {"status": "NO_RUNTIME_RESULT", "board": v4._load_board(Path(self.board_file))}
+        obj["bridge_runtime"] = dict(self.runtime)
+        return obj
+
+    def health(self) -> Dict[str, Any]:
+        board = v4._load_board(Path(self.board_file))
+        return {
+            "ok": self.runtime.get("status") != "ERROR",
+            "status": self.runtime.get("status"),
+            "engine": v4.ENGINE_VERSION, "bridge": self.VERSION, "enabled": self.enabled,
+            "interval_seconds": self.interval, "start_delay_seconds": self.start_delay,
+            "auto_mode_now": v4._auto_mode(), "board_file": self.board_file,
+            "board_present": bool(board), "board_state": board.get("board_state"),
+            "selection_trade_date": board.get("selection_trade_date"),
+            "next_trade_date": board.get("next_trade_date"),
+            "candidate_count": len(board.get("candidates") or []),
+            "board_restore_source": board.get("board_restore_source"),
+            "postgres_configured": bool(v4._board_db_dsn()),
+            "runtime": dict(self.runtime),
+            "policy": "EOD_SELECT__FROZEN_NEXT_SESSION_BOARD__ENTRY_STATE_ONLY_INTRADAY__SHADOW_NO_REPLACE",
+        }
+
+    def handle_get(self, raw_path: str) -> Optional[Tuple[int, Dict[str, Any]]]:
+        from urllib.parse import urlparse
+        path = urlparse(raw_path).path.rstrip("/")
+        base = "/api/context/eod-nextday-v4"
+        if not path.startswith(base):
+            return None
+        if path.endswith("/health"):
+            return 200, self.health()
+        if path.endswith("/board"):
+            return 200, {"engine_version": v4.ENGINE_VERSION, "board": v4._load_board(Path(self.board_file)), "runtime": dict(self.runtime)}
+        if path.endswith("/confirm"):
+            return 200, self._read_json(os.getenv("V4_CONFIRM_OUTPUT", "/data/results/fullmarket_v4_nextday_confirm.json"))
+        if path.endswith("/shadow"):
+            return 200, self._read_json(os.getenv("V4_SHADOW_RESULT", "/data/results/fullmarket_v4_shadow_latest.json"))
+        if path.endswith("/latest") or path == base:
+            return 200, self.latest()
+        return 404, {"status": "NOT_FOUND", "path": path}
+
+    def handle_post(self, raw_path: str) -> Optional[Tuple[int, Dict[str, Any]]]:
+        from urllib.parse import urlparse, parse_qs
+        u = urlparse(raw_path)
+        path = u.path.rstrip("/")
+        base = "/api/context/eod-nextday-v4"
+        if not path.startswith(base):
+            return None
+        q = parse_qs(u.query or "")
+        force = str((q.get("force") or ["false"])[0]).lower() in {"1", "true", "yes", "on"}
+        mode = "auto"
+        if path.endswith("/eod"):
+            mode = "eod"
+        elif path.endswith("/live"):
+            mode = "live"
+        elif path.endswith("/status"):
+            mode = "status"
+        elif path.endswith("/shadow"):
+            mode = "shadow"
+        elif not path.endswith("/run"):
+            return 404, {"status": "NOT_FOUND", "path": path}
+        result = self.run_once("http", mode, force=force)
+        return (200 if result.get("status") != "ERROR" else 500), result
+
+    def _loop(self) -> None:
+        self._stop.wait(self.start_delay)
+        while self.enabled and not self._stop.is_set():
+            self.run_once("interval", "auto", force=False)
+            self._stop.wait(self.interval)
+
+    def start(self) -> None:
+        if not self.enabled:
+            self.runtime.update(status="DISABLED")
+            return
+        if self._thread and self._thread.is_alive():
+            return
+        self.runtime.update(status="STARTING", started_at=self._now())
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="eod-nextday-v4")
+        self._thread.start()
+
+
+BRIDGE = EodNextdayV4Bridge()
+EOD_NEXTDAY_V4_HTTP_BRIDGE_PY_7D4E
+
+COPY <<'EOD_NEXTDAY_V4_PATCH_PY_7D4E' /tmp/apply_eod_nextday_v4_patch.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+from pathlib import Path
+
+p=Path('/app/오백종목_통합엔진_웹서비스_V1_0.py')
+s=p.read_text(encoding='utf-8')
+
+IMPORT_MARK='EOD_NEXTDAY_V4_IMPORT_V1'
+GET_MARK='EOD_NEXTDAY_V4_GET_ROUTE_V1'
+POST_MARK='EOD_NEXTDAY_V4_POST_ROUTE_V1'
+START_MARK='EOD_NEXTDAY_V4_START_V1'
+
+if IMPORT_MARK not in s:
+    anchor='\nclass Handler(BaseHTTPRequestHandler):\n'
+    if anchor not in s:
+        raise SystemExit('EOD_NEXTDAY_V4_PATCH_FAIL: Handler anchor not found')
+    block='''\n# EOD_NEXTDAY_V4_IMPORT_V1\ntry:\n    from eod_nextday_v4_http_bridge import BRIDGE as EOD_NEXTDAY_V4_BRIDGE\nexcept Exception as _eod_nextday_v4_import_error:\n    EOD_NEXTDAY_V4_BRIDGE = None\n    print(f"EOD_NEXTDAY_V4_IMPORT_ERROR {type(_eod_nextday_v4_import_error).__name__}: {_eod_nextday_v4_import_error}", flush=True)\n\n'''
+    s=s.replace(anchor,'\n'+block+'class Handler(BaseHTTPRequestHandler):\n',1)
+
+if GET_MARK not in s:
+    anchor='        # FULLMARKET_V3_GET_ROUTE_V1\n'
+    if anchor not in s:
+        raise SystemExit('EOD_NEXTDAY_V4_PATCH_FAIL: V3 GET route anchor not found')
+    block='''        # EOD_NEXTDAY_V4_GET_ROUTE_V1\n        if EOD_NEXTDAY_V4_BRIDGE is not None and path.startswith("/api/context/eod-nextday-v4"):\n            try:\n                _v4 = EOD_NEXTDAY_V4_BRIDGE.handle_get(self.path)\n                if _v4 is not None:\n                    return self._json(_v4[0], _v4[1])\n            except Exception as _v4_route_error:\n                return self._json(500, {"status":"ERROR","error":f"EOD_NEXTDAY_V4: {type(_v4_route_error).__name__}: {_v4_route_error}"})\n'''
+    s=s.replace(anchor,block+anchor,1)
+
+if POST_MARK not in s:
+    anchor='        # FULLMARKET_V3_POST_ROUTE_V1\n'
+    if anchor not in s:
+        raise SystemExit('EOD_NEXTDAY_V4_PATCH_FAIL: V3 POST route anchor not found')
+    block='''        # EOD_NEXTDAY_V4_POST_ROUTE_V1\n        if EOD_NEXTDAY_V4_BRIDGE is not None and path.startswith("/api/context/eod-nextday-v4"):\n            try:\n                _v4 = EOD_NEXTDAY_V4_BRIDGE.handle_post(self.path)\n                if _v4 is not None:\n                    return self._json(_v4[0], _v4[1])\n            except Exception as _v4_route_error:\n                return self._json(500, {"status":"ERROR","error":f"EOD_NEXTDAY_V4: {type(_v4_route_error).__name__}: {_v4_route_error}"})\n'''
+    s=s.replace(anchor,block+anchor,1)
+
+if START_MARK not in s:
+    anchor='    # FULLMARKET_V3_START_V1\n'
+    if anchor not in s:
+        raise SystemExit('EOD_NEXTDAY_V4_PATCH_FAIL: V3 start anchor not found')
+    block='''    # EOD_NEXTDAY_V4_START_V1\n    if EOD_NEXTDAY_V4_BRIDGE is not None:\n        try:\n            EOD_NEXTDAY_V4_BRIDGE.start()\n            print("EOD_NEXTDAY_V4_STARTED", flush=True)\n        except Exception as _v4_start_error:\n            print(f"EOD_NEXTDAY_V4_START_ERROR {type(_v4_start_error).__name__}: {_v4_start_error}", flush=True)\n'''
+    s=s.replace(anchor,block+anchor,1)
+
+p.write_text(s,encoding='utf-8')
+print('EOD_NEXTDAY_V4_PATCH_PASS')
+EOD_NEXTDAY_V4_PATCH_PY_7D4E
+
 RUN python /tmp/apply_fullmarket_v3_patch.py \
+ && python /tmp/apply_eod_nextday_v4_patch.py \
  && python -m py_compile \
       /app/ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_1.py \
       /app/V1_7_ACTION_PRE_운영본.py \
@@ -27868,15 +28858,21 @@ RUN python /tmp/apply_fullmarket_v3_patch.py \
       /app/ALPHA_SELECT_THEN_ENTRY_V1_1_POC_DELTA.py \
       /app/VOLUME_CANDLE_MVWAP_V1_0.py \
       /app/fullmarket_v3_http_bridge.py \
+      /app/ALPHA_EOD_NEXTDAY_SELECT_THEN_ENTRY_V4_0.py \
+      /app/eod_nextday_v4_http_bridge.py \
       /app/오백종목_통합엔진_웹서비스_V1_0.py \
  && cd /app \
  && python ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_1.py --selftest \
+ && python ALPHA_EOD_NEXTDAY_SELECT_THEN_ENTRY_V4_0.py --selftest \
  && python - <<'PY'
 from pathlib import Path
 s=Path('/app/오백종목_통합엔진_웹서비스_V1_0.py').read_text(encoding='utf-8')
-assert s.count('FULLMARKET_V3_IMPORT_V1') == 1
-assert s.count('FULLMARKET_V3_GET_ROUTE_V1') == 1
-assert s.count('FULLMARKET_V3_POST_ROUTE_V1') == 1
-assert s.count('FULLMARKET_V3_START_V1') == 1
-print('FULLMARKET_V3_BUILD_VALIDATION_PASS')
+for mark in [
+    'FULLMARKET_V3_IMPORT_V1','FULLMARKET_V3_GET_ROUTE_V1',
+    'FULLMARKET_V3_POST_ROUTE_V1','FULLMARKET_V3_START_V1',
+    'EOD_NEXTDAY_V4_IMPORT_V1','EOD_NEXTDAY_V4_GET_ROUTE_V1',
+    'EOD_NEXTDAY_V4_POST_ROUTE_V1','EOD_NEXTDAY_V4_START_V1',
+]:
+    assert s.count(mark) == 1, (mark, s.count(mark))
+print('FULLMARKET_V3_AND_EOD_NEXTDAY_V4_BUILD_VALIDATION_PASS')
 PY
