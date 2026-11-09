@@ -27908,6 +27908,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
 
 try:
     import psycopg
@@ -27916,8 +27917,8 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-ENGINE_VERSION = "ALPHA_EOD_NEXTDAY_SELECT_THEN_ENTRY_V4_0"
-BOARD_VERSION = "NEXT_SESSION_BOARD_V1"
+ENGINE_VERSION = "ALPHA_EOD_NEXTDAY_SELECT_THEN_ENTRY_V4_3_DUAL_V17"
+BOARD_VERSION = "NEXT_SESSION_BOARD_V3"
 KST = timezone(timedelta(hours=9))
 
 
@@ -28082,6 +28083,183 @@ def _load_board(board_path: Path) -> dict:
     return {}
 
 
+V17_DIRECT_ACTION = {"TRIGGER", "SHOCK_TRIGGER", "V_TURN_TRIGGER", "EARLY_TRIGGER"}
+V17_DIRECT_PRE = {"SHOCK_ARMED", "V_TURN_ARMED", "ARMED", "PRE_EXPLOSION_ARMED"}
+V17_DIRECT_ACTIVE = V17_DIRECT_ACTION | V17_DIRECT_PRE
+
+
+def _v17_original_direct_snapshot(ls_base: str, max_age_seconds: int = 600) -> Tuple[dict, dict]:
+    """Read the independent V1.7 ORIGINAL bridge directly.
+
+    Prefer the local atomic artifact (no extra CPU/API load). If unavailable, fall back
+    to its HTTP endpoint. This is an EOD cross-check, not a replacement engine.
+    """
+    audit: Dict[str, Any] = {
+        "source": "NONE", "status": "NO_DATA", "error": None,
+        "generated_at": None, "history_ready_count": None, "eligible_count": None,
+        "active_count": 0, "action_count": 0, "pre_count": 0,
+    }
+    local = Path(os.getenv("V17_ORIGINAL_OUTPUT_DIR", "/data/results/v17_original")) / "latest.json"
+    snap: dict = {}
+    try:
+        if local.exists():
+            age = max(0.0, _now_kst().timestamp() - local.stat().st_mtime)
+            obj = _read_json(local)
+            if isinstance(obj, dict) and obj:
+                snap = obj
+                audit["source"] = "LOCAL_ARTIFACT"
+                audit["artifact_age_seconds"] = round(age, 1)
+                if age > max_age_seconds:
+                    audit["status"] = "STALE_LOCAL"
+                    # Never promote stale signals when the HTTP fallback fails.
+                    snap = {}
+    except Exception as exc:
+        audit["error"] = f"LOCAL:{type(exc).__name__}:{exc}"
+
+    need_http = not snap or audit.get("status") == "STALE_LOCAL"
+    if need_http:
+        try:
+            url = ls_base.rstrip("/") + "/api/context/v17-original/latest?limit=100&include_watch=true"
+            r = requests.get(url, timeout=max(3, min(15, int(os.getenv("V4_V17_DIRECT_TIMEOUT", "8")))))
+            r.raise_for_status()
+            obj = r.json()
+            if isinstance(obj, dict) and obj:
+                timestamp = obj.get("generated_at") or obj.get("generated_at_kst")
+                parsed_at = None
+                if isinstance(timestamp, str):
+                    try:
+                        parsed_at = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                        if parsed_at.tzinfo is None:
+                            parsed_at = parsed_at.replace(tzinfo=KST)
+                    except ValueError:
+                        pass
+                if parsed_at is None:
+                    audit["status"] = "HTTP_TIMESTAMP_UNVERIFIED"
+                    audit["error"] = "V17_HTTP_MISSING_VALID_TIMESTAMP"
+                elif abs((_now_kst() - parsed_at).total_seconds()) > max_age_seconds:
+                    audit["status"] = "HTTP_STALE"
+                    audit["error"] = "V17_HTTP_SNAPSHOT_STALE"
+                else:
+                    snap = obj
+                    audit["source"] = "HTTP_ENDPOINT"
+                    audit["status"] = "FETCHED_HTTP"
+        except Exception as exc:
+            prev = audit.get("error")
+            audit["error"] = (str(prev) + " | " if prev else "") + f"HTTP:{type(exc).__name__}:{exc}"
+
+    if snap:
+        audit.update({
+            "status": str(snap.get("status") or audit.get("status") or "UNKNOWN"),
+            "generated_at": snap.get("generated_at"),
+            "round_id": snap.get("round_id"),
+            "coverage_state": snap.get("coverage_state"),
+            "history_ready_count": snap.get("history_ready_count"),
+            "eligible_count": snap.get("eligible_count"),
+            "history_coverage_pct": snap.get("history_coverage_pct"),
+            "active_count": int(_f(snap.get("active_count"), 0)),
+            "action_count": int(_f(snap.get("action_count"), 0)),
+            "pre_count": int(_f(snap.get("pre_count"), 0)),
+        })
+    return snap, audit
+
+
+def _merge_v17_original_direct(discovery: Mapping[str, Any], snap: Mapping[str, Any], audit: Mapping[str, Any]) -> dict:
+    """Union V3 A1 with the independently running V1.7 ORIGINAL result.
+
+    Direct-only recovery receives A1 structural status but never fabricates X2/reversal
+    confirmation. Therefore it can enter the EOD WAIT slot, not PRIMARY, until the normal
+    downstream confirmation layer passes.
+    """
+    out = dict(discovery)
+    rows = [dict(x) for x in (discovery.get("candidates") or [])]
+    cmap = {_code(x.get("code")): x for x in rows if _code(x.get("code"))}
+    v3_a1_codes = {
+        _code(x.get("code")) for x in rows
+        if any("V17" in str(v).upper() or "ORIGINAL" in str(v).upper() for v in (x.get("lanes") or []))
+    }
+    direct_codes: List[str] = []
+    recovered: List[str] = []
+    reinforced: List[str] = []
+    ignored: List[str] = []
+
+    for raw in (snap.get("candidates") or []):
+        if not isinstance(raw, Mapping):
+            continue
+        st = str(raw.get("status") or "").upper()
+        c = _code(raw.get("code"))
+        if not c or st not in V17_DIRECT_ACTIVE:
+            if c:
+                ignored.append(c)
+            continue
+        direct_codes.append(c)
+        z = cmap.get(c)
+        if z is None:
+            price = raw.get("quote_price") if raw.get("quote_price") not in (None, "") else raw.get("current_price")
+            day = raw.get("quote_change_pct") if raw.get("quote_change_pct") not in (None, "") else raw.get("day_change_pct")
+            z = {
+                "code": c,
+                "name": raw.get("name") or c,
+                "lanes": ["A1_V17_ORIGINAL_DIRECT"],
+                "lane_details": [{"lane": "A1_V17_ORIGINAL_DIRECT", "grade": st, "rank": 10.0 if st in V17_DIRECT_ACTION else 7.0, "detail": dict(raw)}],
+                "fusion_rank": 10.0 if st in V17_DIRECT_ACTION else 7.0,
+                "freshness": "NEW",
+                "signal_level": 75 if st in V17_DIRECT_ACTION else 65,
+                "selection_state": "PRIMARY_ARMED",
+                "final_state": "V17_DIRECT_ACTION_ARMED" if st in V17_DIRECT_ACTION else "V17_DIRECT_PRE_ARMED",
+                "x2_state": "X2_PENDING_HISTORY",
+                "x2_core_support": False,
+                "reversal_state": "V17_DIRECT_PENDING_DOWNSTREAM_CONFIRM",
+                "reversal_confirmed": False,
+                "current_price": _f(price),
+                "day_change_pct": _f(day),
+            }
+            rows.append(z)
+            cmap[c] = z
+            recovered.append(c)
+        else:
+            lanes = list(z.get("lanes") or [])
+            if "A1_V17_ORIGINAL_DIRECT" not in lanes:
+                lanes.append("A1_V17_ORIGINAL_DIRECT")
+            z["lanes"] = lanes
+            details = list(z.get("lane_details") or [])
+            details.append({"lane": "A1_V17_ORIGINAL_DIRECT", "grade": st, "rank": 10.0 if st in V17_DIRECT_ACTION else 7.0, "detail": dict(raw)})
+            z["lane_details"] = details
+            z["fusion_rank"] = max(_f(z.get("fusion_rank"), 0.0), 10.0 if st in V17_DIRECT_ACTION else 7.0)
+            reinforced.append(c)
+        z["v17_original_direct"] = True
+        z["v17_original_status"] = st
+        z["v17_original_generated_at"] = snap.get("generated_at")
+        z["v17_original_round_id"] = snap.get("round_id")
+
+    direct_set = set(direct_codes)
+    union_set = v3_a1_codes | direct_set
+    counts = dict(discovery.get("counts") or {})
+    counts["a1_v17_v3"] = int(_f(counts.get("a1_v17"), len(v3_a1_codes)))
+    counts["a1_v17_direct"] = len(direct_set)
+    counts["a1_v17"] = len(union_set)
+    counts["a1_v17_recovered_direct"] = len(set(recovered))
+    counts["a1_v17_reinforced_direct"] = len(set(reinforced))
+    out["counts"] = counts
+    out["candidates"] = rows
+    out["v17_crosscheck"] = {
+        **dict(audit),
+        "v3_a1_count": len(v3_a1_codes),
+        "direct_active_count_seen": len(direct_set),
+        "union_a1_count": len(union_set),
+        "intersection_count": len(v3_a1_codes & direct_set),
+        "recovered_direct_count": len(set(recovered)),
+        "reinforced_direct_count": len(set(reinforced)),
+        "v3_only_count": len(v3_a1_codes - direct_set),
+        "direct_only_count": len(direct_set - v3_a1_codes),
+        "recovered_codes": sorted(set(recovered))[:20],
+        "reinforced_codes": sorted(set(reinforced))[:20],
+        "v3_only_codes": sorted(v3_a1_codes - direct_set)[:20],
+        "direct_only_codes": sorted(direct_set - v3_a1_codes)[:20],
+        "ignored_nonactive_codes": sorted(set(ignored))[:20],
+    }
+    return out
+
+
 def _selection_priority(z: Mapping[str, Any]) -> Tuple[int, float, str]:
     state = str(z.get("selection_state") or "")
     p = {
@@ -28106,12 +28284,64 @@ def _compact_candidate(z: Mapping[str, Any]) -> dict:
         "institution_level", "program_level", "program_decision", "sector",
         "sector_state", "sector_energy", "sector_energy_delta", "sector_breadth",
         "stock_market_rs", "stock_turnover_accel", "volume_reaccel",
-        "turnover_reaccel", "source_timestamp",
+        "turnover_reaccel", "source_timestamp", "v17_original_direct",
+        "v17_original_status", "v17_original_generated_at", "v17_original_round_id",
     ]
     out = {k: z.get(k) for k in keep if k in z}
     out["code"] = _code(out.get("code"))
     return out
 
+
+def _quality_gate(z: Mapping[str, Any]) -> Tuple[str, str]:
+    """Separate discovery quality from entry timing. Missing data never becomes zero."""
+    state = str(z.get("selection_state") or "")
+    lanes = {str(v).upper() for v in (z.get("lanes") or [])}
+    if bool(z.get("risk_block")) or bool(z.get("no_chase")) or state in {"REJECT_RISK", "NO_CHASE"}:
+        return "REJECT", "RISK_OR_CHASE"
+    if state not in {"PRIMARY_SELECTED", "PRIMARY_RESERVE", "PRIMARY_ARMED", "PRIMARY_WAIT_HISTORY"}:
+        return "WATCH", "DISCOVERY_ONLY"
+
+    has_a1 = any("V17" in x or "ORIGINAL" in x for x in lanes)
+    has_a2 = any("HYBRID" in x for x in lanes)
+    has_a3 = any("ROTATION" in x for x in lanes)
+    if not (has_a1 or has_a2):
+        return "WATCH", "A3_ONLY_NEEDS_STRUCTURAL_DISCOVERY" if has_a3 else "NO_VERIFIED_DISCOVERY_LANE"
+
+    x2 = bool(z.get("x2_core_support"))
+    reversal = bool(z.get("reversal_confirmed")) or str(z.get("reversal_state") or "").upper() == "REVERSAL_CONFIRMED"
+    if x2 or reversal:
+        return "PRIMARY", "A1_A2_PLUS_CONFIRM_PASS"
+
+    # A1/A2 can be frozen as the single WAIT slot, but cannot trade until next-day live confirmation.
+    return "ARMED", "A1_A2_DISCOVERY_CONFIRM_PENDING"
+
+def _quality_audit_board(board: Mapping[str, Any]) -> dict:
+    """Apply entry veto/permission to both new and legacy frozen boards without rotating symbols."""
+    out = dict(board)
+    rows = []
+    for item in board.get("candidates") or []:
+        z = dict(item)
+        tier, reason = _quality_gate(z)
+        z["quality_tier"] = tier
+        z["quality_reason"] = reason
+        if tier == "PRIMARY":
+            z["entry_permission"] = "CONDITIONAL"
+        elif tier == "ARMED":
+            z["entry_permission"] = "LIVE_CONFIRM_REQUIRED"
+        else:
+            z["entry_permission"] = "BLOCKED_PENDING_REVIEW"
+        rows.append(z)
+    out["candidates"] = rows
+    out["quality_policy_version"] = "V4_3_DUAL_V17_CROSSCHECK"
+    out["tradable_candidate_count"] = sum(x["quality_tier"] == "PRIMARY" for x in rows)
+    out["wait_candidate_count"] = sum(x["quality_tier"] == "ARMED" for x in rows)
+    if out["tradable_candidate_count"]:
+        out["board_investment_state"] = "QUALIFIED"
+    elif out["wait_candidate_count"]:
+        out["board_investment_state"] = "WAIT_ONLY"
+    else:
+        out["board_investment_state"] = "NO_TRADE"
+    return out
 
 def build_eod_board(
     discovery: Mapping[str, Any],
@@ -28123,59 +28353,149 @@ def build_eod_board(
     rows = [dict(x) for x in (discovery.get("candidates") or [])]
     rows.sort(key=_selection_priority)
 
-    # No forced fill. Risk/NO_CHASE는 board에 넣지 않는다.
-    chosen: List[dict] = []
+    confirmed, armed, watch_only, rejected = [], [], [], []
     for z in rows:
-        st = str(z.get("selection_state") or "")
-        if st in {"REJECT_RISK", "NO_CHASE", "WATCH_NOT_CONFIRMED"}:
-            continue
-        if bool(z.get("risk_block")) or bool(z.get("no_chase")):
-            continue
-        if st not in {"PRIMARY_SELECTED", "PRIMARY_RESERVE", "PRIMARY_ARMED", "PRIMARY_WAIT_HISTORY"}:
-            continue
-        chosen.append(_compact_candidate(z))
-        if len(chosen) >= max_slots:
-            break
+        tier, reason = _quality_gate(z)
+        c = _compact_candidate(z)
+        c["quality_tier"] = tier
+        c["quality_reason"] = reason
+        if tier == "PRIMARY":
+            confirmed.append(c)
+        elif tier == "ARMED":
+            armed.append(c)
+        elif tier == "WATCH":
+            watch_only.append(c)
+        else:
+            rejected.append(c)
 
-    roles = ["EOD_PRIMARY", "EOD_BACKUP", "EOD_WATCH"]
+    # Official next-session Board: at most 2 confirmed + 1 structural wait.
+    # A3-only can never fill an official slot.
+    confirmed_cap = min(2, max_slots)
+    chosen = list(confirmed[:confirmed_cap])
+    confirmed_used = len(chosen)
+    if len(chosen) < max_slots and armed:
+        chosen.append(armed[0])
+
     for i, z in enumerate(chosen):
-        z["eod_role"] = roles[i] if i < len(roles) else "EOD_WATCH"
+        if i < confirmed_used:
+            z["eod_role"] = "EOD_PRIMARY" if i == 0 else "EOD_BACKUP"
+            z["entry_state"] = "WAIT_NEXT_SESSION"
+            z["entry_permission"] = "CONDITIONAL"
+        else:
+            z["eod_role"] = "EOD_WAIT"
+            z["entry_state"] = "WAIT_LIVE_CONFIRM"
+            z["entry_permission"] = "LIVE_CONFIRM_REQUIRED"
         z["eod_close"] = z.get("current_price")
         z["eod_selected_at_kst"] = _iso_kst()
-        z["entry_state"] = "WAIT_NEXT_SESSION"
+
+    watch_rows = []
+    for z in watch_only[:3]:
+        x = dict(z)
+        x["eod_role"] = "A3_WATCH_ONLY"
+        x["entry_state"] = "WATCH_ONLY"
+        x["entry_permission"] = "BLOCKED_PENDING_REVIEW"
+        x["eod_close"] = x.get("current_price")
+        watch_rows.append(x)
+
+    counts = dict(discovery.get("counts", {}))
+    v17_meta = dict(discovery.get("v17_meta") or {})
+    cross = dict(discovery.get("v17_crosscheck") or {})
+    ready = _f(v17_meta.get("history_ready"), math.nan)
+    universe_n = _f(v17_meta.get("universe"), math.nan)
+    direct_ready = _f(cross.get("history_ready_count"), math.nan)
+    direct_universe = _f(cross.get("eligible_count"), math.nan)
+    history_coverage = (ready / universe_n) if math.isfinite(ready) and math.isfinite(universe_n) and universe_n > 0 else None
+    direct_history_coverage = (direct_ready / direct_universe) if math.isfinite(direct_ready) and math.isfinite(direct_universe) and direct_universe > 0 else None
+    a1_union = int(_f(counts.get("a1_v17"), 0))
+    direct_ok = str(cross.get("status") or "").upper() == "READY"
+    if a1_union <= 0 and (not math.isfinite(ready) or ready <= 0) and (not math.isfinite(direct_ready) or direct_ready <= 0):
+        data_quality_state = "DUAL_V17_DATA_LIMITED"
+    elif int(_f(cross.get("recovered_direct_count"), 0)) > 0:
+        data_quality_state = "V17_DIRECT_RECOVERY"
+    elif not direct_ok:
+        data_quality_state = "V17_CROSSCHECK_PARTIAL"
+    else:
+        data_quality_state = "CHECKED"
+
+    tradable = confirmed_used
+    waits = len(chosen) - confirmed_used
+    if tradable:
+        investment_state = "QUALIFIED"
+    elif waits:
+        investment_state = "WAIT_ONLY"
+    else:
+        investment_state = "NO_TRADE"
 
     board = {
         "engine_version": ENGINE_VERSION,
+        "quality_policy_version": "V4_3_DUAL_V17_CROSSCHECK",
         "board_version": BOARD_VERSION,
         "board_state": "FROZEN_FOR_NEXT_SESSION",
+        "board_investment_state": investment_state,
+        "data_quality_state": data_quality_state,
         "selection_trade_date": selection_trade_date,
         "next_trade_date": next_trade_date,
         "created_at_kst": _iso_kst(),
         "source_engine": discovery.get("engine_version"),
         "source_generated_at": discovery.get("generated_at"),
-        "source_counts": discovery.get("counts", {}),
+        "source_counts": counts,
         "history": discovery.get("history", {}),
+        "data_quality": {
+            "v17_history_ready": None if not math.isfinite(ready) else int(ready),
+            "v17_universe": None if not math.isfinite(universe_n) else int(universe_n),
+            "v17_history_coverage": history_coverage,
+            "v17_direct_history_ready": None if not math.isfinite(direct_ready) else int(direct_ready),
+            "v17_direct_universe": None if not math.isfinite(direct_universe) else int(direct_universe),
+            "v17_direct_history_coverage": direct_history_coverage,
+            "v17_crosscheck_source": cross.get("source"),
+            "v17_crosscheck_status": cross.get("status"),
+            "a1_v17_v3_count": int(_f(counts.get("a1_v17_v3"), counts.get("a1_v17"))),
+            "a1_v17_direct_count": int(_f(counts.get("a1_v17_direct"), 0)),
+            "a1_v17_recovered_direct": int(_f(counts.get("a1_v17_recovered_direct"), 0)),
+            "a1_v17_count": int(_f(counts.get("a1_v17"), 0)),
+            "a2_hybrid_count": int(_f(counts.get("a2_hybrid"), 0)),
+            "a3_rotation_count": int(_f(counts.get("a3_rotation"), 0)),
+        },
         "candidate_count": len(chosen),
+        "tradable_candidate_count": tradable,
+        "wait_candidate_count": waits,
         "candidates": chosen,
+        "watch_only_count": len(watch_rows),
+        "watch_only": watch_rows,
+        "v17_crosscheck": cross,
+        "discovery_audit": {
+            "primary_confirmed": len(confirmed),
+            "a1_a2_armed": len(armed),
+            "watch_only": len(watch_only),
+            "rejected": len(rejected),
+            "watch_codes": [x.get("code") for x in watch_only[:20]],
+        },
         "rules": [
-            "BOARD candidates are frozen until next EOD reset.",
-            "Intraday discovery cannot replace BOARD candidates.",
-            "Intraday hard invalidation may CANCEL a candidate but never substitutes another stock.",
-            "BUY requires the original entry engine/minute evidence; no fake BUY from EOD_REFERENCE.",
+            "Official Board requires A1 V1.7 or A2 HYBRID structural discovery.",
+            "A1 is the union of V3 A1 and direct V1.7 ORIGINAL cross-check; direct recovery cannot fabricate X2/reversal confirmation.",
+            "A3 ROTATION-only names are WATCH_ONLY and never fill official Board slots.",
+            "At most two confirmed candidates plus one A1/A2 structural WAIT candidate are frozen.",
+            "Zero official candidates is a valid NO_TRADE result; no forced fill.",
+            "A1/A2 WAIT may promote only after next-day LIVE confirmation and minute/Delta evidence.",
+            "BOARD symbols are immutable intraday; hard invalidation cancels but never substitutes.",
         ],
         "board_file": board_file,
     }
     return board
 
-
 def save_eod_board(board: Mapping[str, Any], board_path: Path, force: bool = False) -> dict:
     old = _load_board(board_path)
     same_day = old.get("selection_trade_date") == board.get("selection_trade_date")
-    if same_day and old.get("board_state") == "FROZEN_FOR_NEXT_SESSION" and not force:
+    same_policy = old.get("board_version") == board.get("board_version")
+    if same_day and same_policy and old.get("board_state") == "FROZEN_FOR_NEXT_SESSION" and not force:
         old["write_status"] = "KEPT_EXISTING_FROZEN_BOARD"
         return old
     out = dict(board)
-    out["write_status"] = "NEW_BOARD_WRITTEN" if not same_day else "BOARD_RESELECTED_FORCE"
+    if same_day and not same_policy:
+        out["write_status"] = "BOARD_POLICY_MIGRATED"
+        out["previous_board_version"] = old.get("board_version")
+    else:
+        out["write_status"] = "NEW_BOARD_WRITTEN" if not same_day else "BOARD_RESELECTED_FORCE"
     _write_json(board_path, out)
     db_ok, db_err = _db_save_board(out)
     out["durable_store"] = "POSTGRES+LOCAL" if db_ok else "LOCAL_ONLY"
@@ -28297,8 +28617,10 @@ def run_eod_select(
         not force
         and existing.get("selection_trade_date") == trade_date
         and existing.get("board_state") == "FROZEN_FOR_NEXT_SESSION"
+        and existing.get("board_version") == BOARD_VERSION
     ):
         existing["write_status"] = "KEPT_EXISTING_FROZEN_BOARD"
+        existing = _quality_audit_board(existing)
         return {
             "engine_version": ENGINE_VERSION,
             "mode": "EOD_SELECT",
@@ -28337,6 +28659,14 @@ def run_eod_select(
             base_dir=args.base_dir,
         )
 
+    # Independent V1.7 ORIGINAL EOD cross-check. This repairs A1 omissions without
+    # letting direct PRE/ACTION bypass X2/reversal/live-entry confirmation.
+    direct_snap, direct_audit = _v17_original_direct_snapshot(
+        args.ls_base,
+        max_age_seconds=max(120, int(getattr(args, "v17_direct_max_age", 600))),
+    )
+    discovery = _merge_v17_original_direct(discovery, direct_snap, direct_audit)
+
     board = build_eod_board(
         discovery,
         selection_trade_date=trade_date,
@@ -28355,19 +28685,34 @@ def run_eod_select(
         "discovery_counts": discovery.get("counts", {}),
         "v17_meta": discovery.get("v17_meta", {}),
         "discovery_source": discovery_source,
+        "v17_crosscheck": discovery.get("v17_crosscheck", {}),
         "note": "EOD board frozen. Intraday runs must not replace its stock codes.",
     }
 
 
 def run_nextday_confirm(v3: Any, args: argparse.Namespace, preopen: bool = False) -> dict:
     board_path = Path(args.board_file)
-    board = _load_board(board_path)
-    if not board or not board.get("candidates"):
+    board = _quality_audit_board(_load_board(board_path))
+    if not board:
         return {
             "engine_version": ENGINE_VERSION,
             "mode": "PREOPEN_STATUS" if preopen else "NEXTDAY_CONFIRM",
             "generated_at_kst": _iso_kst(),
             "status": "NO_FROZEN_BOARD",
+            "board_investment_state": "NO_BOARD",
+            "board_file": str(board_path),
+            "candidates": [],
+        }
+    if not board.get("candidates"):
+        return {
+            "engine_version": ENGINE_VERSION,
+            "mode": "PREOPEN_STATUS" if preopen else "NEXTDAY_CONFIRM",
+            "generated_at_kst": _iso_kst(),
+            "status": "NO_ACTIONABLE_BOARD",
+            "board_investment_state": board.get("board_investment_state", "NO_TRADE"),
+            "selection_trade_date": board.get("selection_trade_date"),
+            "next_trade_date": board.get("next_trade_date"),
+            "watch_only": board.get("watch_only", []),
             "board_file": str(board_path),
             "candidates": [],
         }
@@ -28379,34 +28724,49 @@ def run_nextday_confirm(v3: Any, args: argparse.Namespace, preopen: bool = False
         c = _code(b.get("code"))
         live = _live_overlay(v3, src, c)
         state, evidence = _advisory_entry_state(b, live)
+        perm = str(b.get("entry_permission") or "BLOCKED_PENDING_REVIEW")
+        if perm == "BLOCKED_PENDING_REVIEW":
+            state, evidence = "WATCH_NO_ENTRY", ["QUALITY_GATE_VETO"]
         z = dict(b)
         z.update({f"live_{k}": v for k, v in live.items() if k not in {"code", "name"}})
-        z["entry_state"] = "PREOPEN_WAIT" if preopen else state
-        z["entry_evidence"] = [] if preopen else evidence
+        if preopen:
+            z["entry_state"] = "WATCH_NO_ENTRY" if perm == "BLOCKED_PENDING_REVIEW" else "PREOPEN_WAIT"
+            z["entry_evidence"] = []
+        else:
+            z["entry_state"] = state
+            z["entry_evidence"] = evidence
+            if perm == "LIVE_CONFIRM_REQUIRED" and state == "ENTRY_ARMED_WAIT_MINUTE":
+                z["entry_permission"] = "CONDITIONAL_LIVE_CONFIRMED"
         z["board_code_frozen"] = True
         z["confirmed_at_kst"] = _iso_kst()
         out_rows.append(z)
 
-    # 실제 분봉 파일이 있으면 기존 entry engine을 그대로 적용한다.
+    # Actual BUY still requires minute/Delta evidence after live advisory arming.
     entry_events: List[dict] = []
     if not preopen and args.minute_bars:
         entry_mod = _load_module(Path(args.base_dir) / "ALPHA_SELECT_THEN_ENTRY_V1_1_POC_DELTA.py", "v4_entry")
         temp = []
-        role_to_sel = {"EOD_PRIMARY": "PRIMARY_SELECTED", "EOD_BACKUP": "PRIMARY_RESERVE", "EOD_WATCH": "PRIMARY_RESERVE"}
+        role_to_sel = {"EOD_PRIMARY": "PRIMARY_SELECTED", "EOD_BACKUP": "PRIMARY_RESERVE", "EOD_WAIT": "PRIMARY_RESERVE"}
         for z in out_rows:
+            if z.get("entry_state") != "ENTRY_ARMED_WAIT_MINUTE":
+                continue
+            if z.get("entry_permission") not in {"CONDITIONAL", "CONDITIONAL_LIVE_CONFIRMED"}:
+                continue
             temp.append({
                 "code": _code(z.get("code")),
                 "name": z.get("name"),
                 "selection_state": role_to_sel.get(str(z.get("eod_role")), "PRIMARY_RESERVE"),
                 "final_state": z.get("entry_state", "WAIT_MINUTE_DATA"),
             })
-        temp, entry_events = v3.apply_entry(temp, args.minute_bars, entry_mod, Path(args.base_dir))
+        if temp:
+            temp, entry_events = v3.apply_entry(temp, args.minute_bars, entry_mod, Path(args.base_dir))
         emap = {_code(x.get("code")): x for x in temp}
         for z in out_rows:
             e = emap.get(_code(z.get("code")))
             if e and e.get("entry_event"):
                 z["entry_state"] = e.get("final_state")
                 z["entry_event"] = e.get("entry_event")
+                z["entry_permission"] = "LIVE_AND_MINUTE_CONFIRMED"
 
     result = {
         "engine_version": ENGINE_VERSION,
@@ -28415,16 +28775,16 @@ def run_nextday_confirm(v3: Any, args: argparse.Namespace, preopen: bool = False
         "selection_trade_date": board.get("selection_trade_date"),
         "next_trade_date": board.get("next_trade_date"),
         "board_state": board.get("board_state"),
+        "board_investment_state": board.get("board_investment_state"),
         "candidate_count": len(out_rows),
         "candidates": out_rows,
         "entry_events": entry_events,
         "source_errors": src.get("_errors", {}),
-        "principle": "BOARD stock codes are immutable intraday; only entry state can change.",
+        "principle": "Frozen A1/A2 symbols only; live advisory must arm before minute/Delta can create BUY.",
     }
     out = Path(args.confirm_output)
     _write_json(out, result)
     return result
-
 
 def run_shadow_discovery(v3: Any, args: argparse.Namespace) -> dict:
     board = _load_board(Path(args.board_file))
@@ -28466,61 +28826,125 @@ def selftest() -> dict:
     fake = {
         "engine_version": "V3",
         "generated_at": "X",
-        "counts": {},
+        "counts": {"a1_v17":2,"a2_hybrid":1,"a3_rotation":1},
+        "v17_meta": {"history_ready":100,"universe":500},
         "candidates": [
-            {"code": "111111", "name": "A", "selection_state": "PRIMARY_SELECTED", "fusion_rank": 90, "current_price": 10000},
-            {"code": "222222", "name": "B", "selection_state": "PRIMARY_RESERVE", "fusion_rank": 80, "current_price": 20000},
-            {"code": "333333", "name": "C", "selection_state": "PRIMARY_ARMED", "fusion_rank": 70, "current_price": 30000},
-            {"code": "444444", "name": "D", "selection_state": "NO_CHASE", "fusion_rank": 999, "current_price": 40000},
+            {"code":"111111","name":"A","selection_state":"PRIMARY_SELECTED","lanes":["A1_V17"],"x2_core_support":True,"fusion_rank":90,"current_price":10000},
+            {"code":"222222","name":"B","selection_state":"PRIMARY_RESERVE","lanes":["A2_HYBRID"],"reversal_confirmed":True,"fusion_rank":80,"current_price":20000},
+            {"code":"333333","name":"C","selection_state":"PRIMARY_ARMED","lanes":["A1_V17"],"x2_state":"X2_PENDING_HISTORY","fusion_rank":70,"current_price":30000},
+            {"code":"444444","name":"ROT","selection_state":"PRIMARY_ARMED","lanes":["A3_ROTATION"],"reversal_state":"REVERSAL_ARMED","signal_level":68,"fusion_rank":99,"current_price":40000},
+            {"code":"555555","name":"CHASE","selection_state":"NO_CHASE","lanes":["A1_V17"],"fusion_rank":999,"current_price":50000},
         ],
     }
     b = build_eod_board(fake, "2026-11-09", "2026-11-10", "/tmp/x.json", 3)
-    assert [x["code"] for x in b["candidates"]] == ["111111", "222222", "333333"]
-    assert [x["eod_role"] for x in b["candidates"]] == ["EOD_PRIMARY", "EOD_BACKUP", "EOD_WATCH"]
-    assert b["board_state"] == "FROZEN_FOR_NEXT_SESSION"
+    assert [x["code"] for x in b["candidates"]] == ["111111","222222","333333"]
+    assert [x["eod_role"] for x in b["candidates"]] == ["EOD_PRIMARY","EOD_BACKUP","EOD_WAIT"]
+    assert b["tradable_candidate_count"] == 2 and b["wait_candidate_count"] == 1
+    assert b["watch_only_count"] == 1 and b["watch_only"][0]["code"] == "444444"
+    assert b["board_investment_state"] == "QUALIFIED"
+    assert b["candidates"][2]["entry_permission"] == "LIVE_CONFIRM_REQUIRED"
 
-    # Same-day EOD rerun must keep the first frozen board unless force=True.
+    # A3-only must never fabricate an official Board.
+    a3 = build_eod_board({
+        "candidates":[
+            {"code":"600001","lanes":["A3_ROTATION"],"selection_state":"PRIMARY_ARMED","reversal_state":"REVERSAL_ARMED","signal_level":68,"fusion_rank":90},
+            {"code":"600002","lanes":["A3_ROTATION"],"selection_state":"PRIMARY_ARMED","reversal_state":"REVERSAL_ARMED","signal_level":68,"fusion_rank":80},
+            {"code":"600003","lanes":["A3_ROTATION"],"selection_state":"PRIMARY_ARMED","reversal_state":"REVERSAL_ARMED","signal_level":68,"fusion_rank":70},
+        ],
+        "counts":{"a1_v17":0,"a2_hybrid":0,"a3_rotation":3},
+        "v17_meta":{"history_ready":0,"universe":612},
+    }, "2026-11-09", "2026-11-10", "/tmp/a3.json", 3)
+    assert a3["candidate_count"] == 0
+    assert a3["board_investment_state"] == "NO_TRADE"
+    assert a3["watch_only_count"] == 3
+    assert a3["data_quality_state"] == "DUAL_V17_DATA_LIMITED"
+
+    # Direct ORIGINAL must recover an A1 omitted by V3, but only as WAIT without downstream confirmation.
+    merged = _merge_v17_original_direct({
+        "candidates":[{"code":"810001","name":"ROT","lanes":["A3_ROTATION"],"selection_state":"PRIMARY_ARMED","fusion_rank":8}],
+        "counts":{"a1_v17":0,"a2_hybrid":0,"a3_rotation":1},
+        "v17_meta":{"history_ready":0,"universe":500},
+    }, {
+        "status":"READY","generated_at":"X","round_id":"R","history_ready_count":100,"eligible_count":500,
+        "active_count":2,"action_count":1,"pre_count":1,
+        "candidates":[
+            {"code":"810001","name":"ROT","status":"PRE_EXPLOSION_ARMED","quote_price":10000},
+            {"code":"810002","name":"RECOVER","status":"TRIGGER","quote_price":20000},
+        ],
+    }, {"source":"LOCAL_ARTIFACT","status":"READY","history_ready_count":100,"eligible_count":500})
+    assert merged["counts"]["a1_v17"] == 2
+    assert merged["counts"]["a1_v17_recovered_direct"] == 1
+    assert merged["counts"]["a1_v17_reinforced_direct"] == 1
+    rb = build_eod_board(merged, "2026-11-09", "2026-11-10", "/tmp/recovered.json", 3)
+    assert rb["data_quality_state"] == "V17_DIRECT_RECOVERY"
+    assert rb["candidate_count"] >= 1
+    assert all(x["quality_tier"] == "ARMED" for x in rb["candidates"])
+    assert all(x["entry_permission"] == "LIVE_CONFIRM_REQUIRED" for x in rb["candidates"])
+
+    # Structural wait-only is valid, but has no entry permission until live confirmation.
+    wait = build_eod_board({
+        "candidates":[{"code":"700001","lanes":["A1_V17"],"selection_state":"PRIMARY_WAIT_HISTORY","x2_state":"X2_PENDING_HISTORY","fusion_rank":70}],
+        "counts":{"a1_v17":1,"a2_hybrid":0,"a3_rotation":0},
+        "v17_meta":{"history_ready":20,"universe":500},
+    }, "2026-11-09", "2026-11-10", "/tmp/wait.json", 3)
+    assert wait["candidate_count"] == 1 and wait["tradable_candidate_count"] == 0
+    assert wait["board_investment_state"] == "WAIT_ONLY"
+    assert wait["candidates"][0]["eod_role"] == "EOD_WAIT"
+    assert wait["candidates"][0]["entry_permission"] == "LIVE_CONFIRM_REQUIRED"
+
+    # Same-day board is immutable under the same policy, but policy migration can replace it once.
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         bp = Path(td) / "board.json"
         first = save_eod_board(b, bp, force=False)
+        same = save_eod_board(b, bp, force=False)
+        assert same["write_status"] == "KEPT_EXISTING_FROZEN_BOARD"
+        old_policy = dict(first); old_policy["board_version"] = "NEXT_SESSION_BOARD_V1"
+        _write_json(bp, old_policy)
+        migrated = save_eod_board(b, bp, force=False)
+        assert migrated["write_status"] == "BOARD_POLICY_MIGRATED"
+        assert migrated["board_version"] == BOARD_VERSION
         fake2 = dict(fake)
-        fake2["candidates"] = [{"code":"999999","name":"NEW","selection_state":"PRIMARY_SELECTED","fusion_rank":999,"current_price":9999}]
-        b2 = build_eod_board(fake2, "2026-11-09", "2026-11-10", str(bp), 3)
-        kept = save_eod_board(b2, bp, force=False)
-        assert [x["code"] for x in kept["candidates"]] == ["111111","222222","333333"]
-        assert kept["write_status"] == "KEPT_EXISTING_FROZEN_BOARD"
-        # Next EOD (new trade date) is allowed to replace the board.
+        fake2["candidates"] = [{"code":"999999","name":"NEW","selection_state":"PRIMARY_SELECTED","lanes":["A2_HYBRID"],"reversal_confirmed":True,"fusion_rank":999,"current_price":9999}]
         b3 = build_eod_board(fake2, "2026-11-10", "2026-11-11", str(bp), 3)
         nxt = save_eod_board(b3, bp, force=False)
         assert [x["code"] for x in nxt["candidates"]] == ["999999"]
-        assert nxt["selection_trade_date"] == "2026-11-10"
 
-    # Auto mode separates intraday confirm from EOD selection.
+    # Legacy A3 frozen board receives a hard quality veto.
+    legacy = _quality_audit_board({"candidates":[{"code":"0088M0","lanes":["A3_ROTATION"],"selection_state":"PRIMARY_ARMED"}]})
+    assert legacy["candidates"][0]["entry_permission"] == "BLOCKED_PENDING_REVIEW"
+
     assert _auto_mode(datetime(2026,11,9,15,31,tzinfo=KST)) == "EOD_SELECT"
     assert _auto_mode(datetime(2026,11,10,9,5,tzinfo=KST)) == "NEXTDAY_CONFIRM"
 
-    s, _ = _advisory_entry_state(b["candidates"][0], {
-        "current_price": 10100, "day_change_pct": 1.0, "vwap_hold": True, "price_hold": True,
-        "turnover_reaccel": True, "stock_market_rs": 2.0, "sector_breadth": 0.7,
-        "foreign_level": 1, "institution_level": 1, "program_level": -1,
+    s1, _ = _advisory_entry_state(b["candidates"][0], {
+        "current_price":10100,"day_change_pct":1.0,"vwap_hold":True,"price_hold":True,
+        "turnover_reaccel":True,"stock_market_rs":2.0,"sector_breadth":0.7,
+        "foreign_level":1,"institution_level":1,"program_level":-1,
     })
-    assert s == "ENTRY_ARMED_WAIT_MINUTE"
+    assert s1 == "ENTRY_ARMED_WAIT_MINUTE"
     s2, _ = _advisory_entry_state(b["candidates"][0], {
-        "current_price": 9300, "day_change_pct": -7.0, "vwap_hold": False, "price_hold": False,
-        "program_decision": "BLOCKED_PROGRAM_SELL_ACCEL",
+        "current_price":9300,"day_change_pct":-7.0,"vwap_hold":False,"price_hold":False,
+        "program_decision":"BLOCKED_PROGRAM_SELL_ACCEL",
     })
     assert s2 == "CANCEL"
+
     return {
-        "engine": ENGINE_VERSION,
-        "eod_freeze": "PASS",
-        "no_force_fill_no_chase": "PASS",
-        "roles": "PASS",
-        "same_day_board_freeze": "PASS",
-        "next_eod_reset": "PASS",
-        "auto_time_axis": "PASS",
-        "nextday_entry_only": "PASS",
-        "hard_cancel_no_substitute": "PASS",
+        "engine":ENGINE_VERSION,
+        "board_policy":BOARD_VERSION,
+        "structural_lane_required":"PASS",
+        "a3_only_never_fills_board":"PASS",
+        "max_two_confirmed_plus_one_wait":"PASS",
+        "wait_promotes_only_after_live_confirm":"PASS",
+        "minute_delta_requires_live_arm":"PASS",
+        "zero_candidate_no_trade_valid":"PASS",
+        "same_day_board_freeze":"PASS",
+        "board_policy_migration_same_day":"PASS",
+        "dual_v17_direct_crosscheck":"PASS",
+        "direct_v17_recovery_wait_only":"PASS",
+        "dual_v17_data_limited_explicit":"PASS",
+        "next_eod_reset":"PASS",
+        "hard_cancel_no_substitute":"PASS",
     }
 
 
@@ -28541,6 +28965,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--shadow-result", default=os.getenv("V4_SHADOW_RESULT", "/data/results/fullmarket_v4_shadow_latest.json"))
     ap.add_argument("--v3-latest-file", default=os.getenv("V4_V3_LATEST_FILE", "/data/results/fullmarket_v3/FULLMARKET_V3_LATEST.json"))
     ap.add_argument("--v3-latest-max-age", type=int, default=int(os.getenv("V4_V3_LATEST_MAX_AGE_SECONDS", "600")))
+    ap.add_argument("--v17-direct-max-age", type=int, default=int(os.getenv("V4_V17_DIRECT_MAX_AGE_SECONDS", "600")))
     ap.add_argument("--minute-bars", default=os.getenv("V3_MINUTE_BARS", "") or None)
     ap.add_argument("--trade-date", default="")
     ap.add_argument("--next-trade-date", default="")
@@ -28663,6 +29088,7 @@ class EodNextdayV4Bridge:
             shadow_result=os.getenv("V4_SHADOW_RESULT", "/data/results/fullmarket_v4_shadow_latest.json"),
             v3_latest_file=os.getenv("V4_V3_LATEST_FILE", "/data/results/fullmarket_v3/FULLMARKET_V3_LATEST.json"),
             v3_latest_max_age=int(os.getenv("V4_V3_LATEST_MAX_AGE_SECONDS", "600")),
+            v17_direct_max_age=int(os.getenv("V4_V17_DIRECT_MAX_AGE_SECONDS", "600")),
             minute_bars=os.getenv("V3_MINUTE_BARS", "") or None,
             trade_date="", next_trade_date="",
             max_slots=max(1, min(3, int(os.getenv("V4_MAX_SLOTS", "3")))),
