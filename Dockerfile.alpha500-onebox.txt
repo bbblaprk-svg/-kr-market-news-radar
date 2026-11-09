@@ -22869,9 +22869,9 @@ print('V17_ORIGINAL_BRIDGE_BUILD_VALIDATION_PASS')
 PY
 
 # ============================================================
-# FULLMARKET SELECT-THEN-ENTRY V3.0 — THREE INDEPENDENT DISCOVERY LANES
+# FULLMARKET SELECT-THEN-ENTRY V3.1 — THREE INDEPENDENT DISCOVERY LANES
 # A1 V1.7 LIVE + A2 HYBRID_STANDALONE + A3 LIVE_ROTATION
-# KIS authority / LS auxiliary / X2 after union / no forced fill
+# KIS authority / X2 CORE-only / HYBRID+ROTATION REVERSAL_CONFIRM / no forced fill
 # ============================================================
 ENV FULLMARKET_V3_ENABLED=true \
     FULLMARKET_V3_INTERVAL_SECONDS=180 \
@@ -22882,17 +22882,18 @@ ENV FULLMARKET_V3_ENABLED=true \
     V3_STATE_FILE=/data/fullmarket_v3_state.json \
     V3_OUTPUT_DIR=/data/results/fullmarket_v3
 
-COPY <<'FULLMARKET_V3_MAIN_PY' /app/ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_0.py
+COPY <<'FULLMARKET_V3_MAIN_PY' /app/ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_1.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_0
+ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_1
 ======================================
 목적
 - 종목을 먼저 전체시장에서 새로 선정하고, 그 다음 매수 타이밍을 판정한다.
 - V1.7 한 레인이 후보를 독점하지 못하게 한다.
 - A1 V1.7 LIVE, A2 HYBRID_STANDALONE, A3 LIVE_ROTATION을 독립 실행 후 합집합한다.
-- 합집합 후보만 X2-62로 확인하고, 실제 1분 buy/sell Delta가 있을 때만 Entry 엔진을 실행한다.
+- X2-62는 CORE 레인 전용 하드게이트로 사용한다. HYBRID/ROTATION은 별도 REVERSAL_CONFIRM으로 검증한다.
+- 실제 1분 buy/sell Delta가 있을 때만 BUY를 확정하고, 없으면 BUY_ARMED/WAIT_MINUTE_DATA로 유지한다.
 - NEW / UPGRADE / REENTRY / HOLD / DROP을 기록해 같은 종목 반복 노출을 구분한다.
 - KIS가 권위원장이고 LS는 보조/역사/섹터 원장이다. LS는 KIS 값을 덮어쓰지 않는다.
 
@@ -22930,7 +22931,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-ENGINE_VERSION = "ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_0"
+ENGINE_VERSION = "ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_1"
 ACTIVE_V17 = {
     "TRIGGER", "SHOCK_TRIGGER", "V_TURN_TRIGGER", "EARLY_TRIGGER",
     "SHOCK_ARMED", "V_TURN_ARMED", "ARMED", "PRE_EXPLOSION_ARMED",
@@ -23023,6 +23024,17 @@ class V3Config:
     rotation_vwap_buffer_pct: float = 0.003
     rotation_prime_min_pass: int = 5
     rotation_armed_min_pass: int = 4
+
+    # V3.1 reversal / capital-reentry confirm (A2/A3 only)
+    reversal_close_location_min: float = 0.60
+    reversal_vwap_buffer_pct: float = 0.003
+    reversal_sector_breadth_min: float = 0.50
+    reversal_sector_energy_floor: float = 40.0
+    reversal_flow_min_positive: int = 2
+    reversal_flow_min_available: int = 2
+    reversal_confirm_min_pass: int = 5
+    reversal_armed_min_pass: int = 4
+    reversal_stop_max_pct: float = 6.0
 
     request_timeout: int = 25
     state_reentry_hours: int = 36
@@ -23442,31 +23454,129 @@ def build_cross_section_market_proxy(histories: Mapping[str,pd.DataFrame], marke
     return out
 
 
-def apply_x2(union: List[dict], histories: Mapping[str,pd.DataFrame], market_map: Mapping[str,str], x2: Any) -> List[dict]:
+def apply_x2(union: List[dict], histories: Mapping[str,pd.DataFrame], market_map: Mapping[str,str], x2: Any, v17: Any) -> List[dict]:
+    """V3.1: X2 is CORE-only and uses the original hard-gate semantics.
+
+    SHORT must pass VCP AND ASYM AND NO_CHASE.  When >=130 rows exist we also
+    run the original LONG V1.7 confirm.  Partial VCP-only or ASYM-only evidence
+    is informative but never becomes CORE support.
+    """
     proxies=build_cross_section_market_proxy(histories,market_map)
     cfg=x2.X2Config()
     out=[]
     for z in union:
         c=z["code"]; h=histories.get(c)
         if h is None or len(h)<10:
-            z["x2_state"]="X2_PENDING_HISTORY"; z["x2_support"]=False; z["x2_detail"]={"rows":0 if h is None else len(h)}; out.append(z); continue
+            z["x2_state"]="X2_PENDING_HISTORY"; z["x2_support"]=False; z["x2_core_support"]=False
+            z["x2_detail"]={"rows":0 if h is None else len(h)}; out.append(z); continue
         m=str(market_map.get(c) or "KRX"); mr=proxies.get(m) or proxies.get("KRX") or {}
         try:
             ev=x2.short_vcp_asym(h.copy(),mr,cfg)
-            support=bool(ev.no_chase and (ev.vcp_pass or ev.asym_pass))
-            if ev.vcp_pass and ev.asym_pass: state="X2_DUAL_PASS"
-            elif ev.asym_pass: state="X2_ASYM_PASS"
-            elif ev.vcp_pass: state="X2_VCP_PASS"
-            else: state="X2_FAIL"
-            z["x2_state"]=state; z["x2_support"]=support; z["x2_detail"]=asdict(ev)
+            short_pass=bool(ev.passed)  # original: VCP AND ASYM AND NO_CHASE
+            if short_pass:
+                state="X2_SHORT_CORE_PASS"
+            elif ev.vcp_pass and ev.asym_pass:
+                state="X2_NO_CHASE_FAIL"
+            elif ev.asym_pass:
+                state="X2_ASYM_ONLY"
+            elif ev.vcp_pass:
+                state="X2_VCP_ONLY"
+            else:
+                state="X2_FAIL"
+            detail={"short":asdict(ev)}
+            core=False
+            if short_pass and len(h)>=cfg.__dict__.get('history_min_rows',130):
+                try:
+                    cr=x2.long_v17_confirm(h.copy(),c,str(z.get("name") or ""),v17,ev,cfg)
+                    detail["long"]=asdict(cr)
+                    core=bool(str(cr.state)=="CORE_ELIGIBLE" and not cr.blockers)
+                    state="X2_CORE_ELIGIBLE" if core else "X2_LONG_REJECT"
+                except Exception as le:
+                    detail["long_error"]=f"{type(le).__name__}:{le}"
+                    state="X2_LONG_ERROR"
+            elif short_pass:
+                # Never promote to CORE without the long V1.7 confirm.
+                state="X2_SHORT_PASS_WAIT_LONG"
+            z["x2_state"]=state; z["x2_support"]=core; z["x2_core_support"]=core; z["x2_detail"]=detail
         except Exception as e:
-            z["x2_state"]="X2_ERROR"; z["x2_support"]=False; z["x2_detail"]={"error":f"{type(e).__name__}:{e}"}
+            z["x2_state"]="X2_ERROR"; z["x2_support"]=False; z["x2_core_support"]=False; z["x2_detail"]={"error":f"{type(e).__name__}:{e}"}
         out.append(z)
     return out
 
 
+def _flow_sign(v: Any) -> Optional[bool]:
+    x=_f(v)
+    if not math.isfinite(x): return None
+    if x>0: return True
+    if x<0: return False
+    return None
+
+
+def apply_reversal_confirm(rows: List[dict], universe: pd.DataFrame, cfg: V3Config) -> List[dict]:
+    """Independent confirm for A2 HYBRID / A3 ROTATION capital-reentry names.
+
+    This deliberately does NOT require X2 VCP compression.  It checks live
+    reclaim/hold, activity reacceleration, sector participation and flow.
+    Missing flow does not become zero; it yields ARMED/PENDING, not CONFIRMED.
+    """
+    umap={str(r.code):r.to_dict() for _,r in universe.iterrows()} if not universe.empty else {}
+    for z in rows:
+        lanes=set(z.get("lanes") or [])
+        if not ({"A2_HYBRID","A3_ROTATION"} & lanes):
+            z["reversal_state"]="NOT_APPLICABLE"; z["reversal_confirmed"]=False
+            continue
+        u=umap.get(z["code"],{})
+        price=_f(z.get("current_price")); vwap=_f(z.get("session_vwap")); cl=_f(u.get("close_location"))
+        sea=_f(u.get("sector_energy")); sed=_f(u.get("sector_energy_delta")); br=_f(u.get("sector_breadth"))
+        momentum=_f(u.get("price_momentum")); ta=_f(u.get("stock_turnover_accel"))
+        reaccel=(_b(u.get("turnover_reaccel")) is True) or (_b(u.get("volume_reaccel")) is True) or (math.isfinite(ta) and ta>=cfg.rotation_turnover_accel_min)
+        program_decision=str(z.get("program_decision") or "")
+        fvals=[_flow_sign(z.get("foreign_level")),_flow_sign(z.get("institution_level")),_flow_sign(z.get("program_level"))]
+        flow_avail=sum(v is not None for v in fvals); flow_pos=sum(v is True for v in fvals)
+        flow_pass=flow_avail>=cfg.reversal_flow_min_available and flow_pos>=cfg.reversal_flow_min_positive
+        sector_ok=None if not (math.isfinite(sea) or math.isfinite(sed)) else ((math.isfinite(sed) and sed>0) or (math.isfinite(sea) and sea>=cfg.reversal_sector_energy_floor))
+        breadth_ok=None if not math.isfinite(br) else br>=cfg.reversal_sector_breadth_min
+        vwap_ok=None if not(math.isfinite(price) and math.isfinite(vwap)) else price>=vwap*(1-cfg.reversal_vwap_buffer_pct)
+        close_ok=None if not math.isfinite(cl) else cl>=cfg.reversal_close_location_min
+        momentum_ok=None if not math.isfinite(momentum) else momentum>=0
+        # structure stop: VWAP reclaim buffer; fail only when a calculable stop is >6% away.
+        stop_ref=vwap*0.985 if math.isfinite(vwap) and vwap>0 else math.nan
+        stop_width=((price/stop_ref)-1)*100 if math.isfinite(price) and math.isfinite(stop_ref) and stop_ref>0 else math.nan
+        stop_ok=None if not math.isfinite(stop_width) else stop_width<=cfg.reversal_stop_max_pct
+        tests={
+            "VWAP_RECLAIM_HOLD":vwap_ok,
+            "CLOSE_LOCATION":close_ok,
+            "ACTIVITY_REACCEL":bool(reaccel),
+            "PRICE_MOMENTUM":momentum_ok,
+            "SECTOR_ENERGY":sector_ok,
+            "SECTOR_BREADTH":breadth_ok,
+            "FLOW_2OF3":flow_pass,
+            "STOP_WIDTH_LE_6":stop_ok,
+        }
+        passed=sum(v is True for v in tests.values()); available=sum(v is not None for v in tests.values())
+        blocked=bool(program_decision in BLOCK_PROGRAM or z.get("risk_block"))
+        no_chase=bool(z.get("no_chase"))
+        if blocked:
+            state="REVERSAL_BLOCKED_PROGRAM"
+        elif no_chase:
+            state="REVERSAL_NO_CHASE"
+        elif flow_pass and vwap_ok is True and close_ok is True and reaccel and stop_ok is not False and passed>=cfg.reversal_confirm_min_pass:
+            state="REVERSAL_CONFIRMED"
+        elif vwap_ok is True and close_ok is True and reaccel and passed>=cfg.reversal_armed_min_pass:
+            state="REVERSAL_ARMED"
+        else:
+            state="REVERSAL_WATCH"
+        z["reversal_state"]=state
+        z["reversal_confirmed"]=state=="REVERSAL_CONFIRMED"
+        z["reversal_detail"]={"tests":tests,"passed":passed,"available":available,"flow_positive":flow_pos,"flow_available":flow_avail,"stop_width_pct":stop_width,"program_decision":program_decision}
+        # confirmed capital re-entry is a first-class candidate, not an X2 reject.
+        if state=="REVERSAL_CONFIRMED": z["fusion_rank"]=_f(z.get("fusion_rank"),0)+4.0
+        elif state=="REVERSAL_ARMED": z["fusion_rank"]=_f(z.get("fusion_rank"),0)+1.5
+    return rows
+
 FRESH_PRIORITY={
-    "BUY":100,"BUY_ARMED":90,"PRIMARY_SELECTED":80,"X2_DUAL_PASS":75,"X2_ASYM_PASS":70,"X2_VCP_PASS":65,
+    "BUY":100,"BUY_ARMED":90,"PRIMARY_SELECTED":80,"X2_CORE_ELIGIBLE":78,"REVERSAL_CONFIRMED":76,
+    "REVERSAL_ARMED":68,"X2_SHORT_PASS_WAIT_LONG":66,
     "ROTATION_PRIME":60,"HYBRID_PRIME":60,"SHOCK_TRIGGER":60,"TRIGGER":60,
     "HYBRID_ARMED":50,"PRE_EXPLOSION_ARMED":50,"ROTATION_ARMED":50,
     "EARLY_EXPLOSION":40,"ROTATION_WATCH":35,"WAIT_MINUTE_DATA":30,"X2_PENDING_HISTORY":20,
@@ -23474,7 +23584,7 @@ FRESH_PRIORITY={
 
 
 def best_level(z: Mapping[str,Any]) -> int:
-    vals=[FRESH_PRIORITY.get(str(z.get("x2_state") or ""),0),FRESH_PRIORITY.get(str(z.get("final_state") or ""),0)]
+    vals=[FRESH_PRIORITY.get(str(z.get("x2_state") or ""),0),FRESH_PRIORITY.get(str(z.get("reversal_state") or ""),0),FRESH_PRIORITY.get(str(z.get("final_state") or ""),0)]
     for x in z.get("lane_details") or []:
         vals.append(FRESH_PRIORITY.get(str(x.get("grade") or ""),0))
     return max(vals or [0])
@@ -23512,24 +23622,43 @@ def apply_freshness(rows: List[dict], state_file: Path, cfg: V3Config) -> Tuple[
 
 
 def apply_selection(rows: List[dict], cfg: V3Config) -> List[dict]:
+    """Select across two independent valid paths: CORE(X2) or REVERSAL_CONFIRM.
+
+    REVERSAL_ARMED is retained for monitoring but is not force-filled into the
+    final selected slots.  Minute Delta still owns the final BUY decision.
+    """
     selected=0
+    # rank first so confirmed paths compete fairly for the limited 3 slots
+    rows.sort(key=lambda z:(
+        bool(z.get("risk_block")), bool(z.get("no_chase")),
+        0 if z.get("x2_core_support") else (1 if z.get("reversal_confirmed") else 2),
+        -_f(z.get("fusion_rank"),0), z.get("code","")
+    ))
     for z in rows:
         if z.get("risk_block"):
             z["selection_state"]="REJECT_RISK"
         elif z.get("no_chase"):
             z["selection_state"]="NO_CHASE"
-        elif z.get("x2_support"):
+        elif z.get("x2_core_support") or z.get("reversal_confirmed"):
             if selected<cfg.max_actionable:
                 z["selection_state"]="PRIMARY_SELECTED"; selected+=1
             else:
                 z["selection_state"]="PRIMARY_RESERVE"
-        elif z.get("x2_state")=="X2_PENDING_HISTORY":
+        elif z.get("reversal_state")=="REVERSAL_ARMED":
+            z["selection_state"]="PRIMARY_ARMED"
+        elif z.get("x2_state") in {"X2_PENDING_HISTORY","X2_SHORT_PASS_WAIT_LONG"}:
             z["selection_state"]="PRIMARY_WAIT_HISTORY"
         else:
-            z["selection_state"]="REJECT_X2"
-        z["final_state"]="WAIT_MINUTE_DATA" if z["selection_state"] in {"PRIMARY_SELECTED","PRIMARY_RESERVE"} else z["selection_state"]
+            z["selection_state"]="WATCH_NOT_CONFIRMED"
+        if z["selection_state"] in {"PRIMARY_SELECTED","PRIMARY_RESERVE"}:
+            z["final_state"]="WAIT_MINUTE_DATA"
+            if z.get("reversal_confirmed") and not z.get("x2_core_support"):
+                z["armed_reason"]="ROTATION_BUY_ARMED"
+        elif z["selection_state"]=="PRIMARY_ARMED":
+            z["final_state"]="ROTATION_BUY_ARMED"
+        else:
+            z["final_state"]=z["selection_state"]
     return rows
-
 
 def apply_entry(rows: List[dict], minute_bars_path: Optional[str], entry_mod: Any, base_dir: Path) -> Tuple[List[dict], List[dict]]:
     if not minute_bars_path:
@@ -23592,14 +23721,15 @@ def run_live_once(
                     hcache[c]=overlay_live(h,{"price":urow.get(c,{}).get("current_price"),"open_price":urow.get(c,{}).get("open"),"high_price":urow.get(c,{}).get("high"),"low_price":urow.get(c,{}).get("low"),"volume":urow.get(c,{}).get("volume")})
 
     market_map={c:str((maps["alpha_stock"].get(c) or {}).get("market") or "KRX") for c in hcache}
-    union=apply_x2(union,hcache,market_map,x2)
+    union=apply_x2(union,hcache,market_map,x2,v17)
+    union=apply_reversal_confirm(union,universe,cfg)
     union=apply_selection(union,cfg)
     union,entry_events=apply_entry(union,minute_bars,entry,root)
     union,drops=apply_freshness(union,Path(state_file),cfg)
 
     # NEW/UPGRADE/REENTRY first, then selected, then rank. HOLD remains visible but not re-announced as NEW.
     fresh_order={"NEW":0,"UPGRADE":1,"REENTRY":2,"HOLD":3}
-    sel_order={"PRIMARY_SELECTED":0,"PRIMARY_RESERVE":1,"PRIMARY_WAIT_HISTORY":2,"NO_CHASE":3,"REJECT_X2":4,"REJECT_RISK":5}
+    sel_order={"PRIMARY_SELECTED":0,"PRIMARY_RESERVE":1,"PRIMARY_ARMED":2,"PRIMARY_WAIT_HISTORY":3,"NO_CHASE":4,"WATCH_NOT_CONFIRMED":5,"REJECT_RISK":6}
     union.sort(key=lambda z:(fresh_order.get(z.get("freshness"),9),sel_order.get(z.get("selection_state"),9),-float(z.get("fusion_rank",0))))
 
     summary={
@@ -23611,7 +23741,9 @@ def run_live_once(
         "counts":{
             "live_rows":len(maps["live"]),"eligible_universe":len(universe),
             "a1_v17":len(v17_lane),"a2_hybrid":len(hybrid_lane),"a3_rotation":len(rotation_lane),
-            "union":len(union),"x2_supported":sum(bool(z.get("x2_support")) for z in union),
+            "union":len(union),"x2_supported":sum(bool(z.get("x2_core_support")) for z in union),
+            "reversal_confirmed":sum(bool(z.get("reversal_confirmed")) for z in union),
+            "reversal_armed":sum(z.get("reversal_state")=="REVERSAL_ARMED" for z in union),
             "primary_selected":sum(z.get("selection_state")=="PRIMARY_SELECTED" for z in union),
             "new":sum(z.get("freshness")=="NEW" for z in union),
             "upgrade":sum(z.get("freshness")=="UPGRADE" for z in union),
@@ -23625,6 +23757,7 @@ def run_live_once(
         "principles":[
             "Discovery is three independent lanes; V1.7 cannot monopolize candidates.",
             "Candidate selection precedes entry timing.",
+            "X2 is CORE-only; HYBRID/ROTATION use independent REVERSAL_CONFIRM.",
             "No forced fill. Missing minute Delta never becomes BUY.",
             "KIS authority; LS auxiliary/history/sector only.",
             "Repeated names are marked HOLD, not NEW.",
@@ -23634,7 +23767,7 @@ def run_live_once(
     (outdir/"FULLMARKET_V3_LATEST.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2,default=str),encoding="utf-8")
     flat=[]
     for z in union:
-        flat.append({k:v for k,v in z.items() if k not in {"lane_details","x2_detail","entry_event"}})
+        flat.append({k:v for k,v in z.items() if k not in {"lane_details","x2_detail","reversal_detail","entry_event"}})
     pd.DataFrame(flat).to_csv(outdir/"FULLMARKET_V3_CANDIDATES.csv",index=False,encoding="utf-8-sig")
     pd.DataFrame(drops).to_csv(outdir/"FULLMARKET_V3_DROPS.csv",index=False,encoding="utf-8-sig")
     history.close()
@@ -23653,7 +23786,14 @@ def selftest(base_dir: Optional[str|Path]=None) -> Dict[str,Any]:
     assert not any(x["code"]=="222222" for x in rot), "rotation chase filter failed"
     uni=union_lanes([[],[],rot],u,cfg)
     assert uni and uni[0]["lanes"]==["A3_ROTATION"]
-    return {"engine":ENGINE_VERSION,"rotation_new_candidate":"PASS","no_chase":"PASS","lane_union":"PASS"}
+    # Capital-reentry path must survive without X2 history when live evidence + 2/3 flow are present.
+    uu=u.copy(); uu.loc[uu["code"]=="111111","foreign_level"]=1000; uu.loc[uu["code"]=="111111","institution_level"]=2000; uu.loc[uu["code"]=="111111","program_level"]=-100
+    uni[0]["foreign_level"]=1000; uni[0]["institution_level"]=2000; uni[0]["program_level"]=-100; uni[0]["x2_core_support"]=False; uni[0]["x2_state"]="X2_PENDING_HISTORY"
+    uni=apply_reversal_confirm(uni,uu,cfg)
+    assert uni[0]["reversal_state"]=="REVERSAL_CONFIRMED", uni[0].get("reversal_detail")
+    uni=apply_selection(uni,cfg)
+    assert uni[0]["selection_state"]=="PRIMARY_SELECTED" and uni[0].get("armed_reason")=="ROTATION_BUY_ARMED"
+    return {"engine":ENGINE_VERSION,"rotation_new_candidate":"PASS","no_chase":"PASS","lane_union":"PASS","reversal_confirm":"PASS","x2_core_only":"PASS"}
 
 
 def parse_args():
@@ -23673,11 +23813,10 @@ def main():
     if a.selftest:
         print(json.dumps(selftest(),ensure_ascii=False,indent=2)); return
     s=run_live_once(a.kis_base,a.ls_base,a.history_db,a.state_file,a.output_dir,a.minute_bars)
-    print(json.dumps({"engine":s["engine_version"],"generated_at":s["generated_at"],"counts":s["counts"],"top":[{"code":x.get("code"),"name":x.get("name"),"freshness":x.get("freshness"),"lanes":x.get("lanes"),"x2":x.get("x2_state"),"selection":x.get("selection_state"),"final":x.get("final_state")} for x in s["candidates"][:10]]},ensure_ascii=False,indent=2))
+    print(json.dumps({"engine":s["engine_version"],"generated_at":s["generated_at"],"counts":s["counts"],"top":[{"code":x.get("code"),"name":x.get("name"),"freshness":x.get("freshness"),"lanes":x.get("lanes"),"x2":x.get("x2_state"),"reversal":x.get("reversal_state"),"selection":x.get("selection_state"),"final":x.get("final_state")} for x in s["candidates"][:10]]},ensure_ascii=False,indent=2))
 
 if __name__=="__main__":
     main()
-
 FULLMARKET_V3_MAIN_PY
 
 COPY <<'FULLMARKET_V3_V17_PY' /app/V1_7_ACTION_PRE_운영본.py
@@ -27525,7 +27664,7 @@ FULLMARKET_V3_MVWAP_PY
 COPY <<'FULLMARKET_V3_HTTP_BRIDGE_PY' /app/fullmarket_v3_http_bridge.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""HTTPServer bridge for ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_0.
+"""HTTPServer bridge for ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_1.
 Designed for the existing LS alpha500 one-box service using BaseHTTPRequestHandler.
 """
 from __future__ import annotations
@@ -27537,11 +27676,11 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_0 import ENGINE_VERSION, V3Config, run_live_once
+from ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_1 import ENGINE_VERSION, V3Config, run_live_once
 
 
 class FullMarketV3Bridge:
-    VERSION = "FULLMARKET_V3_HTTP_BRIDGE_V1_0"
+    VERSION = "FULLMARKET_V3_HTTP_BRIDGE_V1_1"
 
     def __init__(self) -> None:
         self.enabled = os.getenv("FULLMARKET_V3_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
@@ -27627,7 +27766,7 @@ class FullMarketV3Bridge:
             "output_dir": self.output_dir,
             "minute_bars": self.minute_bars,
             "runtime": dict(self.runtime),
-            "policy": "KIS_AUTHORITY__LS_AUXILIARY__A1_A2_A3_INDEPENDENT_DISCOVERY__X2_AFTER_UNION__NO_FORCED_FILL",
+            "policy": "KIS_AUTHORITY__THREE_LANES__X2_CORE_ONLY__REVERSAL_CONFIRM_FOR_HYBRID_ROTATION__NO_FORCED_FILL",
         }
 
     def handle_get(self, raw_path: str) -> Optional[Tuple[int, Dict[str, Any]]]:
@@ -27667,7 +27806,6 @@ class FullMarketV3Bridge:
 
 
 BRIDGE = FullMarketV3Bridge()
-
 FULLMARKET_V3_HTTP_BRIDGE_PY
 
 COPY <<'FULLMARKET_V3_PATCH_PY' /tmp/apply_fullmarket_v3_patch.py
@@ -27723,7 +27861,7 @@ FULLMARKET_V3_PATCH_PY
 
 RUN python /tmp/apply_fullmarket_v3_patch.py \
  && python -m py_compile \
-      /app/ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_0.py \
+      /app/ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_1.py \
       /app/V1_7_ACTION_PRE_운영본.py \
       /app/V1_7_ACTION_PRE_HYBRID_DISCOVERY_V1_1.py \
       /app/ALPHA_WINRATE_X2_62.py \
@@ -27732,7 +27870,7 @@ RUN python /tmp/apply_fullmarket_v3_patch.py \
       /app/fullmarket_v3_http_bridge.py \
       /app/오백종목_통합엔진_웹서비스_V1_0.py \
  && cd /app \
- && python ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_0.py --selftest \
+ && python ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_1.py --selftest \
  && python - <<'PY'
 from pathlib import Path
 s=Path('/app/오백종목_통합엔진_웹서비스_V1_0.py').read_text(encoding='utf-8')
