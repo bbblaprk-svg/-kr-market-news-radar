@@ -15,7 +15,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UNIVERSE_TARGET=500 \
     LIQUIDITY_ANCHORS=100 \
     LIQUIDITY_WINDOW_DAYS=20 \
-    PULSE_MIN_MARKET_CAP_100M=1000 \
+    PULSE_MIN_MARKET_CAP_100M=700 \
     STAGE2_CANDIDATES=70 \
     DEEP_CANDIDATES=30 \
     FINAL_TOP_N=10 \
@@ -1207,7 +1207,7 @@ class Alpha500Integrated(TwoStageDeepScanner):
             valid = valid[valid["매수후보"].astype(str).str.upper().eq("Y")]
         if "ENERGY_EXCLUDE" in valid.columns:
             valid = valid[valid["ENERGY_EXCLUDE"].astype(str).str.upper().ne("Y")]
-        min_cap = env_float("PULSE_MIN_MARKET_CAP_100M", 1000.0)
+        min_cap = env_float("PULSE_MIN_MARKET_CAP_100M", 700.0)
         if "market_cap_100m" in valid.columns:
             cap = pd.to_numeric(valid["market_cap_100m"], errors="coerce")
             valid = valid[cap.ge(min_cap)]
@@ -1248,7 +1248,7 @@ class Alpha500Integrated(TwoStageDeepScanner):
             x = x[x["매수후보"].astype(str).str.upper().eq("Y")]
         if "ENERGY_EXCLUDE" in x.columns:
             x = x[x["ENERGY_EXCLUDE"].astype(str).str.upper().ne("Y")]
-        min_cap = env_float("PULSE_MIN_MARKET_CAP_100M", 1000.0)
+        min_cap = env_float("PULSE_MIN_MARKET_CAP_100M", 700.0)
         if "market_cap_100m" not in x.columns:
             return x.iloc[0:0].copy()
         cap = pd.to_numeric(x["market_cap_100m"], errors="coerce")
@@ -2100,7 +2100,7 @@ class Universe500Selector:
         self.target = env_int("UNIVERSE_TARGET", 500)
         self.anchor_n = env_int("LIQUIDITY_ANCHORS", 100)
         self.liq_window = env_int("LIQUIDITY_WINDOW_DAYS", 20)
-        self.min_cap_100m = env_float("PULSE_MIN_MARKET_CAP_100M", 1000.0)
+        self.min_cap_100m = env_float("PULSE_MIN_MARKET_CAP_100M", 700.0)
         self.scan_rank_n = env_int("LIQUIDITY_SCAN_N", 220)
         self.min_cluster_keep = env_int("ENERGY_MIN_MEMBERS", 3)
         self.data_dir = Path(os.getenv("ALPHA500_DATA_DIR", "/data"))
@@ -31284,3 +31284,401 @@ RUN python -m py_compile /tmp/apply_nxt_v52_discovery_lock.py /tmp/nxt_v52_disco
  && grep -Fq 'NXT_V5_2_DISCOVERY_LOCK_BRIDGE' /app/거래량가속_완만상승_LS브리지_V2.py \
  && echo 'NXT_V5_2_DISCOVERY_LOCK_BUILD_VALIDATION_PASS'
 # NXT_V5_2_DISCOVERY_LOCK_DOCKER_PATCH_END
+
+# NXT_V5_2_2_RUNTIME_CORRECTION_DOCKER_PATCH_BEGIN
+ENV NXT_V522_KIS_TIMEOUT_SEC=15 \
+    NXT_V522_FALLBACK_TTL_SEC=30 \
+    NXT_V522_MIN_CAP_100M=700 \
+    NXT_V522_CAP_AUTH_PATH=/data/results/NXT_V522_KIS_CAP_AUTH.json
+
+COPY <<'NXT_V522_RUNTIME_CORRECTION_PATCH_EOF' /tmp/apply_nxt_v522_runtime_correction.py
+#!/usr/bin/env python3
+from pathlib import Path
+import sys
+
+MARK='NXT_V5_2_2_RUNTIME_CORRECTION'
+
+BLOCK = r'''
+# NXT_V5_2_2_RUNTIME_CORRECTION
+# Additive runtime correction. Existing V5/V5.1/V5.2 definitions are preserved above;
+# these wrappers shadow only the broken runtime junctions.
+_NXT_V522_CAP_AUTH_PATH = Path(os.getenv("NXT_V522_CAP_AUTH_PATH", str(RESULT_DIR / "NXT_V522_KIS_CAP_AUTH.json")))
+_NXT_V522_CAP_CACHE = {"at":0.0,"rows":{},"source":None,"source_at":None,"error":None}
+
+
+def _nxt_v522_today():
+    try: return now_kst().strftime("%Y-%m-%d")
+    except Exception: return datetime.now(KST).strftime("%Y-%m-%d")
+
+
+def _nxt_v522_extract_caps(obj):
+    out={}; seen=set()
+    def walk(x, depth=0):
+        if x is None or depth>12: return
+        if isinstance(x, dict):
+            oid=id(x)
+            if oid in seen: return
+            seen.add(oid)
+            c=str(x.get("code") or x.get("symbol") or "").zfill(6)
+            v=_cb_num(x.get("market_cap_100m"),0.0)
+            if c.isdigit() and len(c)==6 and v>0: out[c]=v
+            for q in x.values():
+                if isinstance(q,(dict,list,tuple)): walk(q,depth+1)
+        elif isinstance(x,(list,tuple)):
+            oid=id(x)
+            if oid in seen: return
+            seen.add(oid)
+            for q in x: walk(q,depth+1)
+    walk(obj)
+    return out
+
+
+def _nxt_v522_load_json_caps(path, require_trade_date=False):
+    try:
+        p=Path(path)
+        if not p.exists(): return {},None
+        obj=json.loads(p.read_text(encoding="utf-8"))
+        if require_trade_date and isinstance(obj,dict):
+            td=str(obj.get("trade_date") or "")
+            if td and td!=_nxt_v522_today(): return {},None
+        if isinstance(obj,dict) and isinstance(obj.get("rows"),dict):
+            rows={str(k).zfill(6):_cb_num(v,0.0) for k,v in obj.get("rows",{}).items()}
+            return {k:v for k,v in rows.items() if k.isdigit() and len(k)==6 and v>0}, str(obj.get("source") or "PERSISTED")
+        # LS daily cap-map is a direct code->cap dict.
+        if isinstance(obj,dict):
+            rows={str(k).zfill(6):_cb_num(v,0.0) for k,v in obj.items() if not isinstance(v,(dict,list,tuple))}
+            rows={k:v for k,v in rows.items() if k.isdigit() and len(k)==6 and v>0}
+            if rows: return rows,"LS_LOCAL_CAP_MAP"
+        return _nxt_v522_extract_caps(obj),"LOCAL_JSON"
+    except Exception:
+        return {},None
+
+
+def _nxt_v522_save_authority(rows, source_at=None):
+    try:
+        if not rows: return
+        _NXT_V522_CAP_AUTH_PATH.parent.mkdir(parents=True,exist_ok=True)
+        tmp=Path(str(_NXT_V522_CAP_AUTH_PATH)+".tmp")
+        tmp.write_text(json.dumps({"trade_date":_nxt_v522_today(),"saved_at_kst":now_kst_iso(),"source":"KIS_HTTP_AUTHORITY","source_at":source_at,"rows":rows},ensure_ascii=False,separators=(",",":")),encoding="utf-8")
+        tmp.replace(_NXT_V522_CAP_AUTH_PATH)
+    except Exception:
+        pass
+
+
+def _nxt_v522_local_krx_caps():
+    try:
+        snap=load_latest_for_venue("KRX")
+        if not isinstance(snap,dict): return {}
+        ts=str(snap.get("timestamp_kst") or snap.get("captured_at_kst") or "")[:10]
+        if ts and ts!=_nxt_v522_today(): return {}
+        return _nxt_v522_extract_caps(snap)
+    except Exception:
+        return {}
+
+
+def _nxt_v522_ls_cap_map():
+    try:
+        base=Path(os.getenv("ALPHA500_DATA_DIR","/data"))
+        p=base/("cap_map_"+now_kst().strftime("%Y%m%d")+".json")
+        rows,_=_nxt_v522_load_json_caps(p,False)
+        return rows
+    except Exception:
+        return {}
+
+
+def _nxt_v51_kis_cap(code):
+    """V5.2.2: actual requests import + KIS authority persistence + non-destructive local fallbacks."""
+    code=str(code or "").zfill(6)
+    nowm=time.monotonic(); c=_NXT_V522_CAP_CACHE
+    authority_ttl=max(60,int(_cb_num(os.getenv("NXT_V51_KIS_CAP_TTL_SEC","300"),300)))
+    fallback_ttl=max(10,int(_cb_num(os.getenv("NXT_V522_FALLBACK_TTL_SEC","30"),30)))
+    src=str(c.get("source") or "")
+    ttl=authority_ttl if src=="KIS_HTTP_AUTHORITY" else fallback_ttl
+    if c.get("rows") and nowm-float(c.get("at") or 0.0)<ttl:
+        v=_cb_num((c.get("rows") or {}).get(code),0.0)
+        return (v if v>0 else None),{"source":src,"source_at":c.get("source_at"),"error":c.get("error"),"cache_rows":len(c.get("rows") or {})}
+
+    errors=[]; rows={}; source=None; source_at=None
+    # 1) same-day persisted KIS authority from an earlier successful fetch.
+    p_rows,p_src=_nxt_v522_load_json_caps(_NXT_V522_CAP_AUTH_PATH,True)
+    if p_rows:
+        rows.update(p_rows); source="KIS_PERSISTED_AUTHORITY"
+
+    # 2) fresh KIS authority. Local import fixes the production NameError that V5.2 smoke masked.
+    base=os.getenv("NXT_V51_KIS_BASE",os.getenv("V3_KIS_BASE",os.getenv("MARKET_LEDGER_BASE","https://quant-signal-v3-7-51-clean2.onrender.com"))).rstrip("/")
+    timeout=max(5.0,min(30.0,_cb_num(os.getenv("NXT_V522_KIS_TIMEOUT_SEC","15"),15.0)))
+    try:
+        import requests as _requests
+        resp=_requests.get(base+"/api/ledger/latest/rows",params={"market":"KRX","limit":5000},timeout=timeout)
+        resp.raise_for_status(); obj=resp.json() if getattr(resp,"content",b"") else {}
+        fresh={}
+        for x in (obj.get("rows") or obj.get("data") or []) if isinstance(obj,dict) else []:
+            if not isinstance(x,dict): continue
+            cc=str(x.get("code") or x.get("symbol") or "").zfill(6); vv=_cb_num(x.get("market_cap_100m"),0.0)
+            if cc.isdigit() and len(cc)==6 and vv>0: fresh[cc]=vv
+        if fresh:
+            rows=fresh; source="KIS_HTTP_AUTHORITY"
+            manifest=obj.get("manifest") if isinstance(obj,dict) and isinstance(obj.get("manifest"),dict) else {}
+            source_at=obj.get("timestamp_kst") or obj.get("captured_at_kst") or obj.get("asof") or manifest.get("created_at") or manifest.get("completed_at")
+            _nxt_v522_save_authority(rows,source_at)
+        else: errors.append("KIS_HTTP_EMPTY")
+    except Exception as e:
+        errors.append(type(e).__name__+":"+str(e)[:160])
+
+    # 3) If authority is temporarily unavailable, use same-day local KRX snapshot; never overwrite authority.
+    if source not in {"KIS_HTTP_AUTHORITY","KIS_PERSISTED_AUTHORITY"}:
+        local=_nxt_v522_local_krx_caps()
+        if local:
+            rows=local; source="KRX_LOCAL_SAME_DAY"
+
+    # 4) Last fail-soft source is LS's own persisted daily cap-map already built by the liquidity engine.
+    if not rows:
+        local=_nxt_v522_ls_cap_map()
+        if local:
+            rows=local; source="LS_LOCAL_CAP_MAP"
+
+    c.update({"at":nowm,"rows":rows,"source":source,"source_at":source_at,"error":" | ".join(errors) if errors else None})
+    # keep V5.1 cache mirrored for existing diagnostics
+    try: _NXT_V51_CAP_CACHE.update({"at":nowm,"rows":rows,"source_at":source_at,"error":c.get("error")})
+    except Exception: pass
+    v=_cb_num(rows.get(code),0.0)
+    return (v if v>0 else None),{"source":source,"source_at":source_at,"error":c.get("error"),"cache_rows":len(rows)}
+
+
+def _nxt_v51_resolve_cap(o,code):
+    raw=_cb_num(o.get("market_cap_100m"),0.0)
+    if raw>0:
+        o["market_cap_source"]=str(o.get("market_cap_source") or "PRIMARY_ROW"); o["cap_resolution_source"]=o["market_cap_source"]
+        return raw
+    for k in ("kis_market_cap_100m","authority_market_cap_100m","market_cap_100m_kis"):
+        v=_cb_num(o.get(k),0.0)
+        if v>0:
+            o["market_cap_100m"]=v; o["market_cap_source"]="KIS_AUTHORITY_JOINED"; o["market_cap_raw_100m"]=raw; o["cap_resolution_source"]="KIS_AUTHORITY_JOINED"
+            return v
+    cap,meta=_nxt_v51_kis_cap(code)
+    o["market_cap_raw_100m"]=raw; o["kis_cap_fallback_meta"]=meta; o["cap_resolution_error"]=(meta or {}).get("error"); o["cap_cache_rows"]=(meta or {}).get("cache_rows")
+    src=str((meta or {}).get("source") or "")
+    if cap is not None and cap>0:
+        o["market_cap_100m"]=cap; o["cap_resolution_source"]=src
+        if src in {"KIS_HTTP_AUTHORITY","KIS_PERSISTED_AUTHORITY"}: o["market_cap_source"]="KIS_AUTHORITY_FALLBACK"
+        elif src=="KRX_LOCAL_SAME_DAY": o["market_cap_source"]="KRX_LOCAL_FALLBACK"
+        elif src=="LS_LOCAL_CAP_MAP": o["market_cap_source"]="LS_LOCAL_FALLBACK"
+        else: o["market_cap_source"]="LOCAL_FALLBACK"
+        return cap
+    o["market_cap_source"]="MISSING_PENDING"; o["cap_resolution_source"]="MISSING_PENDING"
+    return 0.0
+
+
+# Preserve the original V5.2 gate and shadow only the runtime data-integrity junction.
+_NXT_V522_GATE_BASE = _nxt_three_lane_gate
+
+def _nxt_three_lane_gate(r):
+    o=_NXT_V522_GATE_BASE(r)
+    cap=_cb_num(o.get("market_cap_100m"),0.0)
+    bars=int(_cb_num(o.get("nxt_bar_count"),0.0))
+    lane=str(o.get("close_bet_lane") or "")
+    need={"AFTER_REACCEL":30,"AFTER_HIGH_HOLD":60,"PRE_BREAKOUT_TRANSFER":120}.get(lane,30)
+    o["actual_series_bars"]=bars; o["series_required_bars"]=need; o["series_depth_status"]="PASS" if bars>=need else "PENDING"
+    o["series_provenance"]="VOLUME_DIRECTION._series actual bars; discovery signal bars are metadata only"
+    # User's standing eligibility rule is a hard gate, not a liquidity side effect.
+    min_cap=max(0.0,_cb_num(os.getenv("NXT_V522_MIN_CAP_100M","700"),700.0))
+    o["market_cap_floor_100m"]=min_cap
+    if cap>0 and cap<min_cap:
+        o["gate_status"]="BLOCK"
+        reasons=list(o.get("gate_fail_reasons") or [])
+        if "MARKET_CAP_LT_700" not in reasons: reasons.insert(0,"MARKET_CAP_LT_700")
+        o["gate_fail_reasons"]=reasons; o["gate_pending_reason"]=None
+        return o
+    if bars<need and str(o.get("gate_status") or "")!="BLOCK":
+        o["gate_status"]="PENDING"; o["gate_pending_reason"]=f"SERIES_DEPTH_{bars}_LT_{need}"
+    return o
+
+
+_NXT_V522_ACTION_BASE = _nxt_v51_replay_apply_action
+
+def _nxt_v51_replay_apply_action(o):
+    status=str(o.get("gate_status") or "FAIL")
+    if status=="PENDING":
+        o["after_entry_ready"]=False
+        if _cb_num(o.get("market_cap_100m"),0.0)<=0:
+            o.update({"final_action":"대기","action_code":"WAIT_CAP_DATA","action_reason":"시총 데이터 대기 · "+str(o.get("cap_resolution_error") or "")[:140]})
+        elif str(o.get("series_depth_status") or "")=="PENDING":
+            o.update({"final_action":"대기","action_code":"WAIT_SERIES_DATA","action_reason":f"실제 시계열 {int(_cb_num(o.get('actual_series_bars'),0))}봉 < 필요 {int(_cb_num(o.get('series_required_bars'),0))}봉; discovery_signal_bars로 대체하지 않음"})
+        else:
+            o.update({"final_action":"대기","action_code":"WAIT_DATA","action_reason":"V5 데이터 게이트 PENDING"})
+        return o
+    return _NXT_V522_ACTION_BASE(o)
+
+
+_NXT_V522_COMPACT_BASE = _nxt_v51_replay_compact
+
+def _nxt_v51_replay_compact(o):
+    d=_NXT_V522_COMPACT_BASE(o)
+    for k in ("cap_resolution_source","cap_resolution_error","cap_cache_rows","actual_series_bars","series_required_bars","series_depth_status","series_provenance","gate_pending_reason","market_cap_floor_100m"):
+        if k in o: d[k]=o.get(k)
+    return d
+
+
+_NXT_V522_REPLAY_BASE = build_nxt_v51_manual_replay
+
+def build_nxt_v51_manual_replay():
+    out=_NXT_V522_REPLAY_BASE()
+    if isinstance(out,dict) and out.get("ok"):
+        rows=out.get("discovery_evaluated") or out.get("discovery_top") or []
+        cap_counts={}; series_counts={}
+        for x in rows:
+            cap_counts[str(x.get("cap_resolution_source") or x.get("market_cap_source") or "UNKNOWN")]=cap_counts.get(str(x.get("cap_resolution_source") or x.get("market_cap_source") or "UNKNOWN"),0)+1
+            series_counts[str(x.get("series_depth_status") or "UNKNOWN")]=series_counts.get(str(x.get("series_depth_status") or "UNKNOWN"),0)+1
+        out["runtime_correction"]="NXT_V5_2_2_RUNTIME_CORRECTION"
+        out["market_cap_floor_100m"]=max(0.0,_cb_num(os.getenv("NXT_V522_MIN_CAP_100M","700"),700.0))
+        out["cap_source_counts"]=cap_counts; out["series_depth_counts"]=series_counts
+        out["data_integrity_contract"]="locked discovery names; KIS authority first; no fabricated historical bars"
+    return out
+'''
+
+
+def patch(path:Path):
+    s=path.read_text(encoding='utf-8')
+    if MARK in s:
+        print(MARK+'_ALREADY_PRESENT'); return
+    for req in ('NXT_V5_2_DISCOVERY_LOCK_APP','def _nxt_v51_kis_cap(','def _nxt_three_lane_gate(','def build_nxt_v51_manual_replay():'):
+        if req not in s: raise SystemExit('V522_REQUIRES:'+req)
+    anchor='\nif __name__ == "__main__":\n    main()'
+    if anchor not in s: raise SystemExit('V522_MAIN_ANCHOR_NOT_FOUND')
+    s=s.replace(anchor,'\n'+BLOCK.strip()+'\n\n'+anchor,1)
+    path.write_text(s,encoding='utf-8')
+    print(MARK+'_PATCH_PASS')
+
+if __name__=='__main__':
+    if len(sys.argv)!=2: raise SystemExit('usage: apply_nxt_v522_runtime_correction.py <app.py>')
+    patch(Path(sys.argv[1]))
+NXT_V522_RUNTIME_CORRECTION_PATCH_EOF
+
+COPY <<'NXT_V522_RUNTIME_CORRECTION_SMOKE_EOF' /tmp/nxt_v522_runtime_correction_smoke.py
+import importlib.util, sys, types, os, tempfile, json
+from pathlib import Path
+import requests
+
+root=Path('/app')
+bridge_path=root/'거래량가속_완만상승_LS브리지_V2.py'
+app_path=root/'오백종목_통합엔진_웹서비스_V1_0.py'
+td=Path(tempfile.mkdtemp(prefix='v522-smoke-'))
+os.environ['RESULT_DIR']=str(td/'results')
+os.environ['ALPHA500_DATA_DIR']=str(td/'data')
+os.environ['VOLUME_DIRECTION_STATE_PATH']=str(td/'short.json')
+os.environ['VOLUME_DIRECTION_HISTORY_PATH']=str(td/'hist.json')
+os.environ['NXT_V51_SESSION_STATE_PATH']=str(td/'full.json.gz')
+os.environ['NXT_V522_CAP_AUTH_PATH']=str(td/'results'/'NXT_V522_KIS_CAP_AUTH.json')
+os.environ['VOLUME_DIRECTION_MAX_BARS']='800'
+os.environ['NXT_V52_DISCOVERY_LOCK_N']='5'
+os.environ['NXT_V51_MANUAL_REPLAY_COOLDOWN_SEC']='5'
+os.environ['NXT_V522_KIS_TIMEOUT_SEC']='15'
+(td/'results').mkdir(parents=True,exist_ok=True); (td/'data').mkdir(parents=True,exist_ok=True)
+
+bridge_name='거래량가속_완만상승_LS브리지_V2'
+spec=importlib.util.spec_from_file_location(bridge_name,bridge_path); bm=importlib.util.module_from_spec(spec); sys.modules[bridge_name]=bm; spec.loader.exec_module(bm)
+im=types.ModuleType('오백종목_섹터에너지_알파하이킨아시_통합_V1_0')
+class DummyAlpha: pass
+im.Alpha500Integrated=DummyAlpha; im.market_session_now=lambda:{'venue':'NXT','scan_allowed':False}; sys.modules[im.__name__]=im
+spec2=importlib.util.spec_from_file_location('v522_test_app',app_path); app=importlib.util.module_from_spec(spec2); sys.modules['v522_test_app']=app; spec2.loader.exec_module(app)
+
+syms=[('029460','케이씨',4072),('241770','메카로',3002),('101160','월덱스',4260),('214430','아이쓰리시스템',4048),('299030','하나기술',843)]
+vd=bm.LSVolumeDirectionBridge(max_bars=800)
+today=bm.datetime.now(bm.KST).strftime('%Y-%m-%d'); base=bm.datetime.now(bm.KST).replace(hour=17,minute=56,second=0,microsecond=0)
+for idx,(code,name,cap) in enumerate(syms):
+    s=bm._Series(800); s.trade_date=today; px=10000+idx*1000
+    # 40 closed + current = 41 actual bars, while signal metadata says 90.
+    for i in range(40):
+        tt=(base+bm.timedelta(minutes=i*3)).isoformat(timespec='minutes'); p=px*(1+0.0001*i); s.bars.append(bm.MinuteBar(tt,p,p*1.001,p*.999,p,10000+i*100))
+    tt=(base+bm.timedelta(minutes=120)).isoformat(timespec='minutes'); s.current=bm.MinuteBar(tt,px*1.01,px*1.011,px*1.009,px*1.01,20000); s.last_update=tt
+    vd._series[('NXT',code)]=s
+    vd._signals[('NXT',code)]=bm.Signal(symbol=code,venue='NXT',minute=tt,combined_state='ACCEL',accel_state='ACCEL',steady_state='QUIET',score=100,accel_score=100,steady_score=10,volume_ratio=2,instant_volume_ratio=2,volume_acceleration=1,price_velocity_pct=.3,directionality=.9,efficiency=.9,higher_structure=.7,steady_return_pct=1,steady_slope_pct_per_30m=.1,positive_step_ratio=.7,max_drawdown_pct=.5,volume_persistence=.6,bars=90,entry_candidate=False,exit_candidate=False,reason='fixture')
+app.VOLUME_DIRECTION=vd; app.VOLUME_DIRECTION_ENABLED=True
+nxt_summary={'venue':'NXT','timestamp_kst':bm.datetime.now(bm.KST).isoformat(timespec='seconds'),'sector_live_pool':[{'symbol':c,'name':n,'current_price':10000+i*1000,'change_pct':4.0,'market_cap_100m':0,'cluster_state':'S2','energy_delta':.5,'energy_trend':'RISING','market_rs_score':70,'stage1_state':'UP_TREND'} for i,(c,n,_) in enumerate(syms)],'sector_energy':[]}
+# local KRX fixture intentionally has no caps in first test: force real cap function through fake requests.
+krx_summary={'venue':'KRX','timestamp_kst':bm.datetime.now(bm.KST).isoformat(timespec='seconds'),'universe':[]}
+app.load_latest_for_venue=lambda venue: nxt_summary if str(venue).upper()=='NXT' else krx_summary
+app._read_preclose=lambda venue:{}
+
+class Resp:
+    content=b'1'
+    def raise_for_status(self): return None
+    def json(self): return {'manifest':{'created_at':'fixture'},'rows':[{'code':c,'market_cap_100m':cap} for c,_,cap in syms]}
+orig_get=requests.get
+requests.get=lambda *a,**k: Resp()
+try:
+    app._NXT_V51_CAP_CACHE={'at':0.0,'rows':{},'source_at':None,'error':None}
+    app._NXT_V522_CAP_CACHE={'at':0.0,'rows':{},'source':None,'source_at':None,'error':None}
+    r=app.build_nxt_v51_manual_replay()
+finally:
+    requests.get=orig_get
+
+names=[x['name'] for x in r['discovery_top']]
+assert names==[n for _,n,_ in syms], names
+assert r['discovery_count']==5 and r['discovery_preserved_count']==5
+assert r['cap_missing_count']==0, r
+assert r.get('runtime_correction')=='NXT_V5_2_2_RUNTIME_CORRECTION'
+assert r.get('market_cap_floor_100m')==700, r.get('market_cap_floor_100m')
+assert r.get('cap_source_counts',{}).get('KIS_HTTP_AUTHORITY')==5, r.get('cap_source_counts')
+assert all(x['discovery_signal_bars']==90 for x in r['discovery_top'])
+assert all(x['actual_series_bars']==41 for x in r['discovery_top'])
+# All five names are >=700억 and therefore must not be cap-blocked; with only 41 honest bars they wait for series depth.
+for x in r['discovery_top']:
+    assert x['action_code']=='WAIT_SERIES_DATA', x
+    assert x['series_depth_status']=='PENDING' and x['series_required_bars']==60, x
+    assert 'MARKET_CAP_LT_700' not in (x.get('gate_fail_reasons') or []), x
+h=r['discovery_top'][4]
+assert h['market_cap_100m']==843 and h['gate_status']=='PENDING', h
+# Exact boundary check for the new hard floor: 699 blocks, 700 passes the cap rule.
+gate_base={'close_bet_lane':'AFTER_REACCEL','market_cap_100m':699,'nxt_bar_count':41,'gate_status':'PASS','gate_fail_reasons':[]}
+a=app._nxt_three_lane_gate(dict(gate_base)); assert a['gate_status']=='BLOCK' and 'MARKET_CAP_LT_700' in a['gate_fail_reasons'], a
+gate_base['market_cap_100m']=700
+b=app._nxt_three_lane_gate(dict(gate_base)); assert 'MARKET_CAP_LT_700' not in (b.get('gate_fail_reasons') or []), b
+
+# Second path: KIS HTTP outage + LS daily cap-map fallback, with no hard-coded stock values in the patch.
+cap_file=td/'data'/('cap_map_'+bm.datetime.now(bm.KST).strftime('%Y%m%d')+'.json')
+cap_file.write_text(json.dumps({c:cap for c,_,cap in syms},ensure_ascii=False),encoding='utf-8')
+# remove prior persisted KIS authority so this branch genuinely exercises LS local fallback
+auth_path=Path(os.environ['NXT_V522_CAP_AUTH_PATH'])
+if auth_path.exists(): auth_path.unlink()
+requests.get=lambda *a,**k: (_ for _ in ()).throw(RuntimeError('simulated outage'))
+try:
+    app._NXT_V51_CAP_CACHE={'at':0.0,'rows':{},'source_at':None,'error':None}
+    app._NXT_V522_CAP_CACHE={'at':0.0,'rows':{},'source':None,'source_at':None,'error':None}
+    o={'symbol':'029460','market_cap_100m':0}
+    cap=app._nxt_v51_resolve_cap(o,'029460')
+finally:
+    requests.get=orig_get
+assert cap==4072 and o['market_cap_source']=='LS_LOCAL_FALLBACK' and o['cap_resolution_source']=='LS_LOCAL_CAP_MAP', o
+assert 'RuntimeError:simulated outage' in str(o.get('cap_resolution_error')), o
+
+# Persistence no-shrink: rich full-session checkpoint must survive a shorter in-memory state.
+vd2=bm.LSVolumeDirectionBridge(max_bars=800)
+code='029460'; s2=bm._Series(800); s2.trade_date=today
+for i in range(240):
+    tt=(base+bm.timedelta(minutes=i)).isoformat(timespec='minutes'); p=10000+i
+    if i<239: s2.bars.append(bm.MinuteBar(tt,p,p,p,p,1000+i))
+    else: s2.current=bm.MinuteBar(tt,p,p,p,p,1000+i)
+vd2._series[('NXT',code)]=s2; vd2._save_v51_state(force=True)
+# replace memory with 41 bars then save; V5.2 merge-no-shrink must retain >=240 in checkpoint.
+short=bm._Series(800); short.trade_date=today
+for i in range(41):
+    tt=(base+bm.timedelta(minutes=199+i)).isoformat(timespec='minutes'); p=10200+i
+    if i<40: short.bars.append(bm.MinuteBar(tt,p,p,p,p,1000+i))
+    else: short.current=bm.MinuteBar(tt,p,p,p,p,1000+i)
+vd2._series[('NXT',code)]=short; vd2._save_v51_state(force=True)
+vd3=bm.LSVolumeDirectionBridge(max_bars=800)
+assert len(vd3._all_bars(vd3._series[('NXT',code)]))>=240, len(vd3._all_bars(vd3._series[('NXT',code)]))
+
+print('NXT_V5_2_2_RUNTIME_SMOKE_PASS order=5/5 kis_cap=5/5 no_requests_nameerror=PASS ls_fallback=PASS actual41_not_faked=PASS cap843_pass=PASS floor699_block_700_pass=PASS persistence_no_shrink=PASS')
+NXT_V522_RUNTIME_CORRECTION_SMOKE_EOF
+
+RUN python -m py_compile /tmp/apply_nxt_v522_runtime_correction.py /tmp/nxt_v522_runtime_correction_smoke.py \
+ && python /tmp/apply_nxt_v522_runtime_correction.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && python -m py_compile /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && PYTHONPATH=/app python /tmp/nxt_v522_runtime_correction_smoke.py \
+ && grep -Fq 'NXT_V5_2_2_RUNTIME_CORRECTION' /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && echo 'NXT_V5_2_2_RUNTIME_CORRECTION_BUILD_VALIDATION_PASS'
+# NXT_V5_2_2_RUNTIME_CORRECTION_DOCKER_PATCH_END
+
+# NXT_V5_2_3_CAP700_THRESHOLD_PATCH
