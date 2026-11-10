@@ -30727,11 +30727,12 @@ def build_nxt_v51_manual_replay():
         raise SystemExit('MANUAL_REPLAY_GET_ANCHOR_NOT_FOUND')
     s = s.replace(old, new, 1)
 
-    old = '''    def do_POST(self):\n        if urlparse(self.path).path == "/api/run":\n            return self.do_GET()\n        return self._json(404, {"error": "not found"})\n'''
-    new = '''    def do_POST(self):\n        path = urlparse(self.path).path\n        if path in {"/api/run", "/api/nxt-v51/manual-replay"}:\n            return self.do_GET()\n        return self._json(404, {"error": "not found"})\n'''
-    if old not in s:
-        raise SystemExit('MANUAL_REPLAY_POST_ANCHOR_NOT_FOUND')
-    s = s.replace(old, new, 1)
+    post_anchor = '    def do_POST(self):\n'
+    post_inject = '    def do_POST(self):\n        if urlparse(self.path).path == "/api/nxt-v51/manual-replay":\n            return self.do_GET()\n'
+    if post_anchor not in s:
+        raise SystemExit('MANUAL_REPLAY_POST_METHOD_NOT_FOUND')
+    if 'urlparse(self.path).path == "/api/nxt-v51/manual-replay"' not in s:
+        s = s.replace(post_anchor, post_inject, 1)
 
     p.write_text(s, encoding='utf-8')
     print(MARK + '_PATCH_PASS')
