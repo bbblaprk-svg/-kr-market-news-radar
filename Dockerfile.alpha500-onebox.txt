@@ -27917,7 +27917,7 @@ except Exception:
     psycopg = None
     Jsonb = None
 
-ENGINE_VERSION = "ALPHA_EOD_NEXTDAY_SELECT_THEN_ENTRY_V4_3_DUAL_V17"
+ENGINE_VERSION = "ALPHA_EOD_NEXTDAY_SELECT_THEN_ENTRY_V4_4_RECOVERY_REGATE"
 BOARD_VERSION = "NEXT_SESSION_BOARD_V3"
 KST = timezone(timedelta(hours=9))
 
@@ -28161,6 +28161,32 @@ def _v17_original_direct_snapshot(ls_base: str, max_age_seconds: int = 600) -> T
             "pre_count": int(_f(snap.get("pre_count"), 0)),
         })
     return snap, audit
+
+
+def _v17_recovery_ready(snap: Mapping[str, Any], audit: Mapping[str, Any]) -> Tuple[bool, str]:
+    """Allow one EOD re-gate only after the independent ORIGINAL feed has genuinely recovered.
+
+    READY alone is not enough: require either usable history or a real active V1.7 signal.
+    The snapshot helper already rejects stale HTTP/local artifacts.
+    """
+    if not snap:
+        return False, "NO_DIRECT_SNAPSHOT"
+    status = str(snap.get("status") or audit.get("status") or "").upper()
+    source = str(audit.get("source") or "NONE").upper()
+    if status != "READY":
+        return False, f"DIRECT_NOT_READY:{status or 'UNKNOWN'}"
+    if source not in {"LOCAL_ARTIFACT", "HTTP_ENDPOINT"}:
+        return False, f"DIRECT_SOURCE_UNVERIFIED:{source}"
+    history_ready = _f(snap.get("history_ready_count"), _f(audit.get("history_ready_count"), math.nan))
+    active_count = _f(snap.get("active_count"), _f(audit.get("active_count"), 0.0))
+    eligible_count = _f(snap.get("eligible_count"), _f(audit.get("eligible_count"), math.nan))
+    if math.isfinite(eligible_count) and eligible_count <= 0:
+        return False, "DIRECT_EMPTY_UNIVERSE"
+    if math.isfinite(history_ready) and history_ready > 0:
+        return True, "V17_HISTORY_RECOVERED"
+    if math.isfinite(active_count) and active_count > 0:
+        return True, "V17_ACTIVE_SIGNAL_RECOVERED"
+    return False, "DIRECT_READY_BUT_HISTORY_NOT_READY"
 
 
 def _merge_v17_original_direct(discovery: Mapping[str, Any], snap: Mapping[str, Any], audit: Mapping[str, Any]) -> dict:
@@ -28428,7 +28454,7 @@ def build_eod_board(
 
     board = {
         "engine_version": ENGINE_VERSION,
-        "quality_policy_version": "V4_3_DUAL_V17_CROSSCHECK",
+        "quality_policy_version": "V4_4_RECOVERY_REGATE",
         "board_version": BOARD_VERSION,
         "board_state": "FROZEN_FOR_NEXT_SESSION",
         "board_investment_state": investment_state,
@@ -28478,20 +28504,30 @@ def build_eod_board(
             "Zero official candidates is a valid NO_TRADE result; no forced fill.",
             "A1/A2 WAIT may promote only after next-day LIVE confirmation and minute/Delta evidence.",
             "BOARD symbols are immutable intraday; hard invalidation cancels but never substitutes.",
+            "Exception: DUAL_V17_DATA_LIMITED Board may re-gate exactly once after independent V1.7 ORIGINAL recovery.",
+            "Recovery monitoring checks V1.7 only; full-market discovery reruns only when recovery is confirmed.",
         ],
         "board_file": board_file,
     }
     return board
 
-def save_eod_board(board: Mapping[str, Any], board_path: Path, force: bool = False) -> dict:
+def save_eod_board(
+    board: Mapping[str, Any],
+    board_path: Path,
+    force: bool = False,
+    recovery_reselect: bool = False,
+) -> dict:
     old = _load_board(board_path)
     same_day = old.get("selection_trade_date") == board.get("selection_trade_date")
     same_policy = old.get("board_version") == board.get("board_version")
-    if same_day and same_policy and old.get("board_state") == "FROZEN_FOR_NEXT_SESSION" and not force:
+    if same_day and same_policy and old.get("board_state") == "FROZEN_FOR_NEXT_SESSION" and not force and not recovery_reselect:
         old["write_status"] = "KEPT_EXISTING_FROZEN_BOARD"
         return old
     out = dict(board)
-    if same_day and not same_policy:
+    if recovery_reselect:
+        out["write_status"] = "BOARD_RESELECTED_DATA_RECOVERY"
+        out["data_recovery_reselect_done"] = True
+    elif same_day and not same_policy:
         out["write_status"] = "BOARD_POLICY_MIGRATED"
         out["previous_board_version"] = old.get("board_version")
     else:
@@ -28611,26 +28647,64 @@ def run_eod_select(
     next_trade_date = args.next_trade_date or _next_weekday(now)
     board_path = Path(args.board_file)
 
-    # Same-day EOD board is immutable. Do not rerun the expensive full-market discovery.
+    # Same-day Board stays immutable except for one controlled data-recovery re-gate.
+    # Only a Board frozen under DUAL_V17_DATA_LIMITED can use this exception.
     existing = _load_board(board_path)
-    if (
+    same_day_frozen = (
         not force
         and existing.get("selection_trade_date") == trade_date
         and existing.get("board_state") == "FROZEN_FOR_NEXT_SESSION"
         and existing.get("board_version") == BOARD_VERSION
-    ):
-        existing["write_status"] = "KEPT_EXISTING_FROZEN_BOARD"
-        existing = _quality_audit_board(existing)
-        return {
-            "engine_version": ENGINE_VERSION,
-            "mode": "EOD_SELECT",
-            "generated_at_kst": _iso_kst(),
-            "board": existing,
-            "discovery_counts": existing.get("source_counts", {}),
-            "v17_meta": existing.get("v17_meta", {}),
-            "discovery_source": "FROZEN_BOARD_NO_RESCAN",
-            "note": "Same-day board already frozen; full-market rescan skipped.",
-        }
+    )
+    recovery_regate = False
+    recovery_trigger = None
+    recovery_snap: dict = {}
+    recovery_audit: dict = {}
+    if same_day_frozen:
+        limited = str(existing.get("data_quality_state") or "") == "DUAL_V17_DATA_LIMITED"
+        already_done = bool(existing.get("data_recovery_reselect_done"))
+        if limited and not already_done:
+            recovery_snap, recovery_audit = _v17_original_direct_snapshot(
+                args.ls_base,
+                max_age_seconds=max(120, int(getattr(args, "v17_direct_max_age", 600))),
+            )
+            recovery_regate, recovery_trigger = _v17_recovery_ready(recovery_snap, recovery_audit)
+            if not recovery_regate:
+                existing["write_status"] = "KEPT_EXISTING_FROZEN_BOARD"
+                existing["data_recovery_monitor"] = {
+                    "checked_at_kst": _iso_kst(),
+                    "state": "WAITING_FOR_V17_RECOVERY",
+                    "reason": recovery_trigger,
+                    "direct_source": recovery_audit.get("source"),
+                    "direct_status": recovery_audit.get("status"),
+                    "history_ready_count": recovery_audit.get("history_ready_count"),
+                    "active_count": recovery_audit.get("active_count"),
+                }
+                existing = _quality_audit_board(existing)
+                return {
+                    "engine_version": ENGINE_VERSION,
+                    "mode": "EOD_SELECT",
+                    "generated_at_kst": _iso_kst(),
+                    "board": existing,
+                    "discovery_counts": existing.get("source_counts", {}),
+                    "v17_meta": existing.get("v17_meta", {}),
+                    "v17_crosscheck": recovery_audit,
+                    "discovery_source": "FROZEN_BOARD_RECOVERY_MONITOR",
+                    "note": "Data-limited Board remains frozen; only V1.7 recovery status was checked.",
+                }
+        else:
+            existing["write_status"] = "KEPT_EXISTING_FROZEN_BOARD"
+            existing = _quality_audit_board(existing)
+            return {
+                "engine_version": ENGINE_VERSION,
+                "mode": "EOD_SELECT",
+                "generated_at_kst": _iso_kst(),
+                "board": existing,
+                "discovery_counts": existing.get("source_counts", {}),
+                "v17_meta": existing.get("v17_meta", {}),
+                "discovery_source": "FROZEN_BOARD_NO_RESCAN",
+                "note": "Same-day Board already frozen; full-market rescan skipped.",
+            }
 
     # Prefer the already-running V3 discovery snapshot to avoid duplicate API/CPU load.
     discovery = {}
@@ -28661,10 +28735,13 @@ def run_eod_select(
 
     # Independent V1.7 ORIGINAL EOD cross-check. This repairs A1 omissions without
     # letting direct PRE/ACTION bypass X2/reversal/live-entry confirmation.
-    direct_snap, direct_audit = _v17_original_direct_snapshot(
-        args.ls_base,
-        max_age_seconds=max(120, int(getattr(args, "v17_direct_max_age", 600))),
-    )
+    if recovery_regate and recovery_snap:
+        direct_snap, direct_audit = recovery_snap, recovery_audit
+    else:
+        direct_snap, direct_audit = _v17_original_direct_snapshot(
+            args.ls_base,
+            max_age_seconds=max(120, int(getattr(args, "v17_direct_max_age", 600))),
+        )
     discovery = _merge_v17_original_direct(discovery, direct_snap, direct_audit)
 
     board = build_eod_board(
@@ -28676,7 +28753,21 @@ def run_eod_select(
     )
     board["discovery_source"] = discovery_source
     board["v17_meta"] = discovery.get("v17_meta", {})
-    saved = save_eod_board(board, board_path, force=force)
+    if recovery_regate:
+        board["data_recovery_reselect_done"] = True
+        board["data_recovery_reselect_at_kst"] = _iso_kst()
+        board["data_recovery_trigger"] = recovery_trigger
+        board["previous_data_quality_state"] = existing.get("data_quality_state")
+        board["previous_board_codes"] = sorted(_board_code_set(existing))
+        board["previous_board_investment_state"] = existing.get("board_investment_state")
+        board["recovery_direct_audit"] = {
+            "source": direct_audit.get("source"),
+            "status": direct_audit.get("status"),
+            "generated_at": direct_audit.get("generated_at"),
+            "history_ready_count": direct_audit.get("history_ready_count"),
+            "active_count": direct_audit.get("active_count"),
+        }
+    saved = save_eod_board(board, board_path, force=force, recovery_reselect=recovery_regate)
     return {
         "engine_version": ENGINE_VERSION,
         "mode": "EOD_SELECT",
@@ -28892,6 +28983,23 @@ def selftest() -> dict:
     assert wait["candidates"][0]["eod_role"] == "EOD_WAIT"
     assert wait["candidates"][0]["entry_permission"] == "LIVE_CONFIRM_REQUIRED"
 
+    # Recovery gate: READY alone is insufficient; history or an actual active signal is required.
+    ok0, why0 = _v17_recovery_ready(
+        {"status":"READY","history_ready_count":0,"active_count":0,"eligible_count":500},
+        {"source":"HTTP_ENDPOINT","status":"READY"},
+    )
+    assert not ok0 and why0 == "DIRECT_READY_BUT_HISTORY_NOT_READY"
+    ok1, why1 = _v17_recovery_ready(
+        {"status":"READY","history_ready_count":12,"active_count":0,"eligible_count":500},
+        {"source":"HTTP_ENDPOINT","status":"READY"},
+    )
+    assert ok1 and why1 == "V17_HISTORY_RECOVERED"
+    ok2, why2 = _v17_recovery_ready(
+        {"status":"READY","history_ready_count":0,"active_count":1,"eligible_count":500},
+        {"source":"LOCAL_ARTIFACT","status":"READY"},
+    )
+    assert ok2 and why2 == "V17_ACTIVE_SIGNAL_RECOVERED"
+
     # Same-day board is immutable under the same policy, but policy migration can replace it once.
     import tempfile
     with tempfile.TemporaryDirectory() as td:
@@ -28899,6 +29007,14 @@ def selftest() -> dict:
         first = save_eod_board(b, bp, force=False)
         same = save_eod_board(b, bp, force=False)
         assert same["write_status"] == "KEPT_EXISTING_FROZEN_BOARD"
+        recovery_board = dict(b)
+        recovery_board["data_quality_state"] = "CHECKED"
+        recovery_board["data_recovery_trigger"] = "V17_HISTORY_RECOVERED"
+        recovered_save = save_eod_board(recovery_board, bp, force=False, recovery_reselect=True)
+        assert recovered_save["write_status"] == "BOARD_RESELECTED_DATA_RECOVERY"
+        assert recovered_save["data_recovery_reselect_done"] is True
+        same_after_recovery = save_eod_board(recovery_board, bp, force=False)
+        assert same_after_recovery["write_status"] == "KEPT_EXISTING_FROZEN_BOARD"
         old_policy = dict(first); old_policy["board_version"] = "NEXT_SESSION_BOARD_V1"
         _write_json(bp, old_policy)
         migrated = save_eod_board(b, bp, force=False)
@@ -28943,6 +29059,7 @@ def selftest() -> dict:
         "dual_v17_direct_crosscheck":"PASS",
         "direct_v17_recovery_wait_only":"PASS",
         "dual_v17_data_limited_explicit":"PASS",
+        "data_limited_one_time_recovery_regate":"PASS",
         "next_eod_reset":"PASS",
         "hard_cancel_no_substitute":"PASS",
     }
@@ -29303,239 +29420,668 @@ for mark in [
 print('FULLMARKET_V3_AND_EOD_NEXTDAY_V4_BUILD_VALIDATION_PASS')
 PY
 
-# V17_HISTORY_SELFHEAL_PATCH_V1
-# Scope: V1.7 ORIGINAL only.
-# Does NOT modify KIS ledger, LS t1632/t1636/t1637, Context ledger,
-# KRX/NXT separation, or the existing alpha500_bars.sqlite3 cache.
-ENV V17_ORIGINAL_HISTORY_DB=/data/v17_original_history.sqlite3 \
-    V17_ORIGINAL_HISTORY_BOOTSTRAP_ENABLED=true \
-    V17_ORIGINAL_HISTORY_BOOTSTRAP_BATCH=20 \
-    V17_ORIGINAL_HISTORY_BOOTSTRAP_RPM=90 \
-    V17_ORIGINAL_HISTORY_BOOTSTRAP_RETRY_SECONDS=300
-
-RUN python - <<'PY'
+# SURVIVAL_GUARD_V1_DEPLOY_BEGIN
+COPY <<'SURVIVAL_GUARD_V1_PY_9F21' /app/survival_guard_v1.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import json, math, os
+from dataclasses import dataclass, asdict
 from pathlib import Path
+from typing import Any, Mapping
 
-p = Path("/app/v17_original_ls_bridge.py")
-s = p.read_text(encoding="utf-8")
-original = s
+ENGINE_VERSION="SURVIVAL_GUARD_V1_2_REVERSE_VALIDATED"
+BUY={'BUY','ENTRY_CORE'}
+ARMED={'BUY_ARMED','PRIMARY_SELECTED','PRIMARY_RESERVE','HYBRID_PRIME','HYBRID_ARMED','PRE_EXPLOSION_ARMED','ACTION','TRIGGER','EARLY_TRIGGER','SHOCK_TRIGGER','V_TURN_TRIGGER'}
+NO_CHASE={'NO_CHASE','WAIT_POOR_RR'}
+BLOCK={'REJECT','REJECT_X2','REJECT_RISK','BLOCK_BUY','BLOCKED_PROGRAM_SELL_ACCEL','NEGATIVE_CONFIRMED','OVERHANG','SELL_THE_NEWS'}
+PENDING={'DATA_PENDING','PENDING','RS_PENDING_DATA','HISTORY_FAIL','WAIT_HISTORY','WAIT_MINUTE_DATA'}
 
+@dataclass
+class Config:
+    max_risk_per_trade_pct: float=1.0
+    max_single_position_pct: float=35.0
+    max_total_exposure_pct: float=80.0
+    min_cash_pct: float=20.0
+    max_positions: int=3
+    max_entry_extension_atr: float=1.8
+    max_above_vwap_pct: float=3.0
+    max_intraday_gain_pct: float=7.0
+    max_rsi: float=75.0
+    default_stop_pct: float=6.0
+    max_stop_pct: float=8.0
+    tp1_r: float=2.0
+    tp2_r: float=3.0
 
-def replace_once(old: str, new: str, label: str) -> None:
-    global s
-    n = s.count(old)
-    if n != 1:
-        raise SystemExit(f"SELFHEAL_PATCH_ANCHOR_ERROR {label}: expected=1 actual={n}")
-    s = s.replace(old, new, 1)
+def f(v, default=math.nan):
+    try:
+        if v is None or v=='': return default
+        x=float(str(v).replace(',','').replace('%',''))
+        return x if math.isfinite(x) else default
+    except Exception: return default
 
+def b(v, default=False):
+    if isinstance(v,bool): return v
+    if v is None: return default
+    s=str(v).strip().upper()
+    if s in {'1','TRUE','Y','YES','PASS','OK'}: return True
+    if s in {'0','FALSE','N','NO','FAIL','NG'}: return False
+    return default
 
-replace_once(
-'''        self.history_max = max(20, _env_int("V17_ORIGINAL_SNAPSHOT_HISTORY_MAX", 200))
-        self.provider = os.getenv("V17_ORIGINAL_HISTORY_PROVIDER", "LS").strip() or "LS"
-        self.venue = os.getenv("V17_ORIGINAL_VENUE", "KRX").strip().upper() or "KRX"
-''',
-'''        self.history_max = max(20, _env_int("V17_ORIGINAL_SNAPSHOT_HISTORY_MAX", 200))
-        self.autofill_enabled = _env_bool("V17_ORIGINAL_HISTORY_BOOTSTRAP_ENABLED", True)
-        self.autofill_batch = max(1, _env_int("V17_ORIGINAL_HISTORY_BOOTSTRAP_BATCH", 20))
-        self.autofill_rpm = max(10, _env_int("V17_ORIGINAL_HISTORY_BOOTSTRAP_RPM", 90))
-        self.autofill_retry_seconds = max(60, _env_int("V17_ORIGINAL_HISTORY_BOOTSTRAP_RETRY_SECONDS", 300))
-        self.provider = os.getenv("V17_ORIGINAL_HISTORY_PROVIDER", "V17_ORIGINAL").strip() or "V17_ORIGINAL"
-        self.venue = os.getenv("V17_ORIGINAL_VENUE", "KRX").strip().upper() or "KRX"
-''',
-"init_autofill",
-)
+def first(m:Mapping[str,Any], *keys):
+    for k in keys:
+        if k in m and m.get(k) not in (None,''): return m.get(k)
+    return None
 
-replace_once(
-'''        # Reuse the exact LS cache path already used by FastHistory500.
-        default_db = str(result_root.parent / "alpha500_bars.sqlite3")
-        self.db_path = Path(os.getenv("V17_ORIGINAL_HISTORY_DB", os.getenv("CACHE_DB", default_db)))
-''',
-'''        # V1.7 owns a dedicated persistent DB. Do not mutate Alpha500/LS caches.
-        default_db = str(result_root.parent / "v17_original_history.sqlite3")
-        self.db_path = Path(os.getenv("V17_ORIGINAL_HISTORY_DB", default_db))
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-''',
-"dedicated_db",
-)
+def code(v):
+    s=str(v or '').strip()
+    if s.endswith('.0'): s=s[:-2]
+    return s.zfill(6) if s.isdigit() and len(s)<=6 else s
 
-replace_once(
-'''        self._quote_provider: Optional[Callable[[Sequence[str]], Mapping[str, Mapping[str, Any]]]] = None
-        self._universe_provider: Optional[Callable[[], Tuple[List[dict], dict]]] = None
-''',
-'''        self._quote_provider: Optional[Callable[[Sequence[str]], Mapping[str, Mapping[str, Any]]]] = None
-        self._universe_provider: Optional[Callable[[], Tuple[List[dict], dict]]] = None
-        self._autofill_limiter = V17.MinuteRateLimiter(self.autofill_rpm) if V17 is not None else None
-        self._autofill_retry_after: Dict[str, float] = {}
-''',
-"autofill_runtime",
-)
+def state(row):
+    v=first(row,'final_state','entry_state','event','signal','decision','selection_state','discovery_state','state')
+    if isinstance(v,Mapping): v=first(v,'event','state','final_state')
+    return str(v or 'WAIT').strip().upper()
 
-replace_once(
-'''            "history_pending_count": 0,
-            "history_coverage_pct": 0.0,
-''',
-'''            "history_pending_count": 0,
-            "history_autofill_enabled": self.autofill_enabled,
-            "history_autofill_batch": self.autofill_batch,
-            "history_autofill_attempted": 0,
-            "history_autofill_succeeded": 0,
-            "history_autofill_failed": 0,
-            "history_autofill_last_error": None,
-            "history_coverage_pct": 0.0,
-''',
-"state_fields",
-)
+def extract_candidates(obj):
+    if isinstance(obj,list): return [dict(x) for x in obj if isinstance(x,Mapping)]
+    if not isinstance(obj,Mapping): return []
+    for k in ('candidates','rows','items','stocks'):
+        if isinstance(obj.get(k),list): return [dict(x) for x in obj[k] if isinstance(x,Mapping)]
+    for k in ('board','next_session_board','NEXT_SESSION_BOARD','result','data'):
+        v=obj.get(k)
+        if isinstance(v,Mapping):
+            for kk in ('candidates','rows','items','stocks'):
+                if isinstance(v.get(kk),list): return [dict(x) for x in v[kk] if isinstance(x,Mapping)]
+    return []
 
-start = s.find("    def _connect_ro(self) -> sqlite3.Connection:\n")
-end = s.find("    @staticmethod\n    def _overlay_quote", start)
-if start < 0 or end < 0 or end <= start:
-    raise SystemExit("SELFHEAL_PATCH_ANCHOR_ERROR history_methods")
+def load_account(path):
+    p=Path(path); d={}
+    if p.exists():
+        try: d=json.loads(p.read_text(encoding='utf-8'))
+        except Exception: return None,'ACCOUNT_FILE_INVALID'
+    else:
+        env={'equity':'SURVIVAL_ACCOUNT_EQUITY','cash':'SURVIVAL_ACCOUNT_CASH','total_market_value':'SURVIVAL_TOTAL_MARKET_VALUE','open_positions':'SURVIVAL_OPEN_POSITIONS','margin_debt':'SURVIVAL_MARGIN_DEBT'}
+        for k,e in env.items():
+            if os.getenv(e,'')!='': d[k]=os.getenv(e)
+    if any(k not in d for k in ('equity','cash','total_market_value','open_positions')): return None,'ACCOUNT_DATA_MISSING'
+    a={'equity':f(d['equity'],0),'cash':f(d['cash'],0),'total_market_value':f(d['total_market_value'],0),'open_positions':int(f(d['open_positions'],0)),'margin_debt':f(d.get('margin_debt'),0),'positions':d.get('positions') if isinstance(d.get('positions'),list) else []}
+    if a['equity']<=0: return None,'ACCOUNT_EQUITY_INVALID'
+    return a,'READY'
 
-history_methods = '''    def _connect_db(self) -> sqlite3.Connection:
-        """Open the dedicated ORIGINAL V1.7 cache using the engine's own schema."""
-        if V17 is None:
-            raise RuntimeError(f"V1.7 engine import failed: {_IMPORT_ERROR}")
-        return V17.init_db(str(self.db_path))
+def upstream_gate(s):
+    if s in BUY: return 'BUY_READY','UPSTREAM_BUY_CONFIRMED'
+    if s in NO_CHASE: return 'NO_CHASE','UPSTREAM_NO_CHASE'
+    if s in BLOCK: return 'BLOCK','UPSTREAM_HARD_BLOCK'
+    if s in PENDING: return 'PENDING','UPSTREAM_DATA_PENDING'
+    if s in ARMED: return 'ARMED','UPSTREAM_NOT_YET_BUY'
+    return 'WAIT','UPSTREAM_WAIT'
 
-    def _read_history(self, con: sqlite3.Connection, code: str, limit: int = 260) -> pd.DataFrame:
-        """Read ORIGINAL V1.7 daily_ohlcv without touching Alpha500 bars."""
-        if V17 is None:
-            return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
-        return V17.load_cached(con, str(code), int(limit))
+def nums(row):
+    ev=row.get('entry_event') if isinstance(row.get('entry_event'),Mapping) else {}
+    px=f(first(ev,'price','close','entry_price')); px=px if math.isfinite(px) else f(first(row,'last_price','current_price','price','close','entry_price'))
+    vw=f(first(ev,'mvwap100','vwap','session_vwap')); vw=vw if math.isfinite(vw) else f(first(row,'mvwap100','session_vwap','vwap','VWAP'))
+    rf=f(first(ev,'reference_price','breakout_price','mvwap100','vwap')); rf=rf if math.isfinite(rf) else f(first(row,'reference_price','breakout_price','pivot_price','mvwap100','session_vwap','vwap'))
+    at=f(first(ev,'atr14','atr')); at=at if math.isfinite(at) else f(first(row,'atr14','atr'))
+    rs=f(first(ev,'rsi14','rsi')); rs=rs if math.isfinite(rs) else f(first(row,'rsi14','rsi'))
+    dy=f(first(row,'day_change_pct','intraday_gain_pct','change_pct','chg_pct'))
+    st=f(first(ev,'stop_price','stop','invalidation_price')); st=st if math.isfinite(st) else f(first(row,'stop_price','stop','invalidation_price','hard_stop'))
+    rk=f(first(row,'fusion_rank','discovery_rank','rank'),0)
+    return dict(price=px,vwap=vw,reference=rf,atr=at,rsi=rs,day_pct=dy,stop=st,rank=rk)
 
-'''
-s = s[:start] + history_methods + s[end:]
+def evaluate_candidate(row,account,cfg):
+    n=nums(row); us=state(row); gate,reason=upstream_gate(us)
+    out={'symbol':code(first(row,'code','symbol','ticker')),'name':str(first(row,'name','stock_name') or ''),'upstream_state':us,'upstream_gate':gate,'rank':n['rank']}
+    if gate=='PENDING': return {**out,'final_action':'DATA_PENDING','reason':reason}
+    if gate=='BLOCK': return {**out,'final_action':'BLOCK_BUY','reason':reason}
+    if gate=='NO_CHASE': return {**out,'final_action':'WAIT_PULLBACK','reason':reason}
+    if gate=='ARMED': return {**out,'final_action':'WAIT_LIVE_CONFIRM','reason':reason}
+    if gate!='BUY_READY': return {**out,'final_action':'WAIT','reason':reason}
+    if account is None: return {**out,'final_action':'WAIT_ACCOUNT_DATA','reason':'ACCOUNT_GATE_REQUIRED'}
+    missing=[k.upper()+'_MISSING' for k in ('price','vwap','atr') if not math.isfinite(n[k]) or n[k]<=0]
+    if missing: return {**out,'final_action':'DATA_PENDING','reason':'SURVIVAL_INPUT_MISSING','missing':missing}
+    ref=n['reference'] if math.isfinite(n['reference']) and n['reference']>0 else n['vwap']; rsi=n['rsi'] if math.isfinite(n['rsi']) else 50; day=n['day_pct'] if math.isfinite(n['day_pct']) else 0
+    if not math.isfinite(n['stop']) or n['stop']<=0:
+        return {**out,'final_action':'WAIT_STOP_DATA','reason':'STRUCTURAL_STOP_REQUIRED'}
+    stop=n['stop']; stop_pct=100*(n['price']-stop)/n['price']
+    veto=[]; chase=[]; exposure=100*account['total_market_value']/account['equity']; cashpct=100*account['cash']/account['equity']
+    if account['margin_debt']>0: veto.append('MARGIN_DEBT_PRESENT')
+    if b(first(row,'is_leveraged_product','leveraged')): veto.append('LEVERAGED_PRODUCT_BLOCKED')
+    if account['open_positions']>=cfg.max_positions: veto.append('MAX_POSITIONS_REACHED')
+    if exposure>=cfg.max_total_exposure_pct: veto.append('MAX_TOTAL_EXPOSURE_REACHED')
+    if cashpct<=cfg.min_cash_pct: veto.append('MIN_CASH_BUFFER_VIOLATED')
+    if stop>=n['price'] or stop_pct<=0: veto.append('INVALID_STOP')
+    if stop_pct>cfg.max_stop_pct: veto.append('STOP_TOO_WIDE')
+    ext=(n['price']-ref)/n['atr']; above=100*(n['price']/n['vwap']-1)
+    if ext>cfg.max_entry_extension_atr: chase.append('ATR_EXTENSION')
+    if above>cfg.max_above_vwap_pct: chase.append('TOO_FAR_ABOVE_VWAP')
+    if day>cfg.max_intraday_gain_pct: chase.append('INTRADAY_FOMO_ZONE')
+    if rsi>cfg.max_rsi: chase.append('RSI_OVERHEATED')
+    raw=cfg.max_risk_per_trade_pct/(stop_pct/100) if stop_pct>0 else 0
+    exposure_room=max(0.0,cfg.max_total_exposure_pct-exposure)
+    cash_room=max(0.0,cashpct-cfg.min_cash_pct)
+    maxpos=max(0.0,min(raw,cfg.max_single_position_pct,exposure_room,cash_room))
+    if maxpos<=0 and not veto: veto.append('PORTFOLIO_ROOM_ZERO')
+    action='BLOCK_BUY' if veto else ('WAIT_PULLBACK' if chase else 'BUY')
+    return {**out,'final_action':action,'reason':'SURVIVAL_GATE','entry_price':round(n['price'],4),'stop_price':round(stop,4),'stop_pct':round(stop_pct,3),'max_position_pct_by_risk':round(maxpos,2),'extension_atr':round(ext,2),'above_vwap_pct':round(above,2),'vetoes':veto,'chase_flags':chase}
 
-replace_once(
-'''            con = self._connect_ro()
-            cfg = V17.Config(min_rows=self.min_rows)
-            rows: List[dict] = []
-            pending: List[dict] = []
-            ready = 0
-            for item in universe:
-''',
-'''            con = self._connect_db()
-            cfg = V17.Config(
-                min_rows=self.min_rows,
-                bootstrap_count=200,
-                requests_per_minute=self.autofill_rpm,
-                request_timeout=max(3, int(self.request_timeout)),
-            )
-            rows: List[dict] = []
-            pending: List[dict] = []
-            ready = 0
-            autofill_attempted = 0
-            autofill_succeeded = 0
-            autofill_failed = 0
-            autofill_last_error = None
-            for item in universe:
-''',
-"scan_setup",
-)
+def evaluate_positions(account,cfg):
+    if not account: return []
+    out=[]
+    for r in account.get('positions') or []:
+        sym=code(first(r,'symbol','code')); ep=f(r.get('entry_price')); px=f(first(r,'price','current_price')); st=f(r.get('stop_price')); val=f(r.get('position_value'))
+        if not all(math.isfinite(x) and x>0 for x in (ep,px,st,val)): out.append({'symbol':sym,'final_action':'DATA_PENDING','reason':'POSITION_INPUT_MISSING'}); continue
+        rr=(px-ep)/max(ep-st,1e-12); pnl=100*(px/ep-1); pct=100*val/account['equity']
+        action='FORCED_DELEVER' if b(r.get('borrowed_position')) else ('EXIT_INVALIDATED' if b(r.get('structural_invalidated')) or px<=st else ('REDUCE_CONCENTRATION' if pct>cfg.max_single_position_pct else ('TRAIL_PROFIT' if rr>=cfg.tp2_r else ('PARTIAL_TAKE_PROFIT' if rr>=cfg.tp1_r else 'HOLD'))))
+        out.append({'symbol':sym,'final_action':action,'pnl_pct':round(pnl,2),'current_r':round(rr,2)})
+    return out
 
-replace_once(
-'''                hist = self._read_history(con, code, 260)
-                cached_rows = len(hist)
-                if cached_rows < self.min_rows:
-                    pending.append({"code": code, "name": name, "cached_rows": cached_rows, "state": "HISTORY_PENDING"})
-                    continue
-''',
-'''                hist = self._read_history(con, code, 260)
-                cached_rows = len(hist)
+def evaluate_payload(obj,account,account_status='READY',cfg=None):
+    cfg=cfg or Config(); decisions=[evaluate_candidate(x,account,cfg) for x in extract_candidates(obj)]
+    buys=sorted([x for x in decisions if x.get('final_action')=='BUY'],key=lambda x:x.get('rank',0),reverse=True)
 
-                if cached_rows < self.min_rows and self.autofill_enabled and autofill_attempted < self.autofill_batch:
-                    now_mono = time.monotonic()
-                    retry_at = float(self._autofill_retry_after.get(code, 0.0) or 0.0)
-                    if now_mono >= retry_at:
-                        autofill_attempted += 1
-                        try:
-                            rr = V17.collect_one(
-                                con,
-                                self._session,
-                                self._autofill_limiter,
-                                code,
-                                cfg,
-                                force_bootstrap=True,
-                                refresh_count=cfg.refresh_count,
-                            )
-                            hist = self._read_history(con, code, 260)
-                            cached_rows = len(hist)
-                            if bool(rr.get("ok")) and cached_rows >= self.min_rows:
-                                autofill_succeeded += 1
-                                self._autofill_retry_after.pop(code, None)
-                            else:
-                                autofill_failed += 1
-                                autofill_last_error = str(rr.get("error") or f"cached_rows={cached_rows}")
-                                self._autofill_retry_after[code] = now_mono + self.autofill_retry_seconds
-                        except Exception as exc:
-                            autofill_failed += 1
-                            autofill_last_error = f"{type(exc).__name__}: {exc}"
-                            self._autofill_retry_after[code] = now_mono + self.autofill_retry_seconds
+    if account is None:
+        available_slots=0; capital_room=0.0
+    else:
+        available_slots=max(0,cfg.max_positions-int(account.get('open_positions',0)))
+        equity=max(float(account.get('equity') or 0),1e-12)
+        exposure=100*float(account.get('total_market_value') or 0)/equity
+        cashpct=100*float(account.get('cash') or 0)/equity
+        capital_room=max(0.0,min(cfg.max_total_exposure_pct-exposure,cashpct-cfg.min_cash_pct))
 
-                if cached_rows < self.min_rows:
-                    pending.append({"code": code, "name": name, "cached_rows": cached_rows, "state": "HISTORY_PENDING"})
-                    continue
-''',
-"missing_history_selfheal",
-)
+    approved=set()
+    for x in buys:
+        sym=x.get('symbol')
+        if available_slots<=0:
+            x['final_action']='WAIT'; x['reason']='MAX_PORTFOLIO_SLOTS_LIMIT'; continue
+        requested=max(0.0,float(x.get('max_position_pct_by_risk') or 0))
+        alloc=min(requested,capital_room)
+        if alloc<=0:
+            x['final_action']='BLOCK_BUY'; x['reason']='PORTFOLIO_EXPOSURE_ROOM_EXHAUSTED'; continue
+        x['approved_position_pct']=round(alloc,2)
+        approved.add(sym); available_slots-=1; capital_room=max(0.0,capital_room-alloc)
 
-replace_once(
-'''                "history_pending_count": len(pending),
-                "history_coverage_pct": coverage_pct,
-''',
-'''                "history_pending_count": len(pending),
-                "history_autofill_attempted": autofill_attempted,
-                "history_autofill_succeeded": autofill_succeeded,
-                "history_autofill_failed": autofill_failed,
-                "history_autofill_last_error": autofill_last_error,
-                "history_coverage_pct": coverage_pct,
-''',
-"snapshot_autofill",
-)
+    counts={}
+    for x in decisions: counts[x['final_action']]=counts.get(x['final_action'],0)+1
+    return {'engine_version':ENGINE_VERSION,'account_status':account_status,'config':asdict(cfg),'counts':counts,'candidate_decisions':decisions,'position_decisions':evaluate_positions(account,cfg),'remaining_slots_after_plan':available_slots,'remaining_capital_room_pct_after_plan':round(capital_room,2),'principles':['NO_UPSTREAM_BUY_NO_FINAL_BUY','NO_MARGIN_DEFAULT','NO_CHASE','RISK_PER_TRADE_1PCT','MAX_3_POSITIONS_TOTAL','COMBINED_EXPOSURE_CAP','PREDEFINED_STOP','2R_3R_TRAIL']}
 
-replace_once(
-'''                action_count=len(actions), pre_count=len(pres), active_count=len(active), watch_count=len(watch),
-                round_id=meta.get("round_id"), last_error=None,
-''',
-'''                action_count=len(actions), pre_count=len(pres), active_count=len(active), watch_count=len(watch),
-                history_autofill_attempted=autofill_attempted,
-                history_autofill_succeeded=autofill_succeeded,
-                history_autofill_failed=autofill_failed,
-                history_autofill_last_error=autofill_last_error,
-                round_id=meta.get("round_id"), last_error=None,
-''',
-"health_autofill",
-)
+def selftest():
+    c=Config(); a={'equity':100000000,'cash':70000000,'total_market_value':30000000,'open_positions':1,'margin_debt':0,'positions':[]}; q={'code':'111111','name':'A','final_state':'BUY','fusion_rank':99,'last_price':10000,'mvwap100':9900,'atr14':300,'rsi14':60,'day_change_pct':2,'stop_price':9500}
+    assert evaluate_candidate(q,a,c)['final_action']=='BUY'
+    assert evaluate_candidate(dict(q,last_price=11000,mvwap100=10000,stop_price=10450,rsi14=80,day_change_pct=8.5),a,c)['final_action']=='WAIT_PULLBACK'
+    assert evaluate_candidate(dict(q,final_state='BUY_ARMED'),a,c)['final_action']=='WAIT_LIVE_CONFIRM'
+    assert evaluate_candidate(q,dict(a,margin_debt=1),c)['final_action']=='BLOCK_BUY'
+    assert evaluate_candidate(q,None,c)['final_action']=='WAIT_ACCOUNT_DATA'
+    q_no_stop=dict(q); q_no_stop.pop('stop_price',None)
+    assert evaluate_candidate(q_no_stop,a,c)['final_action']=='WAIT_STOP_DATA'
+    return {'engine':ENGINE_VERSION,'status':'PASS'}
 
-replace_once(
-'''                "V17_ORIGINAL_SCAN_DONE status=READY eligible=%d history_ready=%d history_pending=%d action=%d pre=%d active=%d round=%s duration=%.3f",
-                len(universe), ready, len(pending), len(actions), len(pres), len(active), meta.get("round_id"), duration,
-''',
-'''                "V17_ORIGINAL_SCAN_DONE status=READY eligible=%d history_ready=%d history_pending=%d autofill=%d/%d fail=%d action=%d pre=%d active=%d round=%s duration=%.3f",
-                len(universe), ready, len(pending), autofill_succeeded, autofill_attempted, autofill_failed,
-                len(actions), len(pres), len(active), meta.get("round_id"), duration,
-''',
-"log_summary",
-)
+if __name__=='__main__': print(json.dumps(selftest(),ensure_ascii=False,indent=2))
+SURVIVAL_GUARD_V1_PY_9F21
 
-if s == original:
-    raise SystemExit("SELFHEAL_PATCH_NO_CHANGE")
+COPY <<'SURVIVAL_GUARD_V1_HTTP_PY_9F21' /app/survival_guard_v1_http_bridge.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import json,os,threading
+from datetime import datetime,timedelta,timezone
+from pathlib import Path
+from typing import Any,Dict,Optional,Tuple
+import survival_guard_v1 as sg
+KST=timezone(timedelta(hours=9))
+class SurvivalGuardBridge:
+    VERSION='SURVIVAL_GUARD_V1_HTTP_BRIDGE_1_0'
+    def __init__(self):
+        self.enabled=os.getenv('SURVIVAL_GUARD_V1_ENABLED','true').lower() in {'1','true','yes','on'}; self.interval=max(60,int(os.getenv('SURVIVAL_GUARD_V1_INTERVAL_SECONDS','120'))); self.start_delay=max(15,int(os.getenv('SURVIVAL_GUARD_V1_START_DELAY_SECONDS','75')))
+        self.board_file=os.getenv('V4_BOARD_FILE','/data/eod_nextday_board.json'); self.confirm_file=os.getenv('V4_CONFIRM_OUTPUT','/data/results/fullmarket_v4_nextday_confirm.json'); self.account_file=os.getenv('SURVIVAL_ACCOUNT_FILE','/data/survival_account.json'); self.latest_file=os.getenv('SURVIVAL_GUARD_V1_LATEST_FILE','/data/results/survival_guard_v1_latest.json')
+        self.runtime={'status':'INIT','last_started_at':None,'last_completed_at':None,'last_error':None,'last_phase':None}; self._lock=threading.Lock(); self._thread=None; self._stop=threading.Event()
+    def now(self): return datetime.now(KST)
+    def phase(self):
+        hm=self.now().hour*60+self.now().minute
+        return 'EOD_BOARD' if hm>=930 else ('NEXTDAY_CONFIRM' if hm>=510 else 'PREOPEN_BOARD')
+    def read(self,p):
+        q=Path(p)
+        if not q.exists(): return {}
+        try: return json.loads(q.read_text(encoding='utf-8'))
+        except Exception: return {}
+    def write(self,o):
+        p=Path(self.latest_file); p.parent.mkdir(parents=True,exist_ok=True); t=p.with_suffix(p.suffix+'.tmp'); t.write_text(json.dumps(o,ensure_ascii=False,indent=2,default=str),encoding='utf-8'); t.replace(p)
+    def run_once(self,reason='interval'):
+        if not self.enabled: return {'status':'DISABLED','engine':sg.ENGINE_VERSION}
+        if not self._lock.acquire(blocking=False): return {'status':'BUSY','engine':sg.ENGINE_VERSION}
+        try:
+            ph=self.phase(); self.runtime.update(status='RUNNING',last_started_at=self.now().isoformat(),last_phase=ph,last_error=None); source=self.confirm_file if ph=='NEXTDAY_CONFIRM' else self.board_file; obj=self.read(source); account,ast=sg.load_account(self.account_file); res=sg.evaluate_payload(obj,account,ast); res.update({'status':'READY','phase':ph,'source_file':source,'generated_at':self.now().isoformat(),'bridge':self.VERSION}); self.write(res); self.runtime.update(status='READY',last_completed_at=self.now().isoformat())
+            top=[{'symbol':x.get('symbol'),'name':x.get('name'),'upstream':x.get('upstream_state'),'final':x.get('final_action')} for x in res.get('candidate_decisions',[])[:5]]; print('SURVIVAL_V1_RESULT '+json.dumps({'phase':ph,'account':ast,'counts':res.get('counts'),'top':top},ensure_ascii=False),flush=True); return res
+        except Exception as e:
+            msg=f'{type(e).__name__}:{e}'; self.runtime.update(status='ERROR',last_completed_at=self.now().isoformat(),last_error=msg); print('SURVIVAL_V1_ERROR '+msg,flush=True); return {'status':'ERROR','error':msg,'engine':sg.ENGINE_VERSION}
+        finally: self._lock.release()
+    def latest(self):
+        x=self.read(self.latest_file)
+        if not x: x=self.run_once('latest-miss')
+        x['bridge_runtime']=dict(self.runtime); return x
+    def health(self):
+        _,ast=sg.load_account(self.account_file); return {'ok':self.runtime.get('status')!='ERROR','status':self.runtime.get('status'),'engine':sg.ENGINE_VERSION,'bridge':self.VERSION,'enabled':self.enabled,'interval_seconds':self.interval,'phase':self.phase(),'account_status':ast,'board_present':Path(self.board_file).exists(),'confirm_present':Path(self.confirm_file).exists(),'runtime':dict(self.runtime),'policy':'UPSTREAM_BUY_REQUIRED__SURVIVAL_GATE__NO_ACCOUNT_NO_BUY'}
+    def handle_get(self,raw_path)->Optional[Tuple[int,Dict[str,Any]]]:
+        from urllib.parse import urlparse
+        path=urlparse(raw_path).path.rstrip('/'); base='/api/context/survival-v1'
+        if not path.startswith(base): return None
+        if path.endswith('/health'): return 200,self.health()
+        if path.endswith('/run'): return 200,self.run_once('http-get')
+        if path.endswith('/latest') or path==base: return 200,self.latest()
+        return 404,{'status':'NOT_FOUND','path':path}
+    def loop(self):
+        self._stop.wait(self.start_delay)
+        while self.enabled and not self._stop.is_set(): self.run_once('interval'); self._stop.wait(self.interval)
+    def start(self):
+        if not self.enabled: self.runtime['status']='DISABLED'; return
+        if self._thread and self._thread.is_alive(): return
+        self.runtime['status']='STARTING'; self._thread=threading.Thread(target=self.loop,daemon=True,name='survival-guard-v1'); self._thread.start()
+BRIDGE=SurvivalGuardBridge()
+SURVIVAL_GUARD_V1_HTTP_PY_9F21
 
-p.write_text(s, encoding="utf-8")
-compile(s, str(p), "exec")
+COPY <<'SURVIVAL_GUARD_V1_PATCH_PY_9F21' /tmp/apply_survival_guard_v1_patch.py
+#!/usr/bin/env python3
+from pathlib import Path
+p=Path('/app/오백종목_통합엔진_웹서비스_V1_0.py'); s=p.read_text(encoding='utf-8')
+if 'SURVIVAL_GUARD_V1_IMPORT' not in s:
+    a='\nclass Handler(BaseHTTPRequestHandler):\n'
+    if a not in s: raise SystemExit('SURVIVAL_PATCH_FAIL_HANDLER')
+    b='''\n# SURVIVAL_GUARD_V1_IMPORT\ntry:\n    from survival_guard_v1_http_bridge import BRIDGE as SURVIVAL_GUARD_V1_BRIDGE\nexcept Exception as _sg_import_error:\n    SURVIVAL_GUARD_V1_BRIDGE=None\n    print(f"SURVIVAL_GUARD_V1_IMPORT_ERROR {type(_sg_import_error).__name__}: {_sg_import_error}",flush=True)\n\n'''; s=s.replace(a,'\n'+b+'class Handler(BaseHTTPRequestHandler):\n',1)
+if 'SURVIVAL_GUARD_V1_GET_ROUTE' not in s:
+    a='        # EOD_NEXTDAY_V4_GET_ROUTE_V1\n'
+    if a not in s: a='        # FULLMARKET_V3_GET_ROUTE_V1\n'
+    if a not in s: raise SystemExit('SURVIVAL_PATCH_FAIL_GET')
+    b='''        # SURVIVAL_GUARD_V1_GET_ROUTE\n        if SURVIVAL_GUARD_V1_BRIDGE is not None and path.startswith("/api/context/survival-v1"):\n            try:\n                _sg=SURVIVAL_GUARD_V1_BRIDGE.handle_get(self.path)\n                if _sg is not None:return self._json(_sg[0],_sg[1])\n            except Exception as _sg_route_error:\n                return self._json(500,{"status":"ERROR","error":f"SURVIVAL_GUARD_V1: {type(_sg_route_error).__name__}: {_sg_route_error}"})\n'''; s=s.replace(a,b+a,1)
+if 'SURVIVAL_GUARD_V1_START' not in s:
+    a='    # EOD_NEXTDAY_V4_START_V1\n'
+    if a not in s: a='    # FULLMARKET_V3_START_V1\n'
+    if a not in s: raise SystemExit('SURVIVAL_PATCH_FAIL_START')
+    b='''    # SURVIVAL_GUARD_V1_START\n    if SURVIVAL_GUARD_V1_BRIDGE is not None:\n        try:\n            SURVIVAL_GUARD_V1_BRIDGE.start();print("SURVIVAL_GUARD_V1_STARTED",flush=True)\n        except Exception as _sg_start_error:\n            print(f"SURVIVAL_GUARD_V1_START_ERROR {type(_sg_start_error).__name__}: {_sg_start_error}",flush=True)\n'''; s=s.replace(a,b+a,1)
+p.write_text(s,encoding='utf-8'); print('SURVIVAL_GUARD_V1_PATCH_PASS')
+SURVIVAL_GUARD_V1_PATCH_PY_9F21
 
-required = [
-    "v17_original_history.sqlite3",
-    "V17.collect_one(",
-    "bootstrap_count=200",
-    "history_autofill_attempted",
-    "history_autofill_succeeded",
-]
-for token in required:
-    if token not in s:
-        raise SystemExit(f"SELFHEAL_VALIDATION_MISSING {token}")
-
-print("V17_HISTORY_SELFHEAL_PATCH_PASS")
+RUN python -m py_compile \
+      /app/survival_guard_v1.py \
+      /app/survival_guard_v1_http_bridge.py \
+      /tmp/apply_survival_guard_v1_patch.py \
+ && cd /app \
+ && python survival_guard_v1.py \
+ && python /tmp/apply_survival_guard_v1_patch.py \
+ && python -m py_compile /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && python - <<'PY'
+from pathlib import Path
+s=Path('/app/오백종목_통합엔진_웹서비스_V1_0.py').read_text(encoding='utf-8')
+for mark in [
+    '# SURVIVAL_GUARD_V1_IMPORT',
+    '# SURVIVAL_GUARD_V1_GET_ROUTE',
+    '# SURVIVAL_GUARD_V1_START',
+]:
+    assert s.count(mark) == 1, (mark, s.count(mark))
+print('SURVIVAL_GUARD_V1_BUILD_VALIDATION_PASS')
 PY
 
-RUN python -m py_compile /app/v17_original_ls_bridge.py /app/v17_original_engine.py
+# SURVIVAL_GUARD_V1_DEPLOY_END
+
+
+# NXT_THREE_LANE_HARD_GATE_V5_DEPLOY_BEGIN
+ENV NXT_THREE_LANE_ENABLED=true \
+    NXT_THREE_LANE_SCAN_LIMIT=40 \
+    NXT_THREE_LANE_TOP_N=3
+
+COPY <<'NXT_THREE_LANE_V5_PATCH_EOF' /tmp/apply_nxt_three_lane_v5.py
+#!/usr/bin/env python3
+from pathlib import Path
+import sys
+
+p=Path(sys.argv[1] if len(sys.argv)>1 else '/app/오백종목_통합엔진_웹서비스_V1_0.py')
+s=p.read_text(encoding='utf-8')
+MARK='NXT_THREE_LANE_HARD_GATE_V5'
+if MARK in s:
+    print(MARK+'_ALREADY_APPLIED')
+    raise SystemExit(0)
+
+helper=r'''
+# NXT_THREE_LANE_HARD_GATE_V5
+# 08:00부터 VOLUME_DIRECTION이 누적한 동일 NXT venue 1분/2분 가격·거래량 시계열을 재사용한다.
+# 추가 REST/WS 구독은 만들지 않는다. 점수는 순위 전용이고, PASS/FAIL은 아래 lane별 HARD GATE만 결정한다.
+def _nxt_three_lane_enabled():
+    return os.getenv("NXT_THREE_LANE_ENABLED","true").strip().lower() in {"1","true","yes","y","on"}
+
+
+def _nxt_bar_dt(minute):
+    try:
+        return datetime.fromisoformat(str(minute))
+    except Exception:
+        return None
+
+
+def _nxt_money_requirements(cap_100m, window="15", relaxed=False):
+    cap=_cb_num(cap_100m,0.0)
+    if cap < 1000:
+        return {"eligible":False,"abs_krw":float("inf"),"ratio":1.0}
+    if cap < 3000:
+        abs15,ratio15=1.0e8,0.0005
+    elif cap < 10000:
+        abs15,ratio15=2.0e8,0.0004
+    elif cap < 30000:
+        abs15,ratio15=3.0e8,0.0003
+    else:
+        abs15,ratio15=5.0e8,0.0
+    if window=="30":
+        # HIGH_HOLD/PRE_BREAKOUT은 막판 폭발이 아닌 유동성 유지가 목적이라 비율 기준을 완화한다.
+        abs_req=abs15
+        ratio_req=ratio15*0.5
+    else:
+        abs_req=abs15
+        ratio_req=ratio15
+    if relaxed:
+        abs_req*=0.5
+        ratio_req*=0.5
+    return {"eligible":True,"abs_krw":abs_req,"ratio":ratio_req}
+
+
+def _nxt_session_features(code, r=None):
+    """Same-venue NXT session features from the already-running VOLUME_DIRECTION bridge.
+    No new broker request. Missing/restored-short history is explicit DATA_PARTIAL, never silently PASS.
+    """
+    code=str(code or "").zfill(6); r=r or {}
+    try:
+        with VOLUME_DIRECTION._lock:
+            ss=VOLUME_DIRECTION._series.get(("NXT",code))
+            sig=VOLUME_DIRECTION._signals.get(("NXT",code))
+            bars=list(VOLUME_DIRECTION._all_bars(ss)) if ss is not None else []
+            sigd=sig.to_dict() if sig is not None else {}
+    except Exception:
+        bars=[]; sigd={}
+    z=[]
+    for b in bars:
+        dt=_nxt_bar_dt(getattr(b,"minute",None))
+        if dt is None: continue
+        z.append((dt,b))
+    z.sort(key=lambda x:x[0])
+    if not z:
+        return {"nxt_data_ready":False,"nxt_data_partial":True,"nxt_bar_count":0}
+    last_dt=z[-1][0]; first_dt=z[0][0]; cur=float(z[-1][1].close or 0.0)
+    if cur<=0:
+        return {"nxt_data_ready":False,"nxt_data_partial":True,"nxt_bar_count":len(z)}
+
+    def win(minutes):
+        cut=last_dt-timedelta(minutes=minutes)
+        return [(dt,b) for dt,b in z if dt>cut and dt<=last_dt]
+    def prevwin(start_min,end_min):
+        hi=last_dt-timedelta(minutes=start_min); lo=last_dt-timedelta(minutes=end_min)
+        return [(dt,b) for dt,b in z if dt>lo and dt<=hi]
+    def at_or_before(minutes):
+        cut=last_dt-timedelta(minutes=minutes); q=None
+        for dt,b in z:
+            if dt<=cut: q=(dt,b)
+            else: break
+        return q
+    def vol(arr): return sum(max(0.0,float(b.volume or 0.0)) for _,b in arr)
+    def money(arr): return sum(max(0.0,float(b.volume or 0.0))*max(0.0,float(b.close or 0.0)) for _,b in arr)
+    def ret_from(minutes):
+        q=at_or_before(minutes)
+        return None if q is None or float(q[1].close or 0)<=0 else (cur/float(q[1].close)-1.0)*100.0
+
+    w15=win(15); p15=prevwin(15,30); w30=win(30); p30=prevwin(30,60); w60=win(60)
+    v15,vp15=vol(w15),vol(p15); t15,tp15=money(w15),money(p15)
+    v30,vp30=vol(w30),vol(p30); t30,tp30=money(w30),money(p30)
+    va15=(v15/vp15) if vp15>0 else None; ta15=(t15/tp15) if tp15>0 else None
+    va30=(v30/vp30) if vp30>0 else None; ta30=(t30/tp30) if tp30>0 else None
+    r15=ret_from(15); r30=ret_from(30); r60=ret_from(60)
+    first_price=float(z[0][1].open or z[0][1].close or 0.0)
+    session_high=max(float(b.high or b.close or 0.0) for _,b in z)
+    session_low=min(float(b.low or b.close or cur) for _,b in z if float(b.low or b.close or 0.0)>0)
+    local_high60=max(float(b.high or b.close or 0.0) for _,b in w60) if w60 else cur
+    local_low60=min(float(b.low or b.close or cur) for _,b in w60) if w60 else cur
+    high_hold60=cur/max(local_high60,1e-9)
+    draw30=(max(float(b.high or b.close or 0.0) for _,b in w30)-min(float(b.low or b.close or cur) for _,b in w30))/max(max(float(b.high or b.close or 0.0) for _,b in w30),1e-9)*100.0 if w30 else 0.0
+    day_turn=money(z)
+    cap_100m=_cb_num(r.get("market_cap_100m"),0.0); cap_krw=cap_100m*1e8
+    t15_cap=t15/cap_krw if cap_krw>0 else None; t30_cap=t30/cap_krw if cap_krw>0 else None; day_cap=day_turn/cap_krw if cap_krw>0 else None
+
+    # Sequence search: earliest/most recent 30-minute impulse followed by a controlled pullback.
+    impulse=None; recom=None
+    for i,(dt,b) in enumerate(z):
+        cut=dt-timedelta(minutes=30)
+        lb=[(d,x) for d,x in z[:i+1] if d>=cut]
+        if len(lb)<3: continue
+        base=min(float(x.low or x.close or 0.0) for _,x in lb if float(x.low or x.close or 0.0)>0)
+        peak=float(b.high or b.close or 0.0)
+        if base<=0 or peak/base<1.02: continue
+        rr=None
+        for j in range(i+1,len(z)):
+            low=float(z[j][1].low or z[j][1].close or 0.0)
+            if low<=0: continue
+            pb=(peak-low)/peak*100.0
+            retention=(low-base)/max(peak-base,1e-9)
+            if 0.3<=pb<=4.0 and retention>=0.50:
+                rr={"time":z[j][0].isoformat(timespec="minutes"),"price":low,"pullback_pct":pb,"retention":retention}
+                break
+        if rr is not None:
+            impulse={"time":dt.isoformat(timespec="minutes"),"price":peak,"base":base,"move_pct":(peak/base-1)*100.0}
+            recom=rr
+    reclaim=(cur/impulse["price"]) if impulse else None
+    span=(last_dt-first_dt).total_seconds()/60.0
+    first_hm=first_dt.hour*60+first_dt.minute
+    full_session=span>=180 and first_hm<=9*60+30
+    data_ready=len(w60)>=6 and len(w15)>=2 and span>=60
+
+    out={
+        "nxt_data_ready":bool(data_ready),"nxt_data_partial":not bool(data_ready),"nxt_full_session":bool(full_session),
+        "nxt_first_at":first_dt.isoformat(timespec="minutes"),"nxt_last_at":last_dt.isoformat(timespec="minutes"),
+        "nxt_bar_count":len(z),"nxt_recent60_count":len(w60),"nxt_recent15_count":len(w15),"nxt_span_minutes":round(span,1),
+        "nxt_first_price":round(first_price,4),"nxt_current_price":round(cur,4),"nxt_session_high":round(session_high,4),"nxt_session_low":round(session_low,4),
+        "nxt_session_return_pct":round((cur/first_price-1)*100.0,4) if first_price>0 else None,
+        "nxt_price15_pct":None if r15 is None else round(r15,4),"nxt_price30_pct":None if r30 is None else round(r30,4),"nxt_price60_pct":None if r60 is None else round(r60,4),
+        "nxt_volume15":round(v15,2),"nxt_prev15_volume":round(vp15,2),"nxt_volume_accel15":None if va15 is None else round(va15,4),
+        "nxt_turnover15_krw":round(t15,2),"nxt_prev15_turnover_krw":round(tp15,2),"nxt_turnover_accel15":None if ta15 is None else round(ta15,4),
+        "nxt_turnover30_krw":round(t30,2),"nxt_turnover_accel30":None if ta30 is None else round(ta30,4),
+        "nxt_turnover_day_krw":round(day_turn,2),"nxt_turnover15_cap_ratio":t15_cap,"nxt_turnover30_cap_ratio":t30_cap,"nxt_turnover_day_cap_ratio":day_cap,
+        "nxt_high_hold60":round(high_hold60,5),"nxt_drawdown30_pct":round(draw30,4),"nxt_local_high60":round(local_high60,4),"nxt_local_low60":round(local_low60,4),
+        "nxt_impulse_seen":bool(impulse),"nxt_impulse":impulse,"nxt_recompression_seen":bool(recom),"nxt_recompression":recom,
+        "nxt_reclaim_ratio":None if reclaim is None else round(reclaim,5),
+    }
+    for k,v in sigd.items():
+        out.setdefault("nxt_vd_"+k,v)
+    return out
+
+
+def _nxt_three_lane_gate(r):
+    """Three independent NXT hard-gate lanes.
+    A AFTER_REACCEL: late money/volume reacceleration after recompression.
+    B AFTER_HIGH_HOLD: quiet high-hold without distribution; no mandatory late acceleration.
+    C PRE_BREAKOUT_TRANSFER: latent full-session build-up; Deep score is NOT a hard gate.
+    """
+    o=dict(r); code=str(o.get("symbol") or o.get("code") or "").zfill(6)
+    feat=_nxt_session_features(code,o); o.update(feat)
+    cap=_cb_num(o.get("market_cap_100m"),0.0); change=_cb_num(o.get("change_pct"),_cb_num(feat.get("nxt_session_return_pct"),0.0))
+    vd=str(o.get("volume_direction_state") or o.get("nxt_vd_combined_state") or "").upper()
+    state=str(o.get("cluster_state") or "").upper(); trend=str(o.get("energy_trend") or "UNKNOWN").upper(); delta=_cb_num(o.get("energy_delta"),0.0)
+    stage=str(o.get("stage1_state") or "").upper(); asym=str(o.get("asym_rs_class") or "").upper(); mrs=_cb_num(o.get("market_rs_score"),0.0)
+    high_hold=_cb_num(feat.get("nxt_high_hold60"),0.0); p15=feat.get("nxt_price15_pct"); p30=feat.get("nxt_price30_pct")
+    ta15=feat.get("nxt_turnover_accel15"); va15=feat.get("nxt_volume_accel15"); ta30=feat.get("nxt_turnover_accel30")
+    t15=_cb_num(feat.get("nxt_turnover15_krw"),0.0); prev15=_cb_num(feat.get("nxt_prev15_turnover_krw"),0.0); t30=_cb_num(feat.get("nxt_turnover30_krw"),0.0)
+    t15r=feat.get("nxt_turnover15_cap_ratio"); t30r=feat.get("nxt_turnover30_cap_ratio"); dayr=feat.get("nxt_turnover_day_cap_ratio")
+    req15=_nxt_money_requirements(cap,"15",False); req30=_nxt_money_requirements(cap,"30",False); reqC=_nxt_money_requirements(cap,"30",True)
+    distribution=(ta15 is not None and ta15>=1.3 and p15 is not None and p15<=-0.7)
+    false_break=(p15 is not None and p15<=-1.0 and high_hold<0.97)
+    hard_sector=(state=="S5" or (trend=="FALLING" and delta<=-2.0))
+    late_overext=(change>18.0)
+    day_turn=_cb_num(feat.get("nxt_turnover_day_krw"),0.0)
+    late_spike=(not bool(feat.get("nxt_recompression_seen")) and p15 is not None and p15>=2.0 and ta15 is not None and ta15>=2.0 and va15 is not None and va15>=2.0)
+    common_veto=distribution or false_break or hard_sector or late_overext or late_spike
+    strict_money=(req15["eligible"] and prev15>=0.30e8 and t15>=req15["abs_krw"] and (req15["ratio"]<=0 or (t15r is not None and t15r>=req15["ratio"])))
+    hold_money=(req30["eligible"] and t30>=req30["abs_krw"] and (req30["ratio"]<=0 or (t30r is not None and t30r>=req30["ratio"])) and dayr is not None and dayr>=0.003)
+    latent_money=(reqC["eligible"] and t30>=reqC["abs_krw"] and (reqC["ratio"]<=0 or (t30r is not None and t30r>=reqC["ratio"])) and dayr is not None and dayr>=0.002)
+
+    A={
+      "DATA":bool(feat.get("nxt_data_ready")),"IMPULSE":bool(feat.get("nxt_impulse_seen")),"RECOMPRESSION":bool(feat.get("nxt_recompression_seen")),
+      "MONEY":strict_money,"VOL_REACCEL":va15 is not None and va15>=1.50,"TURN_REACCEL":ta15 is not None and ta15>=1.40,
+      "PRICE_POSITIVE":p15 is not None and p15>0,"RECLAIM":feat.get("nxt_reclaim_ratio") is not None and feat.get("nxt_reclaim_ratio")>=0.98,
+      "NO_VETO":not common_veto,
+    }
+    prior_strength=bool(feat.get("nxt_impulse_seen")) or _cb_num(feat.get("nxt_session_return_pct"),0)>=2.0 or _cb_num(feat.get("nxt_price60_pct"),0)>=1.5
+    B={
+      "DATA":bool(feat.get("nxt_data_ready")),"PRIOR_STRENGTH":prior_strength,"HIGH_HOLD":high_hold>=0.985,
+      "STABLE_PRICE":p30 is not None and p30>=-0.8,"LOW_DRAWDOWN":_cb_num(feat.get("nxt_drawdown30_pct"),99)<=1.5,
+      "LIQUIDITY_HOLD":hold_money,"NO_DISTRIBUTION":not distribution,"NO_VETO":not (false_break or hard_sector or late_overext or late_spike),
+    }
+    structure=( _cb_num(o.get("nxt_vd_higher_structure"),0)>=0.55 and _cb_num(o.get("nxt_vd_positive_step_ratio"),0)>=0.52 and _cb_num(o.get("nxt_vd_max_drawdown_pct"),99)<=2.5 )
+    context=(state in {"S2","S3"} or trend in {"RISING","RISING_STRONG","RISING_WEAK"} or asym in {"SUPER","STRONG"} or mrs>=55 or stage in {"UP_START","REVERSAL_ARMED","UP_TREND"} or vd in {"STEADY_UP","ACCEL","PAUSE","RE_ACCEL","STEADY_REACCEL"})
+    flow=( _cb_num(o.get("nxt_vd_volume_persistence"),0)>=0.45 or vd in {"STEADY_UP","ACCEL","PAUSE","RE_ACCEL","STEADY_REACCEL"} )
+    C={
+      "FULL_SESSION":bool(feat.get("nxt_full_session")),"NOT_EXTENDED":-3.0<=change<=7.0,"STRUCTURE":structure,
+      "ACTIVITY":latent_money and flow,"HIGH_HOLD":high_hold>=0.96,"STABLE_PRICE":p30 is not None and p30>=-0.3,
+      "CONTEXT":context,"NO_VETO":not (distribution or false_break or hard_sector or late_spike),
+    }
+    lanes=[("AFTER_REACCEL",A), ("AFTER_HIGH_HOLD",B), ("PRE_BREAKOUT_TRANSFER",C)]
+    passes=[x for x in lanes if all(x[1].values())]
+    if passes:
+        lane,g=passes[0]
+        status="PASS"
+    else:
+        # NEAR = one missing non-veto gate; never buy. Prefer A, then B, then C.
+        lane,g=min(lanes,key=lambda x:sum(1 for v in x[1].values() if not v))
+        missing=[k for k,v in g.items() if not v]
+        veto_fail=any(k in missing for k in ("NO_VETO","NO_DISTRIBUTION"))
+        status="NEAR" if len(missing)<=1 and not veto_fail else ("BLOCK" if veto_fail else "FAIL")
+    missing=[k for k,v in g.items() if not v]
+    o.update({
+      "gate_lane":lane,"close_bet_lane":lane,"gate_status":status,"gate_results":g,"gate_fail_reasons":missing,
+      "gate_pass_count":sum(1 for v in g.values() if v),"gate_total":len(g),
+      "nxt_distribution_veto":distribution,"nxt_false_break_veto":false_break,"nxt_hard_sector_veto":hard_sector,"nxt_late_overextension_veto":late_overext,"nxt_late_spike_veto":late_spike,
+      "nxt_money_strict_pass":strict_money,"nxt_money_hold_pass":hold_money,"nxt_money_latent_pass":latent_money,
+    })
+    return o
+
+
+def _nxt_three_lane_rank(r):
+    lane=str(r.get("close_bet_lane") or "")
+    base={"AFTER_REACCEL":300.0,"AFTER_HIGH_HOLD":200.0,"PRE_BREAKOUT_TRANSFER":100.0}.get(lane,0.0)
+    status_bonus={"PASS":50.0,"NEAR":10.0,"FAIL":0.0,"BLOCK":-50.0}.get(str(r.get("gate_status") or "FAIL"),0.0)
+    score=base+status_bonus
+    score+=min(25.0,max(0.0,_cb_num(r.get("nxt_high_hold60"),0.0)-0.95)*500.0)
+    score+=min(15.0,max(0.0,_cb_num(r.get("nxt_turnover_day_cap_ratio"),0.0))*500.0)
+    score+=min(12.0,max(0.0,_cb_num(r.get("nxt_vd_higher_structure"),0.0))*12.0)
+    score+=min(10.0,max(0.0,_cb_num(r.get("market_rs_score"),50.0)-50.0)*0.25)
+    if lane=="AFTER_REACCEL":
+        score+=min(15.0,max(0.0,_cb_num(r.get("nxt_turnover_accel15"),0.0)-1.0)*8.0)
+        score+=min(15.0,max(0.0,_cb_num(r.get("nxt_volume_accel15"),0.0)-1.0)*7.0)
+    elif lane=="AFTER_HIGH_HOLD":
+        score+=max(0.0,10.0-_cb_num(r.get("nxt_drawdown30_pct"),10.0)*4.0)
+    else:
+        score+=min(15.0,max(0.0,_cb_num(r.get("nxt_vd_volume_persistence"),0.0))*15.0)
+    # Deep/integrated are ranking-only. C is intentionally not blocked by low Deep.
+    score+=min(8.0,max(0.0,_cb_num(r.get("deep_score"),0.0)-50.0)*0.15)
+    return round(score,2)
+
+
+def _nxt_three_lane_seed_merge(merged, summary, pre=None):
+    """Zero-base NXT discovery using all already-tracked VOLUME_DIRECTION symbols, then cap to close-bet refresh budget."""
+    if not _nxt_three_lane_enabled(): return merged
+    meta={}
+    for key in ("sector_live_pool","live_pool","live_deep30","live_watch10","top_final","top_watch"):
+        for x in (summary.get(key) or []):
+            if not isinstance(x,dict): continue
+            c=str(x.get("symbol") or x.get("code") or "").zfill(6)
+            if c.isdigit() and len(c)==6:
+                if c not in meta: meta[c]=dict(x)
+                else:
+                    for k,v in x.items():
+                        if meta[c].get(k) in (None,"") and v not in (None,""): meta[c][k]=v
+    try:
+        snap=VOLUME_DIRECTION.snapshot("NXT",500)
+        vdrows=snap.get("top") or []
+    except Exception:
+        vdrows=[]
+    allrows={str(k).zfill(6):dict(v) for k,v in (merged or {}).items() if isinstance(v,dict)}
+    for vz in vdrows:
+        c=str(vz.get("symbol") or "").zfill(6)
+        if not (c.isdigit() and len(c)==6): continue
+        row=dict(meta.get(c) or allrows.get(c) or {"symbol":c,"name":c})
+        row.update({"volume_direction_state":vz.get("combined_state")})
+        for k,v in vz.items(): row.setdefault("nxt_vd_"+k,v)
+        allrows[c]=row
+    ranked=[]
+    for c,row in allrows.items():
+        row.setdefault("symbol",c)
+        # attach all VD metrics, not just state
+        try:
+            sig=VOLUME_DIRECTION._signals.get(("NXT",c))
+            if sig is not None:
+                sd=sig.to_dict(); row["volume_direction_state"]=sd.get("combined_state") or row.get("volume_direction_state")
+                for k,v in sd.items(): row["nxt_vd_"+k]=v
+        except Exception: pass
+        q=_nxt_three_lane_gate(row)
+        lane_pri={"AFTER_REACCEL":3,"AFTER_HIGH_HOLD":2,"PRE_BREAKOUT_TRANSFER":1}.get(q.get("close_bet_lane"),0)
+        stat_pri={"PASS":3,"NEAR":2,"FAIL":1,"BLOCK":0}.get(q.get("gate_status"),0)
+        q["_nxt_seed_rank"]=(stat_pri,lane_pri,q.get("gate_pass_count",0),_nxt_three_lane_rank(q))
+        ranked.append(q)
+    ranked.sort(key=lambda x:x.get("_nxt_seed_rank"),( ),reverse=True)
+    limit=max(20,min(80,int(os.getenv("NXT_THREE_LANE_SCAN_LIMIT","40"))))
+    out={}
+    for q in ranked[:limit]:
+        q.pop("_nxt_seed_rank",None); out[str(q.get("symbol") or "").zfill(6)]=q
+    return out
+'''
+# Fix a Python expression typo in the raw block before insertion.
+helper=helper.replace('ranked.sort(key=lambda x:x.get("_nxt_seed_rank"),( ),reverse=True)', 'ranked.sort(key=lambda x:x.get("_nxt_seed_rank",(0,0,0,0)),reverse=True)')
+anchor='def _best_close_gate_decision(r):\n'
+if anchor not in s: raise SystemExit('NXT_V5_PATCH_FAIL_HELPER_ANCHOR')
+s=s.replace(anchor,helper+'\n\n'+anchor,1)
+
+old='''    vd_map={str(x.get("symbol") or "").zfill(6):x for x in (summary.get("volume_direction_top") or (summary.get("volume_direction") or {}).get("top") or []) if isinstance(x,dict)}\n    for code,r in merged.items():\n        vz=vd_map.get(code) or {}; r["volume_direction_state"]=str(vz.get("combined_state") or r.get("volume_direction_state") or "")\n    rows=_close_bet_refresh(list(merged.values()),venue)\n'''
+new='''    vd_map={str(x.get("symbol") or "").zfill(6):x for x in (summary.get("volume_direction_top") or (summary.get("volume_direction") or {}).get("top") or []) if isinstance(x,dict)}\n    for code,r in merged.items():\n        vz=vd_map.get(code) or {}; r["volume_direction_state"]=str(vz.get("combined_state") or r.get("volume_direction_state") or "")\n        for _k,_v in vz.items():\n            if _k not in {"symbol","venue"}: r.setdefault("nxt_vd_"+str(_k),_v)\n    if venue=="NXT" and _nxt_three_lane_enabled():\n        merged=_nxt_three_lane_seed_merge(merged,summary,pre)\n    rows=_close_bet_refresh(list(merged.values()),venue)\n'''
+if old not in s: raise SystemExit('NXT_V5_PATCH_FAIL_VDMAP')
+s=s.replace(old,new,1)
+
+old='''        if hard_mode:\n            o=dict(r)\n            lane,gd=_best_close_gate_decision(o)\n            o["close_bet_lane"]=lane\n            o.update(gd)\n            score,premium,reasons=_close_bet_rank_score(o,venue,krx_close_map,lane)\n            o["close_bet_score"]=score\n            o["nxt_vs_krx_close_pct"]=None if premium is None else round(premium,3)\n            o["close_bet_reasons"]=reasons\n            o["selection_type"]=f"{venue}_CLOSE_BET"\n            o.update(_row_action_decision(o,"CLOSE"))\n            if o.get("gate_status") in {"PASS","NEAR"}:\n                scored.append(o)\n            else:\n                rejected.append(o)\n            continue\n'''
+new='''        if hard_mode:\n            o=dict(r)\n            if venue=="NXT" and _nxt_three_lane_enabled():\n                o=_nxt_three_lane_gate(o)\n                lane=str(o.get("close_bet_lane") or "PRE_BREAKOUT_TRANSFER")\n                score=_nxt_three_lane_rank(o); premium=None\n                if krx_close_map:\n                    ref=krx_close_map.get(str(o.get("symbol") or "").zfill(6)) or {}\n                    rp=_cb_num(ref.get("current_price"),0); cp=_cb_num(o.get("current_price",o.get("nxt_current_price")),0)\n                    if rp>0 and cp>0: premium=(cp/rp-1)*100.0\n                o["close_bet_score"]=score\n                o["nxt_vs_krx_close_pct"]=None if premium is None else round(premium,3)\n                o["close_bet_reasons"]=[f"NXT {lane} HARD GATE",f"PASS {o.get('gate_pass_count',0)}/{o.get('gate_total',0)}"]\n                o["selection_type"]="NXT_THREE_LANE_CLOSE_BET"\n                if o.get("gate_status")=="PASS":\n                    o.update({"final_action":"종가매수","action_code":"AFTER_ENTRY_READY","after_entry_ready":True,"action_reason":f"{lane} HARD GATE ALL PASS · 점수는 순위전용","entry_fraction":0.30 if lane=="PRE_BREAKOUT_TRANSFER" else 0.50})\n                elif o.get("gate_status")=="BLOCK":\n                    o.update({"final_action":"매수금지","action_code":"NO_BUY","after_entry_ready":False,"action_reason":"HARD VETO · "+", ".join(o.get("gate_fail_reasons") or [])})\n                else:\n                    o.update({"final_action":"대기","action_code":"WAIT","after_entry_ready":False,"action_reason":f"{o.get('gate_status')} · 미통과: "+", ".join((o.get("gate_fail_reasons") or [])[:5])})\n            else:\n                lane,gd=_best_close_gate_decision(o)\n                o["close_bet_lane"]=lane\n                o.update(gd)\n                score,premium,reasons=_close_bet_rank_score(o,venue,krx_close_map,lane)\n                o["close_bet_score"]=score\n                o["nxt_vs_krx_close_pct"]=None if premium is None else round(premium,3)\n                o["close_bet_reasons"]=reasons\n                o["selection_type"]=f"{venue}_CLOSE_BET"\n                o.update(_row_action_decision(o,"CLOSE"))\n            if o.get("gate_status") in {"PASS","NEAR"}:\n                scored.append(o)\n            else:\n                rejected.append(o)\n            continue\n'''
+if old not in s: raise SystemExit('NXT_V5_PATCH_FAIL_HARD_PATH')
+s=s.replace(old,new,1)
+
+old='''    max_n=max(1,int(os.getenv("CLOSE_BET_TOP_N","5")))\n    ratio=max(0.5,min(1.0,_cb_num(os.getenv("CLOSE_BET_RISING_MAIN_RATIO","0.80"),0.80)))\n    main_slots=max(1,min(max_n,int(round(max_n*ratio))))\n    rescue_max=max(0,min(max_n-main_slots if max_n>1 else 0,int(os.getenv("CLOSE_BET_EXCEPTION_MAX","1"))))\n    main=[r for r in eligible if r.get("close_bet_lane")=="RISING_SECTOR"]\n    rescue=[r for r in eligible if r.get("close_bet_lane")=="INDEPENDENT_LEADER"]\n    candidates=list(main[:main_slots]); seen={str(x.get("symbol") or "").zfill(6) for x in candidates}\n    for x in rescue[:rescue_max]:\n        code=str(x.get("symbol") or "").zfill(6)\n        if code not in seen: candidates.append(x); seen.add(code)\n    for x in main[main_slots:]:\n        if len(candidates)>=max_n: break\n        code=str(x.get("symbol") or "").zfill(6)\n        if code not in seen: candidates.append(x); seen.add(code)\n    candidates=sorted(candidates,key=lambda x:(float(x.get("close_bet_score") or 0),float(x.get("deep_score") or 0)),reverse=True)[:max_n]\n'''
+new='''    if venue=="NXT" and hard_mode and _nxt_three_lane_enabled():\n        max_n=max(1,min(3,int(os.getenv("NXT_THREE_LANE_TOP_N","3"))))\n        # Lane diversity: no one pattern can monopolize all slots. Ranking only after each lane HARD PASS.\n        lane_caps={"AFTER_REACCEL":2,"AFTER_HIGH_HOLD":2,"PRE_BREAKOUT_TRANSFER":1}\n        eligible=sorted(eligible,key=lambda x:(_nxt_three_lane_rank(x),_cb_num(x.get("gate_pass_count"),0)),reverse=True)\n        candidates=[]; used={}; seen=set()\n        for x in eligible:\n            lane=str(x.get("close_bet_lane") or "")\n            if used.get(lane,0)>=lane_caps.get(lane,1): continue\n            code=str(x.get("symbol") or "").zfill(6)\n            if code in seen: continue\n            candidates.append(x); seen.add(code); used[lane]=used.get(lane,0)+1\n            if len(candidates)>=max_n: break\n    else:\n        max_n=max(1,int(os.getenv("CLOSE_BET_TOP_N","5")))\n        ratio=max(0.5,min(1.0,_cb_num(os.getenv("CLOSE_BET_RISING_MAIN_RATIO","0.80"),0.80)))\n        main_slots=max(1,min(max_n,int(round(max_n*ratio))))\n        rescue_max=max(0,min(max_n-main_slots if max_n>1 else 0,int(os.getenv("CLOSE_BET_EXCEPTION_MAX","1"))))\n        main=[r for r in eligible if r.get("close_bet_lane")=="RISING_SECTOR"]\n        rescue=[r for r in eligible if r.get("close_bet_lane")=="INDEPENDENT_LEADER"]\n        candidates=list(main[:main_slots]); seen={str(x.get("symbol") or "").zfill(6) for x in candidates}\n        for x in rescue[:rescue_max]:\n            code=str(x.get("symbol") or "").zfill(6)\n            if code not in seen: candidates.append(x); seen.add(code)\n        for x in main[main_slots:]:\n            if len(candidates)>=max_n: break\n            code=str(x.get("symbol") or "").zfill(6)\n            if code not in seen: candidates.append(x); seen.add(code)\n        candidates=sorted(candidates,key=lambda x:(float(x.get("close_bet_score") or 0),float(x.get("deep_score") or 0)),reverse=True)[:max_n]\n'''
+if old not in s: raise SystemExit('NXT_V5_PATCH_FAIL_SELECT')
+s=s.replace(old,new,1)
+
+old='''    snap={"captured_at_kst":now_kst_iso(),"trade_date":now_kst().strftime("%Y-%m-%d"),"venue":venue,"trigger":trigger_label,"source_summary_kst":summary.get("timestamp_kst"),"preclose_rescan_kst":(pre or {}).get("captured_at_kst"),"preclose_universe_checked":int((pre or {}).get("universe_checked") or 0),"candidate_count":len(candidates),"main_track_count":sum(1 for x in candidates if x.get("close_bet_lane")=="RISING_SECTOR"),"exception_track_count":sum(1 for x in candidates if x.get("close_bet_lane")=="INDEPENDENT_LEADER"),"data_status":data_status,"decision_status":"BET" if candidates else "NO_BET","buy_score_min":None if hard_mode else buy_min,"wait_score_min":None if hard_mode else wait_min,"legacy_buy_score_min":buy_min,"legacy_wait_score_min":wait_min,"score_role":"RANK_ONLY" if hard_mode else "BUY_THRESHOLD","selection_policy":"DIRECT_HARD_GATE_AUDITED_RANK" if hard_mode else "LEGACY_SCORE","gate_audit":gate_audit,"shadow_legacy_eligible_count":shadow_legacy_eligible,"shadow_legacy_buy_count":shadow_legacy_buy,"quote_sources":sources,"no_force_fill":True,"candidates":candidates,"near_candidates":near[:10],"rejected_top10":rejected[:10]}\n'''
+new='''    snap={"captured_at_kst":now_kst_iso(),"trade_date":now_kst().strftime("%Y-%m-%d"),"venue":venue,"trigger":trigger_label,"source_summary_kst":summary.get("timestamp_kst"),"preclose_rescan_kst":(pre or {}).get("captured_at_kst"),"preclose_universe_checked":int((pre or {}).get("universe_checked") or 0),"candidate_count":len(candidates),"main_track_count":sum(1 for x in candidates if x.get("close_bet_lane")=="RISING_SECTOR"),"exception_track_count":sum(1 for x in candidates if x.get("close_bet_lane")=="INDEPENDENT_LEADER"),"data_status":data_status,"decision_status":"BET" if candidates else "NO_BET","buy_score_min":None if hard_mode else buy_min,"wait_score_min":None if hard_mode else wait_min,"legacy_buy_score_min":buy_min,"legacy_wait_score_min":wait_min,"score_role":"RANK_ONLY" if hard_mode else "BUY_THRESHOLD","selection_policy":"DIRECT_HARD_GATE_AUDITED_RANK" if hard_mode else "LEGACY_SCORE","gate_audit":gate_audit,"shadow_legacy_eligible_count":shadow_legacy_eligible,"shadow_legacy_buy_count":shadow_legacy_buy,"quote_sources":sources,"no_force_fill":True,"candidates":candidates,"near_candidates":near[:10],"rejected_top10":rejected[:10]}\n    if venue=="NXT" and hard_mode and _nxt_three_lane_enabled():\n        snap["selection_policy"]="NXT_THREE_LANE_HARD_GATE_V5"\n        snap["nxt_lane_counts"]={k:sum(1 for x in eligible if x.get("close_bet_lane")==k) for k in ("AFTER_REACCEL","AFTER_HIGH_HOLD","PRE_BREAKOUT_TRANSFER")}\n        snap["after_entry_ready_count"]=sum(1 for x in candidates if x.get("after_entry_ready") is True)\n        snap["nxt_tracking_contract"]="08:00~20:00 same-NXT VOLUME_DIRECTION history; 19:30/19:40/19:50 staged recheck; no KRX/NXT time-series mixing"\n'''
+if old not in s: raise SystemExit('NXT_V5_PATCH_FAIL_SNAP')
+s=s.replace(old,new,1)
+
+# Add staged rechecks at 19:40 and 19:50 so a 19:39-style reacceleration is not missed.
+old='''    done={"PRECLOSE_KRX":None,"KRX":None,"PRECLOSE_NXT":None,"NXT":None,"EOD_NXT":None,"RETENTION_RESET":None}\n'''
+new='''    done={"PRECLOSE_KRX":None,"KRX":None,"PRECLOSE_NXT":None,"NXT":None,"NXT_1940":None,"NXT_1950":None,"EOD_NXT":None,"RETENTION_RESET":None}\n'''
+if old not in s: raise SystemExit('NXT_V5_PATCH_FAIL_DONE')
+s=s.replace(old,new,1)
+old='''            if 19*60+35<=hm<19*60+36 and done["NXT"]!=day:\n                summary=load_latest_for_venue("NXT"); pre=_read_preclose("NXT") or {}; _invalid_close_bet("NXT","19:35_NXT_INVALID","19:20 사전스캔 이후 Full Scan 미완료",summary,pre); done["NXT"]=day\n            eod_enabled=os.getenv("NXT_EOD_HOLD_ENABLED","true").strip().lower() in {"1","true","yes","y","on"}\n'''
+new='''            if 19*60+35<=hm<19*60+36 and done["NXT"]!=day:\n                summary=load_latest_for_venue("NXT"); pre=_read_preclose("NXT") or {}; _invalid_close_bet("NXT","19:35_NXT_INVALID","19:20 사전스캔 이후 Full Scan 미완료",summary,pre); done["NXT"]=day\n            if _nxt_three_lane_enabled() and 19*60+40<=hm<19*60+42 and done["NXT_1940"]!=day:\n                build_close_bet("NXT","19:40_NXT_THREE_LANE_RECHECK"); done["NXT_1940"]=day\n            if _nxt_three_lane_enabled() and 19*60+50<=hm<19*60+52 and done["NXT_1950"]!=day:\n                build_close_bet("NXT","19:50_NXT_THREE_LANE_FINAL"); done["NXT_1950"]=day\n            eod_enabled=os.getenv("NXT_EOD_HOLD_ENABLED","true").strip().lower() in {"1","true","yes","y","on"}\n'''
+if old not in s: raise SystemExit('NXT_V5_PATCH_FAIL_RECHECK')
+s=s.replace(old,new,1)
+
+p.write_text(s,encoding='utf-8')
+print(MARK+'_PATCH_PASS')
+
+NXT_THREE_LANE_V5_PATCH_EOF
+
+RUN python -m py_compile /tmp/apply_nxt_three_lane_v5.py \
+ && python /tmp/apply_nxt_three_lane_v5.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && python -m py_compile /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && python - <<'PYV5'
+from pathlib import Path
+s=Path('/app/오백종목_통합엔진_웹서비스_V1_0.py').read_text(encoding='utf-8')
+for mark in [
+    '# NXT_THREE_LANE_HARD_GATE_V5',
+    'AFTER_REACCEL',
+    'AFTER_HIGH_HOLD',
+    'PRE_BREAKOUT_TRANSFER',
+    '19:40_NXT_THREE_LANE_RECHECK',
+    '19:50_NXT_THREE_LANE_FINAL',
+]:
+    assert mark in s, mark
+print('NXT_THREE_LANE_HARD_GATE_V5_BUILD_VALIDATION_PASS')
+PYV5
+
+# NXT_THREE_LANE_HARD_GATE_V5_DEPLOY_END
