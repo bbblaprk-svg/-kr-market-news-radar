@@ -30492,3 +30492,281 @@ print('NXT_V5_1_COMPLETION_BUILD_VALIDATION_PASS')
 PYV51
 
 # NXT_V5_1_COMPLETION_PATCH_END
+
+
+# NXT_V5_1_MANUAL_REPLAY_DOCKER_PATCH_BEGIN
+COPY <<'NXT_V51_MANUAL_REPLAY_PATCH_EOF' /tmp/apply_nxt_v51_manual_replay.py
+from pathlib import Path
+import sys
+
+MARK = 'NXT_V5_1_MANUAL_REPLAY_API'
+
+
+def patch(path: str) -> None:
+    p = Path(path)
+    s = p.read_text(encoding='utf-8')
+    if MARK in s:
+        print(MARK + '_ALREADY_PRESENT')
+        return
+
+    anchor = '\ndef build_close_bet(venue, trigger_label):\n'
+    if anchor not in s:
+        raise SystemExit('MANUAL_REPLAY_BUILD_ANCHOR_NOT_FOUND')
+
+    block = r'''
+
+# NXT_V5_1_MANUAL_REPLAY_API
+# Read-only deterministic after-hours replay. It never overwrites the official 19:30 close-bet snapshot.
+_NXT_V51_REPLAY_LOCK = threading.Lock()
+_NXT_V51_REPLAY_CACHE = {"at": 0.0, "result": None}
+
+
+def _nxt_v51_manual_replay_enabled():
+    return os.getenv("NXT_V51_MANUAL_REPLAY_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _nxt_v51_replay_apply_action(o):
+    lane = str(o.get("close_bet_lane") or "")
+    status = str(o.get("gate_status") or "FAIL")
+    o["after_entry_ready"] = False
+    if status == "PASS":
+        rr = _nxt_v51_rr_gate(o) if _nxt_v51_enabled() else {
+            "rr_gate_status": "PASS", "rr_gate_pass": True, "rr_gate_reason": "V51_DISABLED"
+        }
+        o.update(rr)
+        if rr.get("rr_gate_pass") is True:
+            o.update({
+                "final_action": "종가매수",
+                "action_code": "AFTER_ENTRY_READY",
+                "after_entry_ready": True,
+                "action_reason": f"{lane} STRUCTURE PASS + 2R HARD GATE PASS",
+                "entry_fraction": 0.30 if lane == "PRE_BREAKOUT_TRANSFER" else 0.50,
+            })
+        elif rr.get("rr_gate_status") == "PENDING":
+            o.update({
+                "final_action": "대기", "action_code": "WAIT_RR_DATA",
+                "action_reason": "V5 HARD PASS · 2R DATA PENDING: " + str(rr.get("rr_gate_reason") or "")
+            })
+        else:
+            o.update({
+                "final_action": "매수금지", "action_code": "RR_BLOCKED",
+                "action_reason": "V5 HARD PASS · 2R HARD GATE FAIL: " + str(rr.get("rr_gate_reason") or "")
+            })
+    elif status == "BLOCK":
+        o.update({
+            "final_action": "매수금지", "action_code": "NO_BUY",
+            "action_reason": "HARD VETO · " + ", ".join(o.get("gate_fail_reasons") or [])
+        })
+    elif status == "PENDING":
+        o.update({
+            "final_action": "대기", "action_code": "WAIT_CAP_DATA",
+            "action_reason": "KIS/LS 시총 권위값 대기"
+        })
+    else:
+        o.update({
+            "final_action": "대기", "action_code": "WAIT",
+            "action_reason": f"{status} · 미통과: " + ", ".join((o.get("gate_fail_reasons") or [])[:5])
+        })
+    return o
+
+
+def _nxt_v51_replay_compact(o):
+    keys = [
+        "symbol", "name", "current_price", "change_pct", "market_cap_100m", "market_cap_source",
+        "close_bet_lane", "gate_status", "gate_pass_count", "gate_total", "gate_fail_reasons",
+        "close_bet_score", "final_action", "action_code", "action_reason", "after_entry_ready",
+        "rr_gate_status", "rr_gate_reason", "rr_value", "rr_required", "rr_entry_price",
+        "rr_stop_price", "rr_stop_source", "rr_stop_pct", "rr_target_price", "rr_target_source",
+        "rr_upside_pct", "nxt_data_ready", "nxt_data_partial", "nxt_full_session", "nxt_bar_count",
+        "nxt_first_at", "nxt_last_at", "nxt_span_minutes", "nxt_session_return_pct",
+        "nxt_high_hold60", "nxt_drawdown30_pct", "nxt_volume_accel15", "nxt_turnover_accel15",
+        "nxt_turnover15_krw", "nxt_turnover30_krw", "nxt_turnover_day_krw",
+        "nxt_impulse_seen", "nxt_recompression_seen", "nxt_reclaim_ratio",
+        "cluster_state", "cluster_energy", "energy_delta", "energy_trend", "market_rs", "market_rs_score",
+        "asym_rs_class", "stage1_state", "deep_score", "deep_grade", "volume_direction_state",
+    ]
+    return {k: o.get(k) for k in keys if k in o}
+
+
+def build_nxt_v51_manual_replay():
+    if not _nxt_v51_manual_replay_enabled():
+        return {"ok": False, "status": "DISABLED", "replay_only": True, "official_snapshot_untouched": True}
+
+    cooldown = max(5, int(_cb_num(os.getenv("NXT_V51_MANUAL_REPLAY_COOLDOWN_SEC", "20"), 20)))
+    nowm = time.monotonic()
+    cached = _NXT_V51_REPLAY_CACHE.get("result")
+    if cached is not None and nowm - float(_NXT_V51_REPLAY_CACHE.get("at") or 0.0) < cooldown:
+        out = json.loads(json.dumps(cached, ensure_ascii=False, default=str))
+        out["cache_hit"] = True
+        return out
+
+    if not _NXT_V51_REPLAY_LOCK.acquire(blocking=False):
+        return {
+            "ok": False, "status": "BUSY", "replay_only": True, "official_snapshot_untouched": True,
+            "captured_at_kst": now_kst_iso(),
+        }
+    try:
+        summary = load_latest_for_venue("NXT")
+        if not isinstance(summary, dict):
+            raise RuntimeError("NXT latest summary unavailable")
+        pre = _read_preclose("NXT") or {}
+
+        base_rows = _candidate_union(summary)
+        merged = {str(r.get("symbol", "")).zfill(6): dict(r) for r in base_rows if isinstance(r, dict)}
+        for r in pre.get("candidates") or []:
+            if not isinstance(r, dict):
+                continue
+            code = str(r.get("symbol") or "").zfill(6)
+            if code in merged:
+                x = dict(r)
+                x.update({k: v for k, v in merged[code].items() if k not in x or x.get(k) in (None, "")})
+                merged[code] = x
+            else:
+                merged[code] = dict(r)
+
+        # Reuse the restored same-NXT VOLUME_DIRECTION session. No broker quote refresh and no official snapshot write.
+        merged = _nxt_three_lane_seed_merge(merged, summary, pre)
+        rows = _close_micro_context(list(merged.values()), summary, pre)
+
+        evaluated = []
+        for r in rows:
+            o = _nxt_three_lane_gate(dict(r))
+            o["close_bet_score"] = _nxt_three_lane_rank(o)
+            o["selection_type"] = "NXT_V51_MANUAL_REPLAY"
+            _nxt_v51_replay_apply_action(o)
+            evaluated.append(o)
+
+        evaluated.sort(key=lambda x: (
+            {"PASS": 3, "NEAR": 2, "FAIL": 1, "PENDING": 1, "BLOCK": 0}.get(str(x.get("gate_status") or "FAIL"), 0),
+            _cb_num(x.get("close_bet_score"), 0.0),
+            _cb_num(x.get("gate_pass_count"), 0.0),
+        ), reverse=True)
+
+        passed = [x for x in evaluated if x.get("gate_status") == "PASS"]
+        near = [x for x in evaluated if x.get("gate_status") == "NEAR"]
+        pending = [x for x in evaluated if x.get("gate_status") == "PENDING"]
+        rejected = [x for x in evaluated if x.get("gate_status") not in {"PASS", "NEAR", "PENDING"}]
+
+        # Same lane-diversity rule as the live V5.1 close-bet path.
+        lane_caps = {"AFTER_REACCEL": 2, "AFTER_HIGH_HOLD": 2, "PRE_BREAKOUT_TRANSFER": 1}
+        candidates, used, seen = [], {}, set()
+        for x in passed:
+            lane = str(x.get("close_bet_lane") or "")
+            if used.get(lane, 0) >= lane_caps.get(lane, 1):
+                continue
+            code = str(x.get("symbol") or "").zfill(6)
+            if code in seen:
+                continue
+            candidates.append(x); seen.add(code); used[lane] = used.get(lane, 0) + 1
+            if len(candidates) >= 3:
+                break
+
+        try:
+            vd = VOLUME_DIRECTION.snapshot("NXT", 5) if VOLUME_DIRECTION_ENABLED else {}
+        except Exception as e:
+            vd = {"snapshot_error": f"{type(e).__name__}: {e}"}
+
+        after_ready = sum(1 for x in candidates if x.get("after_entry_ready") is True)
+        rr_blocked = sum(1 for x in candidates if x.get("action_code") == "RR_BLOCKED")
+        rr_pending = sum(1 for x in candidates if x.get("action_code") == "WAIT_RR_DATA")
+        result = {
+            "ok": True,
+            "status": "READY",
+            "captured_at_kst": now_kst_iso(),
+            "trade_date": str(summary.get("timestamp_kst") or "")[:10] or now_kst().strftime("%Y-%m-%d"),
+            "venue": "NXT",
+            "trigger": "MANUAL_REPLAY",
+            "selection_policy": "NXT_THREE_LANE_HARD_GATE_V5_1_MANUAL_REPLAY",
+            "replay_only": True,
+            "official_snapshot_untouched": True,
+            "broker_quote_refresh_used": False,
+            "source_summary_kst": summary.get("timestamp_kst"),
+            "source_preclose_kst": pre.get("captured_at_kst"),
+            "evaluated_count": len(evaluated),
+            "structural_pass_count": len(passed),
+            "near_count": len(near),
+            "pending_count": len(pending),
+            "candidate_count": len(candidates),
+            "after_entry_ready_count": after_ready,
+            "rr_blocked_count": rr_blocked,
+            "rr_pending_count": rr_pending,
+            "decision_status": "ENTRY_READY" if after_ready > 0 else ("WATCH_ONLY" if candidates else "NO_BET"),
+            "nxt_lane_counts": {k: sum(1 for x in passed if x.get("close_bet_lane") == k) for k in ("AFTER_REACCEL", "AFTER_HIGH_HOLD", "PRE_BREAKOUT_TRANSFER")},
+            "session_restore": {
+                "tracked": vd.get("tracked"), "warmup_ready": vd.get("warmup_ready"), "warming": vd.get("warming"),
+                "restored_series": vd.get("restored_series"), "max_bars_seen": vd.get("max_bars_seen"), "last_error": vd.get("last_error"),
+            },
+            "candidates": [_nxt_v51_replay_compact(x) for x in candidates],
+            "near_candidates": [_nxt_v51_replay_compact(x) for x in near[:10]],
+            "pending_candidates": [_nxt_v51_replay_compact(x) for x in pending[:10]],
+            "rejected_top10": [_nxt_v51_replay_compact(x) for x in rejected[:10]],
+        }
+        _NXT_V51_REPLAY_CACHE["at"] = time.monotonic()
+        _NXT_V51_REPLAY_CACHE["result"] = result
+        logging.getLogger("alpha500_close_bet").info(
+            "NXT V5.1 MANUAL REPLAY status=%s evaluated=%d pass=%d candidates=%d entry_ready=%d rr_blocked=%d rr_pending=%d restored=%s",
+            result["decision_status"], result["evaluated_count"], result["structural_pass_count"], result["candidate_count"],
+            result["after_entry_ready_count"], result["rr_blocked_count"], result["rr_pending_count"],
+            result["session_restore"].get("restored_series"),
+        )
+        return result
+    finally:
+        _NXT_V51_REPLAY_LOCK.release()
+'''
+    s = s.replace(anchor, block + anchor, 1)
+
+    old = 'if path in {"/", "/health", "/api/status", "/api/results", "/api/volume-direction"}:'
+    new = 'if path in {"/", "/health", "/api/status", "/api/results", "/api/volume-direction", "/api/nxt-v51/manual-replay"}:'
+    if old not in s:
+        raise SystemExit('MANUAL_REPLAY_HEAD_ANCHOR_NOT_FOUND')
+    s = s.replace(old, new, 1)
+
+    old = '''        if path == "/api/run":\n            with LOCK: busy = STATE["running"]\n'''
+    new = '''        if path == "/api/nxt-v51/manual-replay":\n            try:\n                out = build_nxt_v51_manual_replay()\n                code = 200 if out.get("ok") else (409 if out.get("status") == "BUSY" else 503)\n                return self._json(code, out)\n            except Exception as e:\n                logging.getLogger("alpha500_close_bet").exception("NXT V5.1 MANUAL REPLAY failed")\n                return self._json(500, {"ok": False, "status": "ERROR", "replay_only": True, "official_snapshot_untouched": True, "error": f"{type(e).__name__}: {e}"})\n        if path == "/api/run":\n            with LOCK: busy = STATE["running"]\n'''
+    if old not in s:
+        raise SystemExit('MANUAL_REPLAY_GET_ANCHOR_NOT_FOUND')
+    s = s.replace(old, new, 1)
+
+    old = '''    def do_POST(self):\n        if urlparse(self.path).path == "/api/run":\n            return self.do_GET()\n        return self._json(404, {"error": "not found"})\n'''
+    new = '''    def do_POST(self):\n        path = urlparse(self.path).path\n        if path in {"/api/run", "/api/nxt-v51/manual-replay"}:\n            return self.do_GET()\n        return self._json(404, {"error": "not found"})\n'''
+    if old not in s:
+        raise SystemExit('MANUAL_REPLAY_POST_ANCHOR_NOT_FOUND')
+    s = s.replace(old, new, 1)
+
+    p.write_text(s, encoding='utf-8')
+    print(MARK + '_PATCH_PASS')
+
+
+if __name__ == '__main__':
+    if len(sys.argv) != 2:
+        raise SystemExit('usage: apply_nxt_v51_manual_replay.py <app.py>')
+    patch(sys.argv[1])
+
+NXT_V51_MANUAL_REPLAY_PATCH_EOF
+
+RUN python -m py_compile /tmp/apply_nxt_v51_manual_replay.py \
+ && python /tmp/apply_nxt_v51_manual_replay.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && python -m py_compile /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && python - <<'PYV51REPLAY'
+from pathlib import Path
+s=Path('/app/오백종목_통합엔진_웹서비스_V1_0.py').read_text(encoding='utf-8')
+for mark in [
+    '# NXT_V5_1_MANUAL_REPLAY_API',
+    'def build_nxt_v51_manual_replay()',
+    '/api/nxt-v51/manual-replay',
+    'official_snapshot_untouched',
+    'broker_quote_refresh_used',
+    'NXT_THREE_LANE_HARD_GATE_V5_1_MANUAL_REPLAY',
+]:
+    assert mark in s, mark
+# Guard against accidental regression of the three V5.1 completion fixes.
+for mark in [
+    'KIS_AUTHORITY_FALLBACK',
+    'WAIT_RR_DATA',
+    'RR_BLOCKED',
+    'NXT_THREE_LANE_HARD_GATE_V5_1',
+]:
+    assert mark in s, mark
+print('NXT_V5_1_MANUAL_REPLAY_BUILD_VALIDATION_PASS')
+PYV51REPLAY
+# NXT_V5_1_MANUAL_REPLAY_DOCKER_PATCH_END
