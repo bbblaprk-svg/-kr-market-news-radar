@@ -30771,3 +30771,516 @@ for mark in [
 print('NXT_V5_1_MANUAL_REPLAY_BUILD_VALIDATION_PASS')
 PYV51REPLAY
 # NXT_V5_1_MANUAL_REPLAY_DOCKER_PATCH_END
+
+# NXT_V5_2_DISCOVERY_LOCK_DOCKER_PATCH_BEGIN
+ENV NXT_V52_DISCOVERY_LOCK_N=20 \
+    NXT_V51_KIS_BASE=https://quant-signal-v3-7-51-clean2.onrender.com
+
+COPY <<'NXT_V52_DISCOVERY_LOCK_PATCH_EOF' /tmp/apply_nxt_v52_discovery_lock.py
+#!/usr/bin/env python3
+from pathlib import Path
+import sys
+
+MARK_APP = 'NXT_V5_2_DISCOVERY_LOCK_APP'
+MARK_BRIDGE = 'NXT_V5_2_DISCOVERY_LOCK_BRIDGE'
+
+
+def replace_top_def(src: str, name: str, new_block: str) -> str:
+    start = src.find(f'def {name}(')
+    if start < 0:
+        raise SystemExit(f'V52_DEF_NOT_FOUND:{name}')
+    # next top-level def/class after this one
+    pos = start + 1
+    candidates = []
+    for token in ('\ndef ', '\nclass '):
+        i = src.find(token, pos)
+        if i >= 0:
+            candidates.append(i + 1)
+    end = min(candidates) if candidates else len(src)
+    return src[:start] + new_block.rstrip() + '\n\n' + src[end:]
+
+
+def replace_method(src: str, name: str, new_block: str) -> str:
+    start = src.find(f'    def {name}(')
+    if start < 0:
+        raise SystemExit(f'V52_METHOD_NOT_FOUND:{name}')
+    pos = start + 1
+    candidates = []
+    for token in ('\n    def ', '\n    @staticmethod', '\n    @classmethod', '\nclass '):
+        i = src.find(token, pos)
+        if i >= 0:
+            candidates.append(i + 1)
+    end = min(candidates) if candidates else len(src)
+    return src[:start] + new_block.rstrip() + '\n\n' + src[end:]
+
+
+def patch_bridge(path: Path):
+    s = path.read_text(encoding='utf-8')
+    if MARK_BRIDGE in s:
+        print(MARK_BRIDGE + '_ALREADY_PRESENT')
+        return
+    if 'NXT_V5_1_SESSION_PERSISTENCE' not in s:
+        raise SystemExit('V52_REQUIRES_V51_BRIDGE')
+
+    load_block = r'''    def _load_v51_state(self):
+        """Merge, never shrink, the same-day full NXT checkpoint with the short warm-state.
+        The short state may be newer but shall never discard older intraday bars.
+        """
+        try:
+            if not self.v51_state_path.exists():
+                return
+            if self.v51_state_path.suffix == ".gz":
+                with gzip.open(self.v51_state_path, "rt", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            else:
+                payload = json.loads(self.v51_state_path.read_text(encoding="utf-8"))
+            rows = payload.get("series") if isinstance(payload, dict) else None
+            if not isinstance(rows, list):
+                return
+            today = datetime.now(KST).strftime("%Y-%m-%d")
+            signal_fields = set(Signal.__dataclass_fields__)
+            restored = 0
+            restored_max = 0
+
+            def from_saved(v):
+                if isinstance(v, list) and len(v) >= 6:
+                    return MinuteBar(*v[:6])
+                if isinstance(v, dict):
+                    return MinuteBar(**{k: v[k] for k in MinuteBar.__dataclass_fields__ if k in v})
+                return None
+
+            def merge_bar(dst, b):
+                if b is None or not getattr(b, "minute", None):
+                    return
+                key = str(b.minute)
+                prev = dst.get(key)
+                if prev is None:
+                    dst[key] = MinuteBar(b.minute, b.open, b.high, b.low, b.close, b.volume)
+                    return
+                # Later source wins close/open where present; high/low/volume preserve the richer minute.
+                op = b.open if float(b.open or 0) > 0 else prev.open
+                hi = max(float(prev.high or prev.close or 0), float(b.high or b.close or 0))
+                lows = [x for x in (float(prev.low or 0), float(b.low or 0)) if x > 0]
+                lo = min(lows) if lows else (b.low or prev.low)
+                cl = b.close if float(b.close or 0) > 0 else prev.close
+                vv = max(float(prev.volume or 0), float(b.volume or 0))
+                dst[key] = MinuteBar(key, op, hi, lo, cl, vv)
+
+            with self._lock:
+                for z in rows:
+                    if not isinstance(z, dict) or str(z.get("trade_date") or "") != today:
+                        continue
+                    code = str(z.get("symbol") or "").zfill(6)
+                    if not (code.isdigit() and len(code) == 6):
+                        continue
+                    key = ("NXT", code)
+                    existing = self._series.get(key)
+                    ss = existing if existing is not None else _Series(self.max_bars)
+                    ss.trade_date = today
+                    merged = {}
+                    # Checkpoint first, short/current state second so the newer close wins without losing history.
+                    for raw in z.get("bars") or []:
+                        try: merge_bar(merged, from_saved(raw))
+                        except Exception: pass
+                    try: merge_bar(merged, from_saved(z.get("current")))
+                    except Exception: pass
+                    if existing is not None:
+                        for b in list(existing.bars): merge_bar(merged, b)
+                        merge_bar(merged, existing.current)
+                    bars = [merged[k] for k in sorted(merged.keys())][-self.max_bars:]
+                    ss.bars.clear()
+                    ss.current = None
+                    if bars:
+                        for b in bars[:-1]: ss.bars.append(b)
+                        ss.current = bars[-1]
+                    saved_update = str(z.get("last_update") or "")
+                    existing_update = str(getattr(existing, "last_update", None) or "") if existing is not None else ""
+                    if existing is None or saved_update >= existing_update:
+                        for attr, default in (("last_cum_volume", None),("last_source", ""),("last_update", None),("accel_state", "QUIET"),("pause_ttl", 0),("prev_response", 0.0),("prev_volume_ratio", 1.0),("prev_price_velocity", 0.0),("last_event_state", "QUIET"),("event_occurrence", 0),("current_signal_state", "QUIET"),("current_signal_price", 0.0),("current_signal_at", None),("last_entry_signal_price", 0.0),("last_entry_signal_at", None)):
+                            if attr in z: setattr(ss, attr, z.get(attr, default))
+                    self._series[key] = ss
+                    sig = z.get("signal")
+                    if isinstance(sig, dict) and (key not in self._signals or saved_update >= existing_update):
+                        try: self._signals[key] = Signal(**{k: sig[k] for k in signal_fields if k in sig})
+                        except Exception: pass
+                    depth = len(self._all_bars(ss))
+                    restored_max = max(restored_max, depth)
+                    restored += 1
+                self._restored_series = max(self._restored_series, restored)
+                self._v51_restored_max_bars = max(int(getattr(self, "_v51_restored_max_bars", 0) or 0), restored_max)
+        except Exception:
+            pass
+'''
+
+    save_block = r'''    def _save_v51_state(self, force: bool = False):
+        """Persist NXT session state without ever replacing a richer same-day checkpoint by a shorter one."""
+        now_m = time.monotonic()
+        if not force and self._last_v51_state_save and now_m - self._last_v51_state_save < self.v51_state_save_seconds:
+            return
+        try:
+            today = datetime.now(KST).strftime("%Y-%m-%d")
+            old_rows = {}
+            if self.v51_state_path.exists():
+                try:
+                    if self.v51_state_path.suffix == ".gz":
+                        with gzip.open(self.v51_state_path, "rt", encoding="utf-8") as fh: old_payload = json.load(fh)
+                    else:
+                        old_payload = json.loads(self.v51_state_path.read_text(encoding="utf-8"))
+                    for z in (old_payload.get("series") or []) if isinstance(old_payload, dict) else []:
+                        if isinstance(z, dict) and str(z.get("trade_date") or "") == today:
+                            c = str(z.get("symbol") or "").zfill(6)
+                            if c.isdigit() and len(c) == 6: old_rows[c] = z
+                except Exception:
+                    old_rows = {}
+
+            def unpack(v):
+                try:
+                    if isinstance(v, list) and len(v) >= 6: return MinuteBar(*v[:6])
+                    if isinstance(v, dict): return MinuteBar(**{k: v[k] for k in MinuteBar.__dataclass_fields__ if k in v})
+                except Exception: return None
+                return None
+
+            def merge(dst, b):
+                if b is None or not getattr(b, "minute", None): return
+                key = str(b.minute); prev = dst.get(key)
+                if prev is None:
+                    dst[key] = MinuteBar(b.minute, b.open, b.high, b.low, b.close, b.volume); return
+                op = b.open if float(b.open or 0) > 0 else prev.open
+                hi = max(float(prev.high or prev.close or 0), float(b.high or b.close or 0))
+                lows = [x for x in (float(prev.low or 0), float(b.low or 0)) if x > 0]
+                lo = min(lows) if lows else (b.low or prev.low)
+                cl = b.close if float(b.close or 0) > 0 else prev.close
+                vv = max(float(prev.volume or 0), float(b.volume or 0))
+                dst[key] = MinuteBar(key, op, hi, lo, cl, vv)
+
+            rows = []
+            seen = set()
+            with self._lock:
+                for (venue, code), ss in self._series.items():
+                    if venue != "NXT" or str(ss.trade_date or "") != today: continue
+                    seen.add(code); merged = {}; old = old_rows.get(code) or {}
+                    for raw in old.get("bars") or []: merge(merged, unpack(raw))
+                    merge(merged, unpack(old.get("current")))
+                    for b in list(ss.bars): merge(merged, b)
+                    merge(merged, ss.current)
+                    bars = [merged[k] for k in sorted(merged.keys())][-self.v51_state_bars:]
+                    old_signal = old.get("signal") if isinstance(old, dict) else None
+                    rows.append({
+                      "venue":"NXT","symbol":code,"trade_date":today,
+                      "bars":[self._v51_bar_compact(b) for b in bars[:-1]],
+                      "current":self._v51_bar_compact(bars[-1]) if bars else None,
+                      "last_cum_volume":ss.last_cum_volume,"last_source":ss.last_source,"last_update":ss.last_update,
+                      "accel_state":ss.accel_state,"pause_ttl":ss.pause_ttl,"prev_response":ss.prev_response,
+                      "prev_volume_ratio":ss.prev_volume_ratio,"prev_price_velocity":ss.prev_price_velocity,
+                      "last_event_state":ss.last_event_state,"event_occurrence":ss.event_occurrence,
+                      "current_signal_state":ss.current_signal_state,"current_signal_price":ss.current_signal_price,
+                      "current_signal_at":ss.current_signal_at,"last_entry_signal_price":ss.last_entry_signal_price,
+                      "last_entry_signal_at":ss.last_entry_signal_at,
+                      "signal":self._signals[(venue,code)].to_dict() if (venue,code) in self._signals else old_signal,
+                    })
+                # Preserve same-day symbols not currently materialized in memory.
+                for code, old in old_rows.items():
+                    if code not in seen: rows.append(old)
+            self.v51_state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = Path(str(self.v51_state_path) + ".tmp")
+            payload = {"saved_at_kst":datetime.now(KST).isoformat(timespec="seconds"),"format":"NXT_V5_2_MERGE_NO_SHRINK","series":rows}
+            if self.v51_state_path.suffix == ".gz":
+                with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=3) as fh: json.dump(payload, fh, ensure_ascii=False, separators=(",",":"), default=str)
+            else:
+                tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",",":"), default=str), encoding="utf-8")
+            tmp.replace(self.v51_state_path)
+            self._last_v51_state_save = now_m
+        except Exception:
+            pass
+'''
+    s = replace_method(s, '_load_v51_state', load_block)
+    s = replace_method(s, '_save_v51_state', save_block)
+    # expose actual restored depth in snapshot diagnostics
+    old = '"restored_series": self._restored_series,\n            "last_series_update": max(last_updates) if last_updates else None,'
+    new = '"restored_series": self._restored_series,\n            "restored_max_bars": int(getattr(self, "_v51_restored_max_bars", 0) or 0),\n            "last_series_update": max(last_updates) if last_updates else None,'
+    if old not in s:
+        raise SystemExit('V52_BRIDGE_SNAPSHOT_ANCHOR_NOT_FOUND')
+    s = s.replace(old, new, 1)
+    # marker
+    s = s.replace('class LSVolumeDirectionBridge:', f'# {MARK_BRIDGE}\nclass LSVolumeDirectionBridge:', 1)
+    path.write_text(s, encoding='utf-8')
+    print(MARK_BRIDGE + '_PATCH_PASS')
+
+
+def patch_app(path: Path):
+    s = path.read_text(encoding='utf-8')
+    if MARK_APP in s:
+        print(MARK_APP + '_ALREADY_PRESENT')
+        return
+    for req in ('NXT_THREE_LANE_HARD_GATE_V5','NXT_V5_1_COMPLETION_PATCH','NXT_V5_1_MANUAL_REPLAY_API'):
+        if req not in s: raise SystemExit('V52_REQUIRES:' + req)
+
+    cap_block = r'''def _nxt_v51_kis_cap(code):
+    """Authoritative KIS market-cap lookup. Never inherit an LS/self base URL by accident."""
+    code = str(code or "").zfill(6)
+    ttl = max(60, int(_cb_num(os.getenv("NXT_V51_KIS_CAP_TTL_SEC", "300"), 300)))
+    nowm = time.monotonic(); cache = _NXT_V51_CAP_CACHE
+    if (not cache.get("rows")) or nowm - float(cache.get("at") or 0.0) >= ttl:
+        base = os.getenv("NXT_V51_KIS_BASE", os.getenv("KIS_AUTHORITY_BASE", "https://quant-signal-v3-7-51-clean2.onrender.com")).rstrip("/")
+        try:
+            resp = requests.get(base + "/api/ledger/latest/rows", params={"market":"KRX","limit":5000}, timeout=8)
+            resp.raise_for_status(); obj = resp.json() if resp.content else {}
+            rows = (obj.get("rows") or obj.get("data") or []) if isinstance(obj, dict) else []
+            cmap = {}
+            for x in rows:
+                if not isinstance(x, dict): continue
+                c = str(x.get("code") or x.get("symbol") or "").zfill(6)
+                cap = _cb_num(x.get("market_cap_100m"), 0.0)
+                if c.isdigit() and len(c) == 6 and cap > 0: cmap[c] = cap
+            manifest = obj.get("manifest") if isinstance(obj, dict) and isinstance(obj.get("manifest"), dict) else {}
+            if cmap:
+                cache.update({"at":nowm,"rows":cmap,"source_at":obj.get("timestamp_kst") or obj.get("captured_at_kst") or obj.get("asof") or manifest.get("captured_at_kst") or manifest.get("created_at"),"source_url":base,"error":None})
+            else:
+                cache.update({"at":nowm,"source_url":base,"error":"KIS_CAP_EMPTY"})
+        except Exception as e:
+            cache.update({"at":nowm,"source_url":base,"error":type(e).__name__+":"+str(e)[:160]})
+    cap = _cb_num((cache.get("rows") or {}).get(code), 0.0)
+    return (cap if cap > 0 else None), {"source_at":cache.get("source_at"),"source_url":cache.get("source_url"),"error":cache.get("error"),"cache_rows":len(cache.get("rows") or {})}
+'''
+    s = replace_top_def(s, '_nxt_v51_kis_cap', cap_block)
+
+    helper = r'''# NXT_V5_2_DISCOVERY_LOCK_APP
+# Discovery is a contract: the price-volume leaders are never silently replaced by a different pool downstream.
+def _nxt_v52_meta_map(summary):
+    meta = {}
+    for key in ("sector_live_pool","live_pool","live_deep30","live_watch10","top_final","top_watch"):
+        for x in (summary.get(key) or []):
+            if not isinstance(x, dict): continue
+            c = str(x.get("symbol") or x.get("code") or "").zfill(6)
+            if not (c.isdigit() and len(c) == 6): continue
+            if c not in meta: meta[c] = dict(x)
+            else:
+                for k, v in x.items():
+                    if meta[c].get(k) in (None, "") and v not in (None, ""): meta[c][k] = v
+    return meta
+
+
+def _nxt_v52_discovery_snapshot(summary, limit=None):
+    limit = max(5, min(40, int(limit or os.getenv("NXT_V52_DISCOVERY_LOCK_N", "20"))))
+    snap = VOLUME_DIRECTION.snapshot("NXT", max(limit, 20)) if VOLUME_DIRECTION_ENABLED else {"top":[]}
+    meta = _nxt_v52_meta_map(summary)
+    rows = []
+    for rank, vz in enumerate((snap.get("top") or [])[:limit], start=1):
+        if not isinstance(vz, dict): continue
+        c = str(vz.get("symbol") or "").zfill(6)
+        if not (c.isdigit() and len(c) == 6): continue
+        row = dict(meta.get(c) or {})
+        row.setdefault("symbol", c); row.setdefault("name", row.get("name") or c)
+        row["volume_direction_state"] = vz.get("combined_state")
+        row["discovery_rank"] = rank
+        row["discovery_state"] = vz.get("combined_state")
+        row["discovery_score"] = vz.get("score")
+        row["discovery_signal_bars"] = vz.get("bars")
+        row["discovery_signal_price"] = vz.get("signal_price")
+        row["discovery_signal_at_kst"] = vz.get("signal_at_kst")
+        row["discovery_locked"] = True
+        for k, v in vz.items(): row["nxt_vd_" + k] = v
+        rows.append(row)
+    raw = "|".join(f"{x.get('symbol')}:{x.get('discovery_state')}:{x.get('discovery_score')}" for x in rows)
+    import hashlib as _hashlib
+    trade_date = str(summary.get("timestamp_kst") or now_kst_iso())[:10]
+    sid = trade_date.replace("-", "") + "_" + _hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+    return {"snapshot_id":sid,"rows":rows,"top5":rows[:5],"tracked":snap.get("tracked"),"actual_max_bars":snap.get("max_bars_seen"),"restored_series":snap.get("restored_series"),"restored_max_bars":snap.get("restored_max_bars")}
+'''
+    anchor = 'def _nxt_three_lane_seed_merge(merged, summary, pre=None):\n'
+    if anchor not in s: raise SystemExit('V52_SEED_ANCHOR_NOT_FOUND')
+    s = s.replace(anchor, helper + '\n\n' + anchor, 1)
+
+    seed_block = r'''def _nxt_three_lane_seed_merge(merged, summary, pre=None):
+    """Keep the locked Volume-Direction discovery set first; expansion may add names but never replace it."""
+    if not _nxt_three_lane_enabled(): return merged
+    lock_n = max(5, min(40, int(os.getenv("NXT_V52_DISCOVERY_LOCK_N", "20"))))
+    disc = _nxt_v52_discovery_snapshot(summary, lock_n)
+    meta = _nxt_v52_meta_map(summary)
+    existing = {str(k).zfill(6):dict(v) for k,v in (merged or {}).items() if isinstance(v,dict)}
+    out = {}
+    locked_codes = []
+    # 1) exact discovery order, never gate-ranked out of the refresh budget
+    for row in disc.get("rows") or []:
+        c = str(row.get("symbol") or "").zfill(6)
+        base = dict(existing.get(c) or meta.get(c) or {})
+        base.update(row)
+        q = _nxt_three_lane_gate(base)
+        q["discovery_snapshot_id"] = disc.get("snapshot_id")
+        q["discovery_locked"] = True
+        out[c] = q; locked_codes.append(c)
+    # 2) optional expansion from the old union, strictly secondary
+    ranked = []
+    for c, row in existing.items():
+        if c in out: continue
+        row.setdefault("symbol", c)
+        q = _nxt_three_lane_gate(row)
+        lane_pri = {"AFTER_REACCEL":3,"AFTER_HIGH_HOLD":2,"PRE_BREAKOUT_TRANSFER":1}.get(q.get("close_bet_lane"),0)
+        stat_pri = {"PASS":3,"NEAR":2,"PENDING":1,"FAIL":1,"BLOCK":0}.get(q.get("gate_status"),0)
+        q["_nxt_seed_rank"] = (stat_pri,lane_pri,q.get("gate_pass_count",0),_nxt_three_lane_rank(q))
+        q["discovery_locked"] = False
+        ranked.append(q)
+    ranked.sort(key=lambda x:x.get("_nxt_seed_rank",(0,0,0,0)), reverse=True)
+    limit = max(lock_n, max(20, min(80, int(os.getenv("NXT_THREE_LANE_SCAN_LIMIT", "40")))))
+    for q in ranked:
+        if len(out) >= limit: break
+        c = str(q.get("symbol") or "").zfill(6); q.pop("_nxt_seed_rank", None); out[c] = q
+    return out
+'''
+    s = replace_top_def(s, '_nxt_three_lane_seed_merge', seed_block)
+
+    replay_block = r'''def build_nxt_v51_manual_replay():
+    """Read-only replay of the exact locked discovery set. No candidate-pool substitution."""
+    if not _nxt_v51_manual_replay_enabled():
+        return {"ok":False,"status":"DISABLED","replay_only":True,"official_snapshot_untouched":True}
+    cooldown = max(5, int(_cb_num(os.getenv("NXT_V51_MANUAL_REPLAY_COOLDOWN_SEC", "20"), 20)))
+    nowm = time.monotonic(); cached = _NXT_V51_REPLAY_CACHE.get("result")
+    if cached is not None and nowm - float(_NXT_V51_REPLAY_CACHE.get("at") or 0.0) < cooldown:
+        out = json.loads(json.dumps(cached, ensure_ascii=False, default=str)); out["cache_hit"] = True; return out
+    if not _NXT_V51_REPLAY_LOCK.acquire(blocking=False):
+        return {"ok":False,"status":"BUSY","replay_only":True,"official_snapshot_untouched":True,"captured_at_kst":now_kst_iso()}
+    try:
+        summary = load_latest_for_venue("NXT")
+        if not isinstance(summary, dict): raise RuntimeError("NXT latest summary unavailable")
+        pre = _read_preclose("NXT") or {}
+        lock_n = max(5, min(40, int(os.getenv("NXT_V52_DISCOVERY_LOCK_N", "20"))))
+        disc = _nxt_v52_discovery_snapshot(summary, lock_n)
+        premap = {str(x.get("symbol") or "").zfill(6):x for x in (pre.get("candidates") or []) if isinstance(x,dict)}
+        rows = []
+        for d in disc.get("rows") or []:
+            c = str(d.get("symbol") or "").zfill(6)
+            base = dict(premap.get(c) or {})
+            # discovery/meta values are authoritative for identity/order; preclose only fills missing context
+            for k,v in d.items(): base[k] = v
+            rows.append(base)
+        rows = _close_micro_context(rows, summary, pre)
+        evaluated = []
+        for r in rows:
+            o = _nxt_three_lane_gate(dict(r)); o["close_bet_score"] = _nxt_three_lane_rank(o)
+            o["selection_type"] = "NXT_V52_DISCOVERY_LOCK_REPLAY"; o["discovery_snapshot_id"] = disc.get("snapshot_id")
+            _nxt_v51_replay_apply_action(o); evaluated.append(o)
+        # preserve discovery order for traceability; separately rank PASS for final capital decision
+        eval_by_rank = sorted(evaluated, key=lambda x:int(x.get("discovery_rank") or 9999))
+        passed_ranked = sorted([x for x in evaluated if x.get("gate_status")=="PASS"], key=lambda x:_cb_num(x.get("close_bet_score"),0.0), reverse=True)
+        near = [x for x in eval_by_rank if x.get("gate_status")=="NEAR"]
+        pending = [x for x in eval_by_rank if x.get("gate_status")=="PENDING"]
+        rejected = [x for x in eval_by_rank if x.get("gate_status") not in {"PASS","NEAR","PENDING"}]
+        lane_caps={"AFTER_REACCEL":2,"AFTER_HIGH_HOLD":2,"PRE_BREAKOUT_TRANSFER":1}; candidates=[]; used={}; seen=set()
+        for x in passed_ranked:
+            lane=str(x.get("close_bet_lane") or ""); c=str(x.get("symbol") or "").zfill(6)
+            if used.get(lane,0)>=lane_caps.get(lane,1) or c in seen: continue
+            candidates.append(x); seen.add(c); used[lane]=used.get(lane,0)+1
+            if len(candidates)>=3: break
+        vd = VOLUME_DIRECTION.snapshot("NXT", max(20,lock_n)) if VOLUME_DIRECTION_ENABLED else {}
+        after_ready=sum(1 for x in candidates if x.get("after_entry_ready") is True)
+        result={
+          "ok":True,"status":"READY","captured_at_kst":now_kst_iso(),"trade_date":str(summary.get("timestamp_kst") or now_kst_iso())[:10],
+          "venue":"NXT","trigger":"MANUAL_REPLAY","selection_policy":"NXT_V5_2_DISCOVERY_LOCK_TO_V5_1_RR",
+          "replay_only":True,"official_snapshot_untouched":True,"broker_quote_refresh_used":False,
+          "source_summary_kst":summary.get("timestamp_kst"),"source_preclose_kst":pre.get("captured_at_kst"),
+          "discovery_snapshot_id":disc.get("snapshot_id"),"discovery_contract":"VOLUME_DIRECTION order locked; downstream may classify but never substitute names",
+          "discovery_count":len(disc.get("rows") or []),"discovery_preserved_count":len(eval_by_rank),
+          "evaluated_count":len(evaluated),"structural_pass_count":len(passed_ranked),"near_count":len(near),"pending_count":len(pending),
+          "candidate_count":len(candidates),"after_entry_ready_count":after_ready,
+          "rr_blocked_count":sum(1 for x in candidates if x.get("action_code")=="RR_BLOCKED"),
+          "rr_pending_count":sum(1 for x in candidates if x.get("action_code")=="WAIT_RR_DATA"),
+          "cap_fallback_count":sum(1 for x in evaluated if x.get("market_cap_source")=="KIS_AUTHORITY_FALLBACK"),
+          "cap_missing_count":sum(1 for x in evaluated if x.get("market_cap_source")=="MISSING_PENDING"),
+          "decision_status":"ENTRY_READY" if after_ready>0 else ("WATCH_ONLY" if candidates else "NO_BET"),
+          "session_restore":{"tracked":vd.get("tracked"),"warmup_ready":vd.get("warmup_ready"),"warming":vd.get("warming"),"restored_series":vd.get("restored_series"),"restored_max_bars":vd.get("restored_max_bars"),"actual_max_bars":vd.get("max_bars_seen"),"last_error":vd.get("last_error")},
+          "discovery_top":[_nxt_v51_replay_compact(x) | {"discovery_rank":x.get("discovery_rank"),"discovery_state":x.get("discovery_state"),"discovery_score":x.get("discovery_score"),"discovery_signal_bars":x.get("discovery_signal_bars"),"actual_series_bars":x.get("nxt_bar_count")} for x in eval_by_rank[:5]],
+          "discovery_evaluated":[_nxt_v51_replay_compact(x) | {"discovery_rank":x.get("discovery_rank"),"discovery_state":x.get("discovery_state"),"discovery_score":x.get("discovery_score"),"discovery_signal_bars":x.get("discovery_signal_bars"),"actual_series_bars":x.get("nxt_bar_count")} for x in eval_by_rank],
+          "candidates":[_nxt_v51_replay_compact(x) for x in candidates],
+          "near_candidates":[_nxt_v51_replay_compact(x) for x in near[:10]],"pending_candidates":[_nxt_v51_replay_compact(x) for x in pending[:10]],"rejected_top10":[_nxt_v51_replay_compact(x) for x in rejected[:10]],
+        }
+        _NXT_V51_REPLAY_CACHE["at"]=time.monotonic(); _NXT_V51_REPLAY_CACHE["result"]=result
+        logging.getLogger("alpha500_close_bet").info("NXT V5.2 DISCOVERY LOCK replay snapshot=%s discovery=%d preserved=%d pass=%d entry=%d cap_fallback=%d cap_missing=%d actual_max_bars=%s",result["discovery_snapshot_id"],result["discovery_count"],result["discovery_preserved_count"],result["structural_pass_count"],result["after_entry_ready_count"],result["cap_fallback_count"],result["cap_missing_count"],result["session_restore"].get("actual_max_bars"))
+        return result
+    finally:
+        _NXT_V51_REPLAY_LOCK.release()
+'''
+    s = replace_top_def(s, 'build_nxt_v51_manual_replay', replay_block)
+    path.write_text(s, encoding='utf-8')
+    print(MARK_APP + '_PATCH_PASS')
+
+
+if __name__ == '__main__':
+    if len(sys.argv) != 3:
+        raise SystemExit('usage: apply_nxt_v52_discovery_lock.py <bridge.py> <app.py>')
+    patch_bridge(Path(sys.argv[1])); patch_app(Path(sys.argv[2]))
+NXT_V52_DISCOVERY_LOCK_PATCH_EOF
+
+COPY <<'NXT_V52_DISCOVERY_LOCK_SMOKE_EOF' /tmp/nxt_v52_discovery_lock_smoke.py
+import importlib.util, sys, types, os, tempfile, gzip, json
+from pathlib import Path
+
+bridge_path='/app/거래량가속_완만상승_LS브리지_V2.py'
+app_path='/app/오백종목_통합엔진_웹서비스_V1_0.py'
+# ---------- persistence no-shrink ----------
+td=Path(tempfile.mkdtemp(prefix='v52_build_smoke_'))
+os.environ['RESULT_DIR']=str(td)
+os.environ['VOLUME_DIRECTION_STATE_PATH']=str(td/'short.json')
+os.environ['VOLUME_DIRECTION_HISTORY_PATH']=str(td/'hist.json')
+os.environ['NXT_V51_SESSION_STATE_PATH']=str(td/'full.json.gz')
+os.environ['VOLUME_DIRECTION_MAX_BARS']='800'; os.environ['NXT_V51_SESSION_STATE_BARS']='800'
+bridge_name='거래량가속_완만상승_LS브리지_V2'
+spec=importlib.util.spec_from_file_location(bridge_name,bridge_path); bm=importlib.util.module_from_spec(spec); sys.modules[bridge_name]=bm; spec.loader.exec_module(bm)
+b=bm.LSVolumeDirectionBridge(max_bars=800); ss=bm._Series(800); today=bm.datetime.now(bm.KST).strftime('%Y-%m-%d'); ss.trade_date=today
+base=bm.datetime.now(bm.KST).replace(hour=8,minute=0,second=0,microsecond=0)
+for i in range(239):
+    t=(base+bm.timedelta(minutes=i)).isoformat(timespec='minutes'); ss.bars.append(bm.MinuteBar(t,100,101,99,100+i*.01,1000+i))
+t=(base+bm.timedelta(minutes=239)).isoformat(timespec='minutes'); ss.current=bm.MinuteBar(t,100,101,99,103,2000); ss.last_update=t
+b._series[('NXT','029460')]=ss; b._save_v51_state(force=True)
+b2=bm.LSVolumeDirectionBridge(max_bars=800); assert len(b2._all_bars(b2._series[('NXT','029460')]))==240
+short=bm._Series(800); short.trade_date=today
+for i in range(40):
+    j=200+i; tt=(base+bm.timedelta(minutes=j)).isoformat(timespec='minutes')
+    (short.bars.append if i<39 else lambda x:setattr(short,'current',x))(bm.MinuteBar(tt,100,101,99,100,3000+j))
+b2._series[('NXT','029460')]=short; b2._save_v51_state(force=True)
+with gzip.open(td/'full.json.gz','rt',encoding='utf-8') as fh: payload=json.load(fh)
+z=[x for x in payload['series'] if x['symbol']=='029460'][0]; assert len(z.get('bars') or [])+(1 if z.get('current') else 0)==240
+# ---------- discovery order + KIS cap + same-series ----------
+im=types.ModuleType('오백종목_섹터에너지_알파하이킨아시_통합_V1_0')
+class DummyAlpha: pass
+im.Alpha500Integrated=DummyAlpha; im.market_session_now=lambda:{'venue':'NXT','scan_allowed':False}; sys.modules[im.__name__]=im
+os.environ['RESULT_DIR']=str(td/'app'); os.environ['NXT_V52_DISCOVERY_LOCK_N']='5'; os.environ['NXT_V51_MANUAL_REPLAY_COOLDOWN_SEC']='5'
+spec2=importlib.util.spec_from_file_location('v52_smoke_app',app_path); app=importlib.util.module_from_spec(spec2); sys.modules['v52_smoke_app']=app; spec2.loader.exec_module(app)
+vd=bm.LSVolumeDirectionBridge(max_bars=800)
+syms=[('029460','케이씨',4072),('241770','메카로',3150),('101160','월덱스',4260),('214430','아이쓰리시스템',4048),('299030','하나기술',843)]
+for idx,(code,name,cap) in enumerate(syms):
+    s=bm._Series(800); s.trade_date=today; px=10000+idx*1000
+    for i in range(239):
+        tt=(base+bm.timedelta(minutes=i)).isoformat(timespec='minutes'); p=px*(1+0.00003*i); s.bars.append(bm.MinuteBar(tt,p,p*1.001,p*.999,p,10000+i))
+    tt=(base+bm.timedelta(minutes=239)).isoformat(timespec='minutes'); s.current=bm.MinuteBar(tt,px*1.01,px*1.011,px*1.009,px*1.01,20000); s.last_update=tt
+    vd._series[('NXT',code)]=s
+    vd._signals[('NXT',code)]=bm.Signal(code,'NXT',tt,'ACCEL','ACCEL','QUIET',100,100,10,2,2,1,.3,.9,.9,.7,1,.1,.7,.5,.6,240,False,False,'fixture')
+app.VOLUME_DIRECTION=vd; app.VOLUME_DIRECTION_ENABLED=True
+summary={'timestamp_kst':bm.datetime.now(bm.KST).isoformat(timespec='seconds'),'sector_live_pool':[{'symbol':c,'name':n,'current_price':10000,'change_pct':4.0,'market_cap_100m':0,'cluster_state':'S2','energy_delta':.5,'energy_trend':'RISING','market_rs_score':70,'stage1_state':'UP_TREND'} for c,n,_ in syms],'sector_energy':[]}
+app.load_latest_for_venue=lambda venue:summary; app._read_preclose=lambda venue:{}
+class Resp:
+    content=b'1'
+    def raise_for_status(self): pass
+    def json(self): return {'manifest':{'created_at':'fixture'},'rows':[{'code':c,'market_cap_100m':cap} for c,_,cap in syms]}
+class Req:
+    @staticmethod
+    def get(url,params=None,timeout=None):
+        assert url.startswith('https://quant-signal-v3-7-51-clean2.onrender.com/'), url
+        return Resp()
+app.requests=Req; app._NXT_V51_CAP_CACHE={'at':0.0,'rows':{},'source_at':None,'error':None}
+r=app.build_nxt_v51_manual_replay(); top=r['discovery_top']
+assert [x['name'] for x in top]==[x[1] for x in syms]
+assert r['discovery_count']==5 and r['discovery_preserved_count']==5 and r['evaluated_count']==5
+assert r['cap_fallback_count']==5 and r['cap_missing_count']==0
+assert all(x['actual_series_bars']==240 for x in top)
+h=[x for x in top if x['name']=='하나기술'][0]; assert h['market_cap_100m']==843 and h['market_cap_source']=='KIS_AUTHORITY_FALLBACK'
+print('NXT_V5_2_DISCOVERY_LOCK_BUILD_SMOKE_PASS order=5/5 cap=5/5 series=240 persistence_no_shrink=PASS')
+NXT_V52_DISCOVERY_LOCK_SMOKE_EOF
+
+RUN python -m py_compile /tmp/apply_nxt_v52_discovery_lock.py /tmp/nxt_v52_discovery_lock_smoke.py \
+ && python /tmp/apply_nxt_v52_discovery_lock.py /app/거래량가속_완만상승_LS브리지_V2.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && python -m py_compile /app/거래량가속_완만상승_LS브리지_V2.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && python /tmp/nxt_v52_discovery_lock_smoke.py \
+ && grep -Fq 'NXT_V5_2_DISCOVERY_LOCK_APP' /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && grep -Fq 'NXT_V5_2_DISCOVERY_LOCK_BRIDGE' /app/거래량가속_완만상승_LS브리지_V2.py \
+ && echo 'NXT_V5_2_DISCOVERY_LOCK_BUILD_VALIDATION_PASS'
+# NXT_V5_2_DISCOVERY_LOCK_DOCKER_PATCH_END
