@@ -29,8 +29,9 @@ def attach(app):
             try:
                 z=V17.analyze_one(x,cfg,c,r.get('name',c))
                 z=dict(z); z['venue']='KRX';z['signal_history_date']=bars[-1]['date']
-                # No fresh intraday trigger is inferred from a daily signal.
-                z['signal_asof']=bars[-1]['date']+'T15:30:00+09:00'
+                # A daily date is an EOD reference, NOT an observed intraday signal time.
+                z['signal_reference_date']=bars[-1]['date']
+                z.pop('signal_asof',None)
                 if z.get('status') not in ('REJECT','HISTORY_FAIL'):
                     result.append(z)
                 else:rejected.append(c)

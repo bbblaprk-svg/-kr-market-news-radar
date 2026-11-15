@@ -39,3 +39,8 @@ When the existing `ALPHA500_STATE_DATABASE_URL`, `DATABASE_URL` or `POSTGRES_URL
 - `install.py` fails closed if expected existing handler/server anchors differ.
 - The Dockerfile addition is appended; the entire pre-existing Dockerfile prefix is byte-for-byte unchanged.
 - Full Docker image build and live service deployment need the confirmed existing Render workspace and actual service configuration; no claim is made from static checks alone.
+
+
+## Daily-date integrity patch (V1.1)
+
+The operational projection compares the existing LS daily cache to KIS `manifest.trade_date` after that session's close. Until a current five-date daily window and each symbol's actual daily bar are confirmed, KRX daily-dependent lanes remain PENDING and the 25% event window is not presented as a completed scan. Actual historical dates remain visible rather than being replaced by `now`. Bare YYYY-MM-DD values are displayed as daily dates, not converted to 09:00 KST. Daily-bar dates never become synthetic 15:30 signal events. The original KIS/LS collectors and Dockerfile remain byte-identical. If the LS-owned cache is stale, the existing collector must restore history; this read-only projection intentionally does not backfill or create artificial bars.

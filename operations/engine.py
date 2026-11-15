@@ -53,6 +53,27 @@ def venue(r):
     v = str(r.get('market') or '').upper()
     return v if v in ('KRX', 'NXT') else None
 
+def trade_date(v):
+    """Only literal exchange daily dates, never reinterpret a calendar day as an intraday quote."""
+    if not isinstance(v, str): return None
+    try:
+        if len(v)==10 and v[4:5]=='-' and v[7:8]=='-':
+            return datetime.strptime(v,'%Y-%m-%d').date().isoformat()
+        if len(v)==8 and v.isdigit():
+            return datetime.strptime(v,'%Y%m%d').date().isoformat()
+    except ValueError: pass
+    return None
+
+def expected_closed_daily_date(manifest, current):
+    """Source-provided trade date, only after that trade day's close. No weekday inference."""
+    trade=trade_date((manifest or {}).get('trade_date'))
+    if not trade or trade>current.date().isoformat(): return None
+    # A KIS manifest itself may be an old frozen snapshot. With no verified
+    # holiday calendar, a >3-calendar-day-old manifest cannot certify freshness.
+    if (current.date()-datetime.strptime(trade,'%Y-%m-%d').date()).days>3: return None
+    if trade==current.date().isoformat() and (current.hour,current.minute)<(15,30): return None
+    return trade
+
 def fresh(at, current, seconds=180):
     d = dt(at)
     return d is not None and -5 <= (current-d).total_seconds() <= seconds
@@ -133,6 +154,10 @@ def core_gates(row, current):
     gates['DATA_FRESH']=fresh(row.get('price_asof'),current) and row.get('timestamp_quality')=='EXCHANGE_TIMESTAMP' and row.get('quote_quality') not in ('EXPIRED','REST_STALE','STALE')
     gates['SESSION']=tri(row.get('session_open'))
     gates['SIGNAL_FRESH']=fresh(row.get('signal_asof'),current,600)
+    # All KRX-based daily-signal lanes require confirmed, completed KRX daily history.
+    # NXT post-acceleration is independent and uses observed NXT minute bars instead.
+    if row['lane'] != 'NXT_POST_ACCEL_LANE':
+        gates['KRX_DAILY_CURRENT']=tri(row.get('history_current'))
     p,s,t = (number(row.get(k)) for k in ('entry_price','stop_price','target_price'))
     valid = p is not None and s is not None and t is not None and 0<s<p<t
     rr = (t-p)/(p-s) if valid else None
@@ -163,8 +188,8 @@ def core_gates(row, current):
     elif gates['LANE_SETUP'] is True and gates['DATA_FRESH'] and gates['SIGNAL_FRESH'] and gates['SESSION'] and not pending and set(fail)<= {'ENTRY_CONFIRM'}:
         classification='ARMED'
     else: classification='WATCH'
-    row.update(classification=classification,decision='PENDING' if pending or any(k in fail for k in ('DATA_FRESH','SIGNAL_FRESH','SESSION','NXT_INDEPENDENT_SESSION')) else classification,
-               data_status='PENDING' if pending or not gates['DATA_FRESH'] or not gates['SIGNAL_FRESH'] else 'READY',
+    row.update(classification=classification,decision='PENDING' if pending or any(k in fail for k in ('DATA_FRESH','SIGNAL_FRESH','SESSION','NXT_INDEPENDENT_SESSION','KRX_DAILY_CURRENT')) else classification,
+               data_status='PENDING' if pending or not gates['DATA_FRESH'] or not gates['SIGNAL_FRESH'] or gates.get('KRX_DAILY_CURRENT') is False else 'READY',
                gate_failures=fail, gate_pending=pending,
                promotion_conditions=[k+'=PASS' for k,v in row['gates'].items() if v!='PASS'],
                invalidation_conditions=['MARKET_STATE veto','NO_CHASE','뉴스 차단','손익비 2R 미달','명시된 지지/손절선 이탈'],
@@ -295,7 +320,9 @@ class Operations:
         return [],{},False,None,errors
     def base(self,r,market,signal,signal_at,alpha,velocity,bars,current):
         c=code(r);ls=alpha.get(c) or {};p=number(r.get('price'));q_at=r.get('source_timestamp')
-        signal_at=signal.get('signal_asof') or (str(signal['date'])+'T15:30:00+09:00' if len(str(signal.get('date','')))==10 else signal_at)
+        # Generated_at/row's calendar date are not exchange signal timestamps.
+        # Prefer an explicit signal event timestamp only; never synthesize 15:30.
+        signal_at=signal.get('signal_asof') if dt(signal.get('signal_asof')) else None
         # LS numbers remain supplemental and never overwrite KIS current/flow values.
         ls_at=pick(ls,'source_timestamp','timestamp_kst','quote_at')
         ls_price=number(pick(ls,'price','current_price'))
@@ -304,7 +331,7 @@ class Operations:
         hist=history_metrics(bars,current.date().isoformat())
         out=dict(code=c,name=r.get('name') if r.get('name') and r.get('name')!=c else 'UNAVAILABLE',market=market,
             price=p,change_pct=number(r.get('change_rate')),turnover=number(r.get('turnover')),volume=number(r.get('volume')),
-            price_asof=q_at,timestamp_quality=r.get('source_timestamp_quality'),quote_quality=r.get('quality'),signal_asof=signal_at,
+            price_asof=q_at,timestamp_quality=r.get('source_timestamp_quality'),quote_quality=r.get('quality'),signal_asof=signal_at,signal_reference_date=trade_date(pick(signal,'signal_reference_date','signal_history_date','date')),
             market_cap_100m=number(r.get('market_cap_100m')),common_stock_confirmed=common,
             source='KIS_AUTHORITY',price_source=r.get('source'),ls_source=ls.get('source','LS_READONLY_CACHE'),ls_asof=ls_at,ls_price=ls_price,ls_crosscheck=cross,
             foreign_net=number(r.get('foreign_net')),institution_net=number(r.get('institution_net')),program_net=number(r.get('program_net')),
@@ -331,6 +358,7 @@ class Operations:
         if not self.lock.acquire(False):return {'status':'BUSY'}
         try:
             current=current or now();hist,dates,hstate=self.history.read_all();recent=dates[-5:]
+            global_history_latest=dates[-1] if dates else None
             upstream=self.local('v17');v17={code(x):x for x in upstream.get('candidates',[])+upstream.get('watch',[]) if isinstance(x,dict) and venue(x)=='KRX'}
             v17_at=upstream.get('generated_at')
             # Existing fullmarket output is a traceable discovery source, never a BUY authority.
@@ -338,6 +366,11 @@ class Operations:
             market_meta={}
             for market in ('KRX','NXT'):
                 rows,manifest,complete,path,errors=self.source(market);qmap={code(r):r for r in rows}
+                manifest_trade_date=trade_date(manifest.get('trade_date'))
+                expected_daily=expected_closed_daily_date(manifest,current)
+                # Never claim the last 5 trading days are current without a verified KIS trade date.
+                global_daily_current=(global_history_latest==expected_daily) if expected_daily else None
+                history_stale_symbols=history_ready_symbols=0
                 alpha_obj=self.local('alpha',market)
                 # A stock-market name such as KOSPI does not constitute a venue tag.
                 alpha={code(r):dict(r,timestamp_kst=pick(r,'timestamp_kst','source_timestamp') or alpha_obj.get('timestamp_kst')) for key in ('sector_live_pool','live_pool','top_watch','top_final') for r in alpha_obj.get(key,[]) if isinstance(r,dict) and (venue(r) or venue(alpha_obj))==market}
@@ -352,9 +385,12 @@ class Operations:
                 nxtrows={code(r):r for r in nxt.get('rows',[]) if isinstance(r,dict) and venue(r)=='NXT'}
                 news=self.local('news',market,current)
                 re25=self.local('re25',market);rerows={code(r):r for r in re25.get('rows',[]) if isinstance(r,dict) and venue(r)==market}
-                pending=Counter();full_recent=bool(recent) and len(recent)==5 and manifest.get('trade_date')==recent[-1]
+                pending=Counter();full_recent=bool(recent) and len(recent)==5 and global_daily_current is True
                 for r in rows:
                     c=code(r);b=hist.get(c,[]);candidates=[]
+                    last_symbol_date=trade_date(b[-1]['date']) if b else None
+                    if expected_daily and last_symbol_date==expected_daily:history_ready_symbols+=1
+                    else:history_stale_symbols+=1
                     if market=='NXT':
                         s=nxtrows.get(c,{})
                         if s:
@@ -385,6 +421,11 @@ class Operations:
                         if c in news:s.update(news[c])
                         out=self.base(r,market,s,signal_at,alpha,velocities.get(c,{}),b,current)
                         out.update(lane=lane,selection_path=[lane,str(s.get('signal_track') or upstate or 'PENDING')],upstream_state=upstate,lane_confirmed=confirmed)
+                        out['history_expected_asof']=expected_daily
+                        out['history_current']=last_symbol_date==expected_daily if expected_daily else None
+                        out['history_quality']='CURRENT' if out['history_current'] is True else ('STALE' if expected_daily and last_symbol_date else 'PENDING')
+                        # If a source cannot prove the current KRX daily series, no lane may promote it.
+                        # This is a view-only check; underlying LS collectors are unchanged.
                         # Engine decisions are evidence, not a substitute for the shared hard gates.
                         for k in ('impulse_seen','recompression_seen','reaccel_seen','high_hold60_confirmed','spike_date','spike_high_pct','spike_age','fast_new_spike','price_preservation_pct','pullback_volume_ratio','post_range_pct','support_price','price_preserved','volume_contracting','compression_confirmed','support_near','recent5_complete','events'):
                             if k in s:out[k]=s[k]
@@ -405,7 +446,7 @@ class Operations:
                     lane_complete=complete and applicable and (set(upstream.get('evaluated_codes',[])) or bool(upstream.get('universe_complete')) if lane=='V17_ACTION_PRE' else bool(fm.get('universe_complete')) if lane=='CAPITAL_HANDOFF' else bool(nxt.get('universe_complete')) if lane=='NXT_POST_ACCEL_LANE' else full_recent if lane=='RE_EXPLOSION_25' else len(alpha)>=len(rows))
                     self.store.reconcile(market,lane,data,lane_complete,current)
                 self.store.track(market,qmap,current)
-                meta=dict(status='READY' if complete else 'PENDING',source_path=path,scan_scope='ZERO_BASE_AUTHORITY_ALL_ROWS',rows_scanned=len(rows),complete=complete,source_errors=errors,manifest=manifest,history_state=hstate,history_symbols=len(hist),recent5_dates=recent,re25_universe_status='COMPLETE' if full_recent and all(all(d in {z['date'] for z in hist.get(code(r),[])} for d in recent) for r in rows) else 'PENDING_PARTIAL_HISTORY',
+                meta=dict(status='READY' if complete else 'PENDING',source_path=path,scan_scope='ZERO_BASE_AUTHORITY_ALL_ROWS',rows_scanned=len(rows),complete=complete,source_errors=errors,manifest=manifest,history_state=hstate,history_symbols=len(hist),history_latest_date=global_history_latest,history_expected_date=expected_daily,history_manifest_trade_date=manifest_trade_date,history_latest_verified=global_daily_current,history_ready_symbols=history_ready_symbols,history_stale_symbols=history_stale_symbols,recent5_dates=recent,re25_universe_status='COMPLETE' if full_recent and all(all(d in {z['date'] for z in hist.get(code(r),[])} for d in recent) for r in rows) else 'PENDING_PARTIAL_HISTORY',
                           pending_axes=dict(pending),lanes={k:{'observed':len(v),'status':'READY' if v else 'PENDING','prime':sum(z['classification']=='PRIME' for z in v)} for k,v in lanes.items()},scan_at=stamp(current),nxt_independent=True)
                 market_meta[market]=meta
                 with self.store.connect() as con:con.execute('INSERT INTO cycles(at,market,status,payload) VALUES(?,?,?,?)',(stamp(current),market,meta['status'],json.dumps(clean(meta),ensure_ascii=False)))
