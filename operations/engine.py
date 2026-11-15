@@ -1,7 +1,8 @@
 """Read-only operational decision projection. Never imports broker clients or writes source caches."""
 from __future__ import annotations
-import json, math, os, sqlite3, threading, time, urllib.request
+import json, math, os, re, sqlite3, threading, time, urllib.request
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -46,7 +47,13 @@ def clean(v):
     if isinstance(v, float) and not math.isfinite(v): return 'UNAVAILABLE'
     return 'UNAVAILABLE' if v is None else v
 
-def code(r): return str(pick(r, 'code', 'symbol') or '').zfill(6)
+def code(r):
+    raw = str(pick(r, 'code', 'symbol') or '').strip().upper()
+    return raw.zfill(6) if raw.isdigit() and 0<len(raw)<=6 else raw
+
+def valid_code(value):
+    # KRX identifiers may contain letters, e.g. 0120G0; never silently drop them.
+    return bool(re.fullmatch(r'[A-Z0-9]{6}', str(value or '')))
 def venue(r):
     v = str(pick(r, 'venue', 'exchange') or '').upper()
     if v in ('KRX', 'NXT'): return v
@@ -64,15 +71,36 @@ def trade_date(v):
     except ValueError: pass
     return None
 
-def expected_closed_daily_date(manifest, current):
-    """Source-provided trade date, only after that trade day's close. No weekday inference."""
-    trade=trade_date((manifest or {}).get('trade_date'))
-    if not trade or trade>current.date().isoformat(): return None
-    # A KIS manifest itself may be an old frozen snapshot. With no verified
-    # holiday calendar, a >3-calendar-day-old manifest cannot certify freshness.
-    if (current.date()-datetime.strptime(trade,'%Y-%m-%d').date()).days>3: return None
-    if trade==current.date().isoformat() and (current.hour,current.minute)<(15,30): return None
-    return trade
+def closed_trade_date_from_manifest(manifest, market=None):
+    """Authoritative immutable KIS snapshot trading date; no request timestamp guess."""
+    m = manifest or {}
+    if not isinstance(m, dict) or m.get('status') != 'READY': return None
+    if market and m.get('market') not in (None,market): return None
+    candidate = trade_date(m.get('trade_date'))
+    round_id = str(m.get('round_id') or '')
+    r = re.fullmatch(r'(\d{8})_\d{6}_(KRX|NXT)', round_id)
+    if not r or (market and r.group(2)!=market): return None
+    round_date=trade_date(r.group(1))
+    if candidate and candidate!=round_date: return None
+    # A source must say which trading session was scanned, not just when fetched.
+    started=dt(m.get('started_at'))
+    if started and started.date().isoformat()!=round_date: return None
+    return candidate or round_date
+
+def expected_closed_daily_date(manifest, current, market=None):
+    """KIS confirmed latest completed exchange scan, fail closed on stale/unknown."""
+    d=closed_trade_date_from_manifest(manifest,market)
+    if not d: return None
+    today=current.date().isoformat()
+    if d>today: return None
+    # No holiday calendar can be fabricated. Old source >3 calendar days is unknown.
+    if (current.date()-datetime.strptime(d,'%Y-%m-%d').date()).days>3:return None
+    if d==today and (current.hour,current.minute)<(15,30):return None
+    # On a new weekday after the normal close, previous-day-only KIS manifest
+    # cannot establish whether today's completed KRX session has been scanned.
+    if market=='KRX' and current.weekday()<5 and (current.hour,current.minute)>=(15,30) and d!=today:
+        return None
+    return d
 
 def fresh(at, current, seconds=180):
     d = dt(at)
@@ -91,7 +119,20 @@ class HistorySnapshot:
     def get(self, symbol, default=None):
         rows=self.con.execute("SELECT timestamp,open,high,low,close,volume,turnover FROM bars WHERE provider='LS' AND venue='KRX' AND symbol=? ORDER BY timestamp DESC LIMIT 260",(symbol,)).fetchall()
         if not rows:return [] if default is None else default
-        return [dict(date=t,open=o,high=h,low=l,close=p,volume=v,turnover=tv) for t,o,h,l,p,v,tv in reversed(rows) if len(str(t))==10]
+        verified=[]
+        for t,o,h,l,p,v,tv in reversed(rows):
+            d=trade_date(t)
+            if not d or d!=str(t) or datetime.strptime(d,'%Y-%m-%d').weekday()>=5:
+                continue  # never promote synthetic weekend/invalid trade dates
+            vals=(number(o),number(h),number(l),number(p))
+            vol=number(v)
+            if any(x is None or x<=0 for x in vals) or vol is None or vol<0:
+                continue
+            op,hi,lo,close=vals
+            if lo>min(op,close) or hi<max(op,close) or lo>hi:
+                continue
+            verified.append(dict(date=d,open=op,high=hi,low=lo,close=close,volume=vol,turnover=number(tv)))
+        return verified
     def close(self): self.con.close()
 
 class History:
@@ -103,7 +144,7 @@ class History:
         try:
             con=sqlite3.connect(self.path.resolve().as_uri()+'?mode=ro',uri=True,timeout=2)
             # No schema, upserts or write pragmas in the source cache.
-            dates=[r[0] for r in con.execute("SELECT DISTINCT timestamp FROM bars WHERE provider='LS' AND venue='KRX' ORDER BY timestamp DESC LIMIT 6").fetchall() if len(str(r[0]))==10]
+            dates=[str(r[0]) for r in con.execute("SELECT DISTINCT timestamp FROM bars WHERE provider='LS' AND venue='KRX' AND strftime('%w',timestamp) NOT IN ('0','6') ORDER BY timestamp DESC LIMIT 8").fetchall() if trade_date(str(r[0]))==str(r[0])]
             count=con.execute("SELECT COUNT(DISTINCT symbol) FROM bars WHERE provider='LS' AND venue='KRX'").fetchone()[0]
             return HistorySnapshot(con,count),sorted(dates),'READY' if dates else 'PENDING_EMPTY_CACHE'
         except (sqlite3.Error,OSError) as e:
@@ -209,8 +250,16 @@ class Store:
             CREATE INDEX IF NOT EXISTS events_market_id ON events(market,id);
             CREATE TABLE IF NOT EXISTS cycles(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT,market TEXT,status TEXT,payload TEXT);
             ''')
+    @contextmanager
     def connect(self):
-        c=sqlite3.connect(self.path,timeout=5);c.row_factory=sqlite3.Row;c.execute('PRAGMA journal_mode=WAL');return c
+        c=sqlite3.connect(self.path,timeout=5)
+        try:
+            c.row_factory=sqlite3.Row
+            c.execute('PRAGMA journal_mode=WAL')
+            with c:
+                yield c
+        finally:
+            c.close()
     def observe(self,market,rows,current):
         out={}
         with self.connect() as c:
@@ -303,21 +352,43 @@ class Operations:
         try:return self.providers[name](*args) if name in self.providers else {}
         except Exception as e:return {'status':'PENDING','error':type(e).__name__}
     def source(self,market):
-        errors=[]
-        for path in ('/api/ledger/live/rows','/api/ledger/latest/rows'):
-            try:
-                obj=self.fetch(self.kis+path+'?market='+market+'&limit=5000')
-                if obj.get('market') not in (None,market):raise ValueError('MARKET_MISMATCH')
-                rows=obj.get('rows'); manifest=obj.get('manifest') or {}
-                if not isinstance(rows,list):raise ValueError('NO_ROWS')
-                valid=[r for r in rows if isinstance(r,dict) and venue(r)==market and len(code(r))==6 and code(r).isdigit()]
-                total=number(obj.get('total'))
-                expected=number(manifest.get('expected_symbols'))
-                complete=len(valid)==len(rows) and total is not None and len(valid)>=total and total>0 and (expected is None or len(valid)>=expected)
-                if not complete:errors.append('INCOMPLETE_OR_MARKET_UNLABELED')
-                return valid,manifest,complete,path,errors
-            except Exception as e:errors.append(path+':'+type(e).__name__)
-        return [],{},False,None,errors
+        """KIS live full-universe rows + independently verified immutable date manifest.
+
+        Never interpret live REST request time as an exchange trading date. On a
+        failed live feed a verified latest snapshot is a *reference*, not live.
+        """
+        errors=[]; completed={}; completed_rows=[]; completed_ok=False
+        try:
+            completed=self.fetch(self.kis+'/api/ledger/latest/rows?market='+market+'&limit=5000')
+            if completed.get('market') not in (None,market):raise ValueError('LATEST_MARKET_MISMATCH')
+            manifest=completed.get('manifest') or {}
+            if not closed_trade_date_from_manifest(manifest,market):
+                errors.append('KIS_READY_SNAPSHOT_DATE_UNVERIFIED')
+            a=completed.get('rows') or []
+            completed_rows=[r for r in a if isinstance(r,dict) and venue(r)==market and valid_code(code(r))]
+            completed_ok=len(completed_rows)==len(a) and len(completed_rows)>=int(completed.get('total') or 0)>0
+        except Exception as e:
+            manifest={};errors.append('KIS_LATEST:'+type(e).__name__)
+        try:
+            obj=self.fetch(self.kis+'/api/ledger/live/rows?market='+market+'&limit=5000')
+            if obj.get('market') not in (None,market):raise ValueError('LIVE_MARKET_MISMATCH')
+            original=obj.get('rows')
+            if not isinstance(original,list):raise ValueError('NO_LIVE_ROWS')
+            rows=[r for r in original if isinstance(r,dict) and venue(r)==market and valid_code(code(r))]
+            total=number(obj.get('total'))
+            complete=(total is not None and total>0 and len(original)==len(rows) and len(rows)>=total)
+            if not complete:errors.append('LIVE_INCOMPLETE_OR_INVALID_IDENTIFIERS')
+            if complete: return rows,manifest,True,'/api/ledger/live/rows + latest/manifest',errors
+            if completed_ok:
+                errors.append('FALLBACK_LAST_KIS_READY_NOT_LIVE')
+                return completed_rows,manifest,False,'/api/ledger/latest/rows',errors
+            return rows,manifest,False,'/api/ledger/live/rows',errors
+        except Exception as e:
+            errors.append('KIS_LIVE:'+type(e).__name__)
+            if completed_ok:
+                errors.append('FALLBACK_LAST_KIS_READY_NOT_LIVE')
+                return completed_rows,manifest,False,'/api/ledger/latest/rows',errors
+        return [],manifest,False,None,errors
     def base(self,r,market,signal,signal_at,alpha,velocity,bars,current):
         c=code(r);ls=alpha.get(c) or {};p=number(r.get('price'));q_at=r.get('source_timestamp')
         # Generated_at/row's calendar date are not exchange signal timestamps.
@@ -366,8 +437,8 @@ class Operations:
             market_meta={}
             for market in ('KRX','NXT'):
                 rows,manifest,complete,path,errors=self.source(market);qmap={code(r):r for r in rows}
-                manifest_trade_date=trade_date(manifest.get('trade_date'))
-                expected_daily=expected_closed_daily_date(manifest,current)
+                manifest_trade_date=closed_trade_date_from_manifest(manifest,market)
+                expected_daily=expected_closed_daily_date(manifest,current,market)
                 # Never claim the last 5 trading days are current without a verified KIS trade date.
                 global_daily_current=(global_history_latest==expected_daily) if expected_daily else None
                 history_stale_symbols=history_ready_symbols=0
@@ -411,11 +482,11 @@ class Operations:
                     if rotation or f.get('capital_handoff_confirmed') is True:
                         candidates.append(('CAPITAL_HANDOFF',f,fm.get('generated_at') if market=='KRX' else f.get('timestamp_kst'),f.get('selection_state'),tri(f.get('capital_handoff_confirmed'))))
                     else:pending['HANDOFF_CONFIRM']+=1
-                    ev=spike_events(b,recent) if b else []
+                    ev=spike_events(b,recent) if b and market=='KRX' else []
                     if ev:
                         s=dict(rerows.get(c,{ }));s.update(ev[-1]);s['events']=ev;s['recent5_complete']=full_recent and all(d in {z['date'] for z in b} for d in recent)
                         candidates.append(('RE_EXPLOSION_25',s,re25.get('source_asof'),s.get('setup_state','FAST_NEW_SPIKE' if ev[-1]['fast_new_spike'] else 'RE25_OBSERVED'),tri(s.get('lane_confirmed'))))
-                    else:pending['RE25_HISTORY_OR_EVENT']+=1
+                    elif market=='KRX':pending['RE25_HISTORY_OR_EVENT']+=1
                     for lane,s,signal_at,upstate,confirmed in candidates:
                         s=dict(s)
                         if c in news:s.update(news[c])
@@ -446,12 +517,16 @@ class Operations:
                     lane_complete=complete and applicable and (set(upstream.get('evaluated_codes',[])) or bool(upstream.get('universe_complete')) if lane=='V17_ACTION_PRE' else bool(fm.get('universe_complete')) if lane=='CAPITAL_HANDOFF' else bool(nxt.get('universe_complete')) if lane=='NXT_POST_ACCEL_LANE' else full_recent if lane=='RE_EXPLOSION_25' else len(alpha)>=len(rows))
                     self.store.reconcile(market,lane,data,lane_complete,current)
                 self.store.track(market,qmap,current)
-                meta=dict(status='READY' if complete else 'PENDING',source_path=path,scan_scope='ZERO_BASE_AUTHORITY_ALL_ROWS',rows_scanned=len(rows),complete=complete,source_errors=errors,manifest=manifest,history_state=hstate,history_symbols=len(hist),history_latest_date=global_history_latest,history_expected_date=expected_daily,history_manifest_trade_date=manifest_trade_date,history_latest_verified=global_daily_current,history_ready_symbols=history_ready_symbols,history_stale_symbols=history_stale_symbols,recent5_dates=recent,re25_universe_status='COMPLETE' if full_recent and all(all(d in {z['date'] for z in hist.get(code(r),[])} for d in recent) for r in rows) else 'PENDING_PARTIAL_HISTORY',
-                          pending_axes=dict(pending),lanes={k:{'observed':len(v),'status':'READY' if v else 'PENDING','prime':sum(z['classification']=='PRIME' for z in v)} for k,v in lanes.items()},scan_at=stamp(current),nxt_independent=True)
+                krx_daily_coverage=(global_daily_current is True and complete and history_ready_symbols==len(rows) and len(rows)>0)
+                nxt_minute_coverage=(complete and nxt.get('status')=='READY' and nxt.get('universe_complete') is True and len(nxtrows)==len(rows) and len(rows)>0)
+                # NXT price-action lane is not dependent on the KRX daily-history cache.
+                coverage_complete=krx_daily_coverage if market=='KRX' else nxt_minute_coverage
+                meta=dict(status='READY' if coverage_complete else 'PENDING',source_path=path,scan_scope='ZERO_BASE_AUTHORITY_ALL_ROWS',source_code_policy='ALPHANUMERIC_6_ALLOWED',rows_scanned=len(rows),complete=complete,source_errors=errors,manifest=manifest,history_state=hstate,history_symbols=len(hist),history_latest_date=global_history_latest,history_expected_date=expected_daily,history_manifest_trade_date=manifest_trade_date,history_latest_verified=(krx_daily_coverage if market=='KRX' else None),history_date_matches_kis=(global_daily_current if market=='KRX' else None),history_coverage_complete=(krx_daily_coverage if market=='KRX' else None),history_repair=(self.local('history_repair_state') if market=='KRX' else {'status':'NOT_APPLICABLE','reason':'KRX_ONLY'}),history_ready_symbols=history_ready_symbols,history_stale_symbols=history_stale_symbols,recent5_dates=recent,re25_universe_status=('NOT_APPLICABLE' if market=='NXT' else 'COMPLETE' if full_recent and all(all(d in {z['date'] for z in hist.get(code(r),[])} for d in recent) for r in rows) else 'PENDING_PARTIAL_HISTORY'),
+                          pending_axes=dict(pending),lanes={k:{'observed':len(v),'status':'READY' if v and coverage_complete else 'PENDING','prime':sum(z['classification']=='PRIME' for z in v)} for k,v in lanes.items()},scan_at=stamp(current),nxt_independent=True)
                 market_meta[market]=meta
                 with self.store.connect() as con:con.execute('INSERT INTO cycles(at,market,status,payload) VALUES(?,?,?,?)',(stamp(current),market,meta['status'],json.dumps(clean(meta),ensure_ascii=False)))
             self.checkpoint.save()
-            self.runtime={'version':VERSION,'scan_at':stamp(current),'markets':clean(market_meta),'storage':self.checkpoint.info(),'status':'READY'}
+            self.runtime={'version':VERSION,'scan_at':stamp(current),'markets':clean(market_meta),'storage':self.checkpoint.info(),'status':'READY' if all(v['status']=='READY' for v in market_meta.values()) else 'PENDING'}
             return self.runtime
         finally:
             if 'hist' in locals() and hasattr(hist,'close'):hist.close()

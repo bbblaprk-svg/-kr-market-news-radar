@@ -1,7 +1,7 @@
 """Adapters use only existing local objects; never start a broker client or collect bars."""
-from .engine import Operations, number, code, dt, stamp, fresh, tri
+from .engine import Operations, number, code, dt, stamp, fresh, tri, valid_code
 from pathlib import Path
-import json
+import json, hashlib, threading
 
 def attach(app):
     ops=Operations()
@@ -11,6 +11,7 @@ def attach(app):
     def native(name):
         obj=app.get(name)
         return obj.latest() if obj else {}
+    v17_daily_cache = {}  # symbol => full-bar digest and unchanged native V1.7 result.
     def v17_all(rows,hist,current):
         try:
             import pandas as pd
@@ -23,19 +24,30 @@ def attach(app):
             c=code(r); bars=hist.get(c,[])
             if number(r.get('market_cap_100m')) is not None and number(r['market_cap_100m'])<700:continue
             if len(bars)<cfg.min_rows:missing.append(c);continue
-            x=pd.DataFrame(bars[-260:]).rename(columns={'date':'date'})
-            # Cached actual trade dates only. Never append a weekend/holiday or request-date synthetic bar.
-            x['date']=pd.to_datetime(x['date']).dt.strftime('%Y%m%d')
-            try:
-                z=V17.analyze_one(x,cfg,c,r.get('name',c))
-                z=dict(z); z['venue']='KRX';z['signal_history_date']=bars[-1]['date']
-                # A daily date is an EOD reference, NOT an observed intraday signal time.
-                z['signal_reference_date']=bars[-1]['date']
-                z.pop('signal_asof',None)
-                if z.get('status') not in ('REJECT','HISTORY_FAIL'):
-                    result.append(z)
-                else:rejected.append(c)
-            except Exception:missing.append(c)
+            # Hash all of the evaluated bars, not only the last five; historic
+            # corrections to older candles must invalidate native V1.7 cache.
+            digest=hashlib.blake2b(digest_size=16)
+            for bar in bars[-260:]:
+                digest.update(repr(tuple(bar.get(k) for k in ('date','open','high','low','close','volume','turnover'))).encode('utf-8'))
+            signature=(len(bars), digest.hexdigest())
+            prior=v17_daily_cache.get(c)
+            if prior and prior[0]==signature:
+                z=dict(prior[1])
+            else:
+                try:
+                    x=pd.DataFrame(bars[-260:]).rename(columns={'date':'date'})
+                    # Cached actual trade dates only. Never append weekend/holiday synthetic bars.
+                    x['date']=pd.to_datetime(x['date']).dt.strftime('%Y%m%d')
+                    z=dict(V17.analyze_one(x,cfg,c,r.get('name',c)))
+                    z['venue']='KRX';z['signal_history_date']=bars[-1]['date']
+                    z['signal_reference_date']=bars[-1]['date']
+                    z.pop('signal_asof',None)
+                    v17_daily_cache[c]=(signature,dict(z))
+                except Exception:
+                    missing.append(c);continue
+            if z.get('status') not in ('REJECT','HISTORY_FAIL'):
+                result.append(z)
+            else:rejected.append(c)
         return {'status':'READY','candidates':result,'generated_at':None,'universe_complete':not missing,'history_pending':len(missing),'evaluated_codes':[code(r) for r in result]+rejected,'rejected_count':len(rejected),'scope':'ZERO_BASE_ALL_KIS_ROWS_READONLY_V17'}
     def nxt(rows,current):
         fn=app.get('_nxt_session_features'); out=[]; pending=0
@@ -66,7 +78,7 @@ def attach(app):
         for z in reversed(items):
             c=str(z.get('ticker') or z.get('code') or '')
             # Preserve exact company mapping and original news classification.
-            if len(c)!=6 or not c.isdigit():continue
+            if not valid_code(c):continue
             at=z.get('published_at') or z.get('published_at_kst')
             if not fresh(at,current,86400):continue
             state=z.get('state');meta=z.get('metadata') or {}
@@ -74,5 +86,27 @@ def attach(app):
             if gate not in ('PRICED_IN','SELL_THE_NEWS','NEGATIVE_CONFIRMED','PASS','CLEAR','POSITIVE_CONFIRMED'):continue
             out[c]={'news_gate':gate,'news_published_at':at,'news_source':z.get('url') or z.get('source')}
         return out
-    ops.attach(alpha=alpha,news=news,v17=lambda:native('V17_ORIGINAL_BRIDGE'),v17_all=v17_all,fullmarket=lambda:native('FULLMARKET_V3_BRIDGE'),nxt=nxt)
+    from .history_repair import KRXHistoryRepair
+    def native_busy():
+        state=app.get('STATE') or {}
+        lock=app.get('LOCK')
+        if lock is None:return bool(state.get('running'))
+        with lock:return bool(state.get('running'))
+    # A dedicated cache writer, NOT the shared lazy-history engine. Changing its
+    # lookback/min-bars would otherwise mutate the native scanner's behavior.
+    repair_worker=[None]
+    repair_worker_lock=threading.RLock()
+    def history_engine(venue):
+        if venue!='KRX':raise ValueError('KRX_ONLY_REPAIR')
+        with repair_worker_lock:
+            if repair_worker[0] is None:
+                from 오백종목_섹터에너지_알파하이킨아시_통합_V1_0 import FastHistory500
+                ls=app['get_engine']().ls  # share broker session and OAuth, no extra credentials
+                worker=FastHistory500(ls,db_path=str(ops.history.path),min_bars=220,lookback_days=520)
+                worker.set_venue('KRX','K')
+                repair_worker[0]=worker
+            return repair_worker[0]
+    repair=KRXHistoryRepair(ops,history_engine,native_busy)
+    ops.attach(alpha=alpha,news=news,v17=lambda:native('V17_ORIGINAL_BRIDGE'),v17_all=v17_all,fullmarket=lambda:native('FULLMARKET_V3_BRIDGE'),nxt=nxt,history_repair_state=repair.snapshot)
+    repair.start()  # isolated, session-aware, rate-limited EOD repair; native collectors untouched.
     return ops
