@@ -5,9 +5,11 @@ from .engine import *
 from .install import patch
 
 AT=datetime(2026,11,13,16,30,tzinfo=KST)
+KIS_C={'started_at':'2026-11-13T05:35:14+00:00','completed_at':'2026-11-13T05:43:43+00:00'}
+KIS_MON={'started_at':'2026-11-16T05:35:14+00:00','completed_at':'2026-11-16T05:43:43+00:00'}
 
 def candidate(market='KRX',lane='V17_ACTION_PRE',symbol='000001'):
-    return dict(code=symbol,name='검증용 가상종목',market=market,lane=lane,price=100,change_pct=1,price_asof=stamp(AT),timestamp_quality='EXCHANGE_TIMESTAMP',quote_quality='FRESH',signal_asof=stamp(AT),market_state='NORMAL',news_gate='CLEAR',history_current=True,common_stock_confirmed=True,market_cap_100m=700,session_open=True,entry_price=100,stop_price=96,target_price=110,target_source='OBSERVED_RESISTANCE',stop_source='OBSERVED_LOW',ls_crosscheck=True,vwap_hold=True,price_hold=True,lane_confirmed=True,upstream_state='TRIGGER',selection_path=[lane],impulse_seen=True,recompression_seen=True,reaccel_seen=True,high_hold60_confirmed=True)
+    return dict(code=symbol,name='검증용 가상종목',market=market,lane=lane,price=100,change_pct=1,price_asof=stamp(AT),timestamp_quality='EXCHANGE_TIMESTAMP',quote_quality='FRESH',signal_asof=stamp(AT),market_state='NORMAL',news_gate='CLEAR',history_current=True,authority_universe_consistent=True,common_stock_confirmed=True,market_cap_100m=700,session_open=True,entry_price=100,stop_price=96,target_price=110,target_source='OBSERVED_RESISTANCE',stop_source='OBSERVED_LOW',ls_crosscheck=True,vwap_hold=True,price_hold=True,lane_confirmed=True,upstream_state='TRIGGER',selection_path=[lane],impulse_seen=True,recompression_seen=True,reaccel_seen=True,high_hold60_confirmed=True)
 
 class EngineTests(unittest.TestCase):
     def setUp(self): self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.store=Store(Path(self.tmp.name)/'op.db')
@@ -43,9 +45,9 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(trade_date('20261113'),'2026-11-13')
         self.assertIsNone(trade_date('2026-11-10T09:00:00+09:00'))
         self.assertIsNone(trade_date('2026-11-31'))
-        self.assertEqual(expected_closed_daily_date({'trade_date':'2026-11-13','round_id':'20261113_143514_KRX','status':'READY'},datetime(2026,11,15,19,0,tzinfo=KST),'KRX'),'2026-11-13')
-        self.assertIsNone(expected_closed_daily_date({'trade_date':'2026-11-16','round_id':'20261116_143514_KRX','status':'READY'},datetime(2026,11,16,10,0,tzinfo=KST),'KRX'))
-        self.assertIsNone(expected_closed_daily_date({'trade_date':'2026-11-10','round_id':'20261110_143514_KRX','status':'READY'},datetime(2026,11,15,19,0,tzinfo=KST),'KRX'))
+        self.assertEqual(expected_closed_daily_date({'trade_date':'2026-11-13','round_id':'20261113_143514_KRX','status':'READY',**KIS_C},datetime(2026,11,15,19,0,tzinfo=KST),'KRX'),'2026-11-13')
+        self.assertIsNone(expected_closed_daily_date({'trade_date':'2026-11-16','round_id':'20261116_143514_KRX','status':'READY',**KIS_MON},datetime(2026,11,16,10,0,tzinfo=KST),'KRX'))
+        self.assertIsNone(expected_closed_daily_date({'trade_date':'2026-11-10','round_id':'20261110_143514_KRX','status':'READY',**KIS_C},datetime(2026,11,15,19,0,tzinfo=KST),'KRX'))
         self.assertFalse(fresh('2026-11-10',AT))
     def test_v17_date_reference_never_signal_timestamp(self):
         import inspect
@@ -62,7 +64,7 @@ class EngineTests(unittest.TestCase):
         source=dict(code='000001',venue='KRX',name='검증용',price=100,change_rate=1,turnover=10000,volume=1000,market_cap_100m=1200,security_type='COMMON',source_timestamp=stamp(AT),source_timestamp_quality='EXCHANGE_TIMESTAMP',session_open=True,market_state='NORMAL')
         def mock_fetch(url):
             m='KRX' if 'market=KRX' in url else 'NXT'
-            return dict(market=m,manifest={'trade_date':'2026-11-13','round_id':'20261113_143514_'+m,'status':'READY'},rows=[source] if m=='KRX' else [],total=1 if m=='KRX' else 0)
+            return dict(market=m,manifest={'trade_date':'2026-11-13','round_id':'20261113_143514_'+m,'status':'READY',**KIS_C},rows=[source] if m=='KRX' else [],total=1 if m=='KRX' else 0)
         op=Operations(self.tmp.name,history_path=p,fetch=mock_fetch)
         op.attach(v17=lambda: {'candidates':[dict(code='000001',venue='KRX',status='PRE_EXPLOSION_ARMED',signal_asof=stamp(AT),chart_actionable=True,vwap_hold=True,entry_price=100,stop_price=96,target_price=110,stop_source='LOW',target_source='HIGH',news_gate='CLEAR')], 'generated_at':stamp(AT)})
         status=op.scan(AT)
@@ -83,7 +85,7 @@ class EngineTests(unittest.TestCase):
         self.assertFalse(valid_code('00593-'))
         def mock_fetch(u):
             if '/latest/' in u:
-                return {'market':'KRX','manifest':{'round_id':'20261113_143514_KRX','status':'READY','started_at':'2026-11-13T05:35:14+00:00'},'total':2,'rows':[{'market':'KRX','code':'0120G0'},{'market':'KRX','code':'005930'}]}
+                return {'market':'KRX','manifest':{'round_id':'20261113_143514_KRX','status':'READY',**KIS_C,'started_at':'2026-11-13T05:35:14+00:00'},'total':2,'rows':[{'market':'KRX','code':'0120G0'},{'market':'KRX','code':'005930'}]}
             return {'market':'KRX','total':2,'rows':[{'market':'KRX','code':'0120G0'},{'market':'KRX','code':'005930'}]}
         op=Operations(self.tmp.name,fetch=mock_fetch)
         rows,manifest,complete,path,errors=op.source('KRX')
@@ -101,7 +103,7 @@ class EngineTests(unittest.TestCase):
         self.assertIsNone(expected_closed_daily_date(manifest,AT,'KRX'))
 
     def test_manifest_uses_source_round_and_no_request_clock(self):
-        m={'status':'READY','market':'KRX','round_id':'20261113_143514_KRX','started_at':'2026-11-13T05:35:14+00:00'}
+        m={'status':'READY',**KIS_C,'market':'KRX','round_id':'20261113_143514_KRX','started_at':'2026-11-13T05:35:14+00:00'}
         self.assertEqual(expected_closed_daily_date(m,datetime(2026,11,15,19,tzinfo=KST),'KRX'),'2026-11-13')
         self.assertIsNone(expected_closed_daily_date({'status':'READY','trade_date':'2026-11-13'},datetime(2026,11,15,19,tzinfo=KST),'KRX'))
         self.assertIsNone(closed_trade_date_from_manifest({**m,'market':'NXT'},'KRX'))
@@ -113,7 +115,7 @@ class EngineTests(unittest.TestCase):
         rows.extend({'market':'KRX','code':f'AB{i:04d}','name':'newly listed'} for i in range(36))
         def fetch(url):
             if '/latest/' in url:
-                return {'market':'KRX','manifest':{'round_id':'20261113_143514_KRX','status':'READY','started_at':'2026-11-13T05:35:14+00:00','expected_symbols':2387},'total':2387,'rows':rows[:2387]}
+                return {'market':'KRX','manifest':{'round_id':'20261113_143514_KRX','status':'READY',**KIS_C,'started_at':'2026-11-13T05:35:14+00:00','expected_symbols':2387},'total':2387,'rows':rows[:2387]}
             return {'market':'KRX','total':2403,'rows':rows}
         op=Operations(self.tmp.name,fetch=fetch)
         valid,manifest,complete,path,errors=op.source('KRX')
@@ -130,7 +132,7 @@ class EngineTests(unittest.TestCase):
                            state_path=Path(self.tmp.name)/'state.json')
         self.assertEqual(r.batch(datetime(2026,11,16,10,tzinfo=KST))['reason'],'SESSION_PROTECTION')
 
-    def test_history_repair_uses_original_ls_bootstrap_and_checks_date(self):
+    def test_fake_history_without_real_bars_never_claims_complete(self):
         from .history_repair import KRXHistoryRepair
         class FakeStore:
             def __init__(self):self.data={'000001':datetime(2026,11,10).date()}
@@ -146,13 +148,13 @@ class EngineTests(unittest.TestCase):
         h=FakeHistory()
         class FakeOp:
             def source(self,market):
-                return [{'code':'000001','market':'KRX','market_cap_100m':900}, {'code':'0120G0','market':'KRX','market_cap_100m':800}],{'status':'READY','round_id':'20261113_143514_KRX','market':'KRX'},True,'/api/ledger/live/rows',[]
+                return [{'code':'000001','market':'KRX','market_cap_100m':900}, {'code':'0120G0','market':'KRX','market_cap_100m':800}],{'status':'READY',**KIS_C,'round_id':'20261113_143514_KRX','market':'KRX'},True,'/api/ledger/live/rows',[]
         r=KRXHistoryRepair(FakeOp(),lambda venue:h,state_path=Path(self.tmp.name)/'state.json',sleep=lambda s:None)
         out=r.batch(datetime(2026,11,15,20,tzinfo=KST),max_calls=2,pacing=0)
-        self.assertEqual(out['updated'],2)
-        self.assertEqual(out['stale'],0)
+        self.assertEqual(out['updated'],0)
+        self.assertGreater(out['stale'],0)
         self.assertEqual(set(h.calls),{'000001','0120G0'})
-        self.assertEqual(r.batch(datetime(2026,11,15,20,tzinfo=KST),max_calls=2,pacing=0)['status'],'READY')
+        self.assertNotEqual(r.batch(datetime(2026,11,15,20,tzinfo=KST),max_calls=2,pacing=0)['status'],'READY')
         self.assertFalse(KRXHistoryRepair.allowed(datetime(2026,11,16,10,tzinfo=KST)))
 
     def test_history_repair_does_not_claim_success_when_ls_old(self):
@@ -163,7 +165,7 @@ class EngineTests(unittest.TestCase):
             def last_date(self,*args):return datetime(2026,11,10).date()
             def bootstrap_one(self,symbol):pass
         class FakeOp:
-            def source(self,market):return [{'code':'0120G0','market':'KRX'}],{'status':'READY','round_id':'20261113_143514_KRX'},True,'latest',[]
+            def source(self,market):return [{'code':'0120G0','market':'KRX'}],{'status':'READY',**KIS_C,'round_id':'20261113_143514_KRX'},True,'latest',[]
         r=KRXHistoryRepair(FakeOp(),lambda venue:FakeHistory(),state_path=Path(self.tmp.name)/'state.json',sleep=lambda s:None)
         out=r.batch(datetime(2026,11,15,20,tzinfo=KST),max_calls=1,pacing=0)
         self.assertEqual(out['updated'],0)
@@ -272,7 +274,7 @@ class V3RepairSafetyTests(unittest.TestCase):
                 self.conn=sqlite3.connect(self.path)
                 self.conn.execute("CREATE TABLE bars(provider TEXT, venue TEXT, symbol TEXT,timestamp TEXT,open REAL,high REAL,low REAL,close REAL,volume REAL,turnover REAL)")
                 for c in names:
-                    for d in dates or ['2026-11-10']:
+                    for d in dates or ['2026-11-06','2026-11-09','2026-11-10','2026-11-11','2026-11-12']:
                         self.conn.execute('INSERT INTO bars VALUES(?,?,?,?,?,?,?,?,?,?)',('LS','KRX',c,d,100,101,99,100,100,1000))
                 self.conn.commit()
             def last_date(self,provider,venue,symbol):
@@ -280,7 +282,7 @@ class V3RepairSafetyTests(unittest.TestCase):
                 return datetime.strptime(z,'%Y-%m-%d').date() if z else None
             def read(self,provider,venue,symbol,limit=1):
                 import pandas as pd
-                return pd.read_sql_query('SELECT open,high,low,close,volume FROM bars WHERE provider=? AND venue=? AND symbol=? ORDER BY timestamp DESC LIMIT ?',self.conn,params=(provider,venue,symbol,limit))
+                return pd.read_sql_query('SELECT timestamp,open,high,low,close,volume FROM bars WHERE provider=? AND venue=? AND symbol=? ORDER BY timestamp DESC LIMIT ?',self.conn,params=(provider,venue,symbol,limit))
         class Worker:
             venue='KRX'
             def __init__(self,db):self.store=db;self.calls=[]
@@ -294,8 +296,9 @@ class V3RepairSafetyTests(unittest.TestCase):
         rows=[{'market':'KRX','code':c,'market_cap_100m':800} for c in names]
         class Op:
             history=type('H',(),{'path':db.path})()
+            authority_audit={'KRX':{'membership_matched':True,'status':'MATCHED_CODES_UNVERIFIED_SAME_SESSION'}}
             def source(self,market):
-                return rows,{'market':'KRX','status':'READY','round_id':'20261113_143514_KRX'},True,'KIS_LATEST',[]
+                return rows,{'market':'KRX','status':'READY',**KIS_C,'round_id':'20261113_143514_KRX'},True,'KIS_LATEST',[]
         repair=KRXHistoryRepair(Op(),lambda venue:worker,state_path=Path(self.tmp.name)/'repair-state.json',
                                 sleep=lambda seconds:None,clock=lambda:self.sunday)
         return repair,worker
@@ -326,16 +329,23 @@ class V3RepairSafetyTests(unittest.TestCase):
     def test_200bar_historical_depth_explicit(self):
         r,w=self._fixture(dates=['2026-11-13'])
         out=r.batch(self.sunday,max_calls=0,pacing=0)
-        self.assertEqual(out['status'],'READY')
+        self.assertEqual(out['status'],'REPAIRING')
         self.assertEqual(out['depth_lt_200'],2)
-        self.assertEqual(out['ready'],2)
-    def test_broker_404_opens_circuit_after_three_failures(self):
+        self.assertEqual(out['ready'],0)  # one correct date cannot prove recent5 completeness
+    def test_broker_503_opens_circuit_after_three_failures(self):
         r,w=self._fixture(names=('000001','0120G0','000003','000004'))
-        w.bootstrap_one=lambda symbol:(_ for _ in ()).throw(RuntimeError('LS t8410 HTTP 404'))
+        w.bootstrap_one=lambda symbol:(_ for _ in ()).throw(RuntimeError('LS t8410 HTTP 503'))
         out=r.batch(self.sunday,max_calls=4,pacing=0)
         self.assertEqual(out['reason'],'LS_BROKER_CIRCUIT_OPEN')
         self.assertEqual(out['attempted'],3)
         self.assertEqual(out['failed'],3)
+    def test_isolated_404_does_not_block_remaining_symbols(self):
+        r,w=self._fixture(names=('000001','0120G0','000003','000004'))
+        w.bootstrap_one=lambda symbol:(_ for _ in ()).throw(RuntimeError('LS t8410 HTTP 404: symbol unavailable'))
+        out=r.batch(self.sunday,max_calls=4,pacing=0)
+        self.assertEqual(out['attempted'],4)
+        self.assertEqual(out['failed'],4)
+        self.assertNotEqual(out['reason'],'LS_BROKER_CIRCUIT_OPEN')
     def test_shared_scanner_cache_path_mismatch_blocks_writes(self):
         r,w=self._fixture()
         w.store.path=Path(self.tmp.name)/'WRONG_SQLITE.sqlite'
@@ -425,12 +435,12 @@ class V3PositiveHistoryIntegrationTests(unittest.TestCase):
             with sqlite3.connect(db) as con:
                 con.execute('CREATE TABLE bars(provider TEXT,venue TEXT,symbol TEXT,timestamp TEXT,open REAL,high REAL,low REAL,close REAL,volume REAL,turnover REAL)')
                 for sym in ('000001','0120G0'):
-                    for d in ('2026-11-09','2026-11-10','2026-11-11','2026-11-12','2026-11-13'):
+                    for d in ('2026-11-06','2026-11-09','2026-11-10','2026-11-11','2026-11-12','2026-11-13'):
                         high=130 if d=='2026-11-12' and sym=='0120G0' else 101
                         con.execute('INSERT INTO bars VALUES(?,?,?,?,?,?,?,?,?,?)',('LS','KRX',sym,d,100,high,99,100,1000,10000))
             def fetch(url):
                 market='NXT' if 'market=NXT' in url else 'KRX'
-                manifest={'status':'READY','market':market,'round_id':'20261113_143514_'+market,'started_at':'2026-11-13T05:35:14Z'}
+                manifest={'status':'READY',**KIS_C,'market':market,'round_id':'20261113_143514_'+market,'started_at':'2026-11-13T05:35:14Z'}
                 rows=[{'code':c,'market':'KRX','name':c,'price':100,'market_cap_100m':800,'source_timestamp':'2026-11-13T05:40:00Z','source_timestamp_quality':'REQUEST_TIME_ONLY'} for c in ('000001','0120G0')] if market=='KRX' else []
                 return {'market':market,'total':len(rows),'rows':rows,'manifest':manifest}
             op=Operations(td,history_path=db,fetch=fetch)
@@ -451,7 +461,7 @@ class V3NxtIndependentDataTests(unittest.TestCase):
             def fetch(url):
                 venue='NXT' if 'market=NXT' in url else 'KRX'
                 rows=[{'code':'000001','market':'NXT','name':'NXT-TEST','price':100,'market_cap_100m':1000}] if venue=='NXT' else [{'code':'000001','market':'KRX','name':'KRX-TEST','price':100}]
-                return {'market':venue,'total':len(rows),'rows':rows,'manifest':{'status':'READY','market':venue,'round_id':'20261113_143514_'+venue,'started_at':'2026-11-13T05:35:14+00:00'}}
+                return {'market':venue,'total':len(rows),'rows':rows,'manifest':{'status':'READY',**KIS_C,'market':venue,'round_id':'20261113_143514_'+venue,'started_at':'2026-11-13T05:35:14+00:00'}}
             op=Operations(td,history_path=Path(td)/'missing.db',fetch=fetch)
             op.attach(nxt=lambda rows,current:{'status':'READY','rows':[{'code':r['code'],'venue':'NXT','gate_status':'PENDING'} for r in rows], 'universe_complete':True})
             out=op.scan(datetime(2026,11,15,20,tzinfo=KST))
@@ -460,3 +470,130 @@ class V3NxtIndependentDataTests(unittest.TestCase):
             self.assertEqual(out['markets']['NXT']['history_latest_verified'],'UNAVAILABLE')
             self.assertEqual(out['markets']['NXT']['history_repair']['status'],'NOT_APPLICABLE')
             self.assertEqual(out['markets']['NXT']['re25_universe_status'],'NOT_APPLICABLE')
+
+class V4DateProvenanceAndCandleTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.sunday=datetime(2026,11,15,21,0,tzinfo=KST)
+        self.market='KRX'
+        self.sessions=['2026-11-09','2026-11-10','2026-11-11','2026-11-12','2026-11-13']
+    def cache(self,days,overrides=None):
+        p=Path(self.tmp.name)/'ls-cache.sqlite3';overrides=overrides or {}
+        if p.exists():p.unlink()
+        with sqlite3.connect(p) as c:
+            c.execute('CREATE TABLE bars(provider TEXT,venue TEXT,symbol TEXT,timestamp TEXT,open REAL,high REAL,low REAL,close REAL,volume REAL,turnover REAL)')
+            for d in days:
+                z=dict(open=100,high=102,low=99,close=101,volume=1000);z.update(overrides.get(d,{ }))
+                c.execute('INSERT INTO bars VALUES(?,?,?,?,?,?,?,?,?,?)',('LS','KRX','0120G0',d,z['open'],z['high'],z['low'],z['close'],z['volume'],10000))
+        return p
+    def fetch(self,url):
+        m='NXT' if 'market=NXT' in url else 'KRX'
+        rows=[{'market':'KRX','code':'0120G0','price':101,'market_cap_100m':900,'source_timestamp':'2026-11-13T05:43:00Z'}] if m=='KRX' else []
+        return {'market':m,'total':len(rows),'rows':rows,'manifest':{'market':m,'status':'READY',**KIS_C,'round_id':f'20261113_143514_{m}'}}
+    def audit(self,p):
+        op=Operations(self.tmp.name,history_path=p,fetch=self.fetch)
+        return op.scan(self.sunday)['markets']['KRX']
+    def test_calendar_exact_last_five_are_9th_through_13th(self):
+        from .trading_calendar import recent_sessions,last_closed_session
+        self.assertEqual(recent_sessions('2026-11-13',5),self.sessions)
+        self.assertEqual(recent_sessions('2026-11-13',6),['2026-11-06']+self.sessions)
+        self.assertEqual(last_closed_session(self.sunday),'2026-11-13')
+    def test_strict_eod_cutoff_vs_1435_kis_scan(self):
+        from .trading_calendar import last_closed_session
+        d=datetime(2026,11,13,15,35,tzinfo=KST)
+        self.assertEqual(last_closed_session(d),'2026-11-12')
+        self.assertIsNone(expected_closed_daily_date({'status':'READY','market':'KRX',**KIS_C,'round_id':'20261113_143514_KRX'},d,'KRX'))
+        self.assertEqual(last_closed_session(d.replace(minute=45)),'2026-11-13')
+        self.assertEqual(expected_closed_daily_date({'status':'READY','market':'KRX',**KIS_C,'round_id':'20261113_143514_KRX'},d.replace(minute=45),'KRX'),'2026-11-13')
+    def test_manifest_has_to_prove_completed_143514_scan(self):
+        x={'status':'READY','market':'KRX',**KIS_C,'round_id':'20261113_143514_KRX'}
+        self.assertEqual(closed_trade_date_from_manifest(x,'KRX'),'2026-11-13')
+        self.assertIsNone(closed_trade_date_from_manifest({**x,'completed_at':None},'KRX'))
+        self.assertIsNone(closed_trade_date_from_manifest({**x,'started_at':'2026-11-13T05:35:15Z'},'KRX'))
+        self.assertIsNone(closed_trade_date_from_manifest({**x,'completed_at':'2026-11-13T05:00:00Z'},'KRX'))
+        self.assertIsNone(closed_trade_date_from_manifest({**x,'status':'COLLECTING'},'KRX'))
+    def test_missing_entire_11th_day_never_changes_recent5_date_list(self):
+        p=self.cache(['2026-11-06','2026-11-09','2026-11-10','2026-11-12','2026-11-13'])
+        z=self.audit(p)
+        self.assertEqual(z['history_recent5_expected'],self.sessions)
+        self.assertEqual(z['history_re25_predecessor_date'],'2026-11-06')
+        self.assertEqual(z['re25_universe_status'],'PENDING_PARTIAL_HISTORY')
+        self.assertEqual(z['history_ready_symbols'],0)
+        self.assertFalse(z['history_latest_verified'])
+    def test_equal_last_date_but_only_one_bar_is_not_ready(self):
+        p=self.cache(['2026-11-13'])
+        z=self.audit(p)
+        self.assertEqual(z['history_latest_date'],'2026-11-13')
+        self.assertEqual(z['history_expected_date'],'2026-11-13')
+        self.assertEqual(z['history_ready_symbols'],0)
+        self.assertEqual(z['re25_universe_status'],'PENDING_PARTIAL_HISTORY')
+    def test_corrupt_last_candle_is_not_masqueraded_as_valid_date(self):
+        p=self.cache(['2026-11-06']+self.sessions,{'2026-11-13':{'open':110,'high':100,'low':111,'close':105}})
+        z=self.audit(p)
+        self.assertEqual(z['history_latest_date'],'2026-11-12')
+        self.assertEqual(z['history_ready_symbols'],0)
+        self.assertFalse(z['history_latest_verified'])
+    def test_25pct_earliest_event_requires_prior_day(self):
+        p=self.cache(self.sessions)
+        z=self.audit(p)
+        self.assertEqual(z['history_ready_symbols'],1)
+        self.assertEqual(z['re25_universe_status'],'PENDING_PARTIAL_HISTORY')
+        p2=self.cache(['2026-11-06']+self.sessions)
+        self.assertEqual(self.audit(p2)['re25_universe_status'],'COMPLETE')
+    def test_ma200_requires_exact_200_sessions_not_last_200_available(self):
+        from .trading_calendar import recent_sessions
+        dates=recent_sessions('2026-11-13',200)
+        self.assertEqual(len(dates),200)
+        rows=[{'date':d,'close':100,'volume':100} for d in dates]
+        self.assertEqual(history_metrics(rows,'2026-11-13')['ma200'],100)
+        gapped=[r for r in rows if r['date']!='2026-11-11']
+        gapped.append({'date':'2025-01-02','close':100,'volume':100})
+        self.assertGreaterEqual(len(gapped),200)
+        self.assertIsNone(history_metrics(gapped,'2026-11-13')['ma200'])
+        self.assertIsNone(history_metrics(gapped,'2026-11-13')['ma5'])
+    def test_unconfirmed_future_bar_excluded_from_indicators(self):
+        days=['2026-11-06']+self.sessions
+        bars=[{'date':d,'close':100,'volume':100} for d in days]
+        bars.append({'date':'2026-11-16','close':900,'volume':900})
+        metrics=history_metrics(bars,'2026-11-13')
+        self.assertEqual(metrics['history_asof'],'2026-11-13')
+        self.assertEqual(metrics['ma5'],100)
+    def test_duplicate_kis_symbols_are_not_complete(self):
+        def duplicate(url):
+            d=self.fetch(url)
+            if 'market=KRX' in url:
+                d['rows']=[d['rows'][0],d['rows'][0]]
+                d['total']=2
+            return d
+        o=Operations(self.tmp.name,fetch=duplicate)
+        rows,manifest,complete,src,errors=o.source('KRX')
+        self.assertEqual(len(rows),2)
+        self.assertFalse(complete)
+        self.assertIn('LIVE_INCOMPLETE_OR_INVALID_IDENTIFIERS',errors)
+    def test_repair_worker_invalid_last_and_missing_recent_must_not_mark_ready(self):
+        from .history_repair import KRXHistoryRepair
+        p=self.cache(['2026-11-06','2026-11-09','2026-11-10','2026-11-12','2026-11-13'])
+        class Store0:
+            path=p
+            conn=sqlite3.connect(p)
+        class Worker:
+            venue='KRX';store=Store0()
+        class Op:
+            history=type('H',(),{'path':p})()
+            def source(self,market):
+                return [{'code':'0120G0','market':'KRX'}],{'market':'KRX','status':'READY',**KIS_C,'round_id':'20261113_143514_KRX'},True,'KIS',[]
+        w=Worker()
+        repair=KRXHistoryRepair(Op(),lambda venue:w,state_path=Path(self.tmp.name)/'s.json',clock=lambda:self.sunday)
+        z=repair.batch(self.sunday,max_calls=0,pacing=0)
+        self.assertEqual(z['ready'],0)
+        self.assertEqual(z['stale'],1)
+        self.assertEqual(z['status'],'REPAIRING')
+        w.store.conn.close()
+
+# V4.1 regression suites are included in the pre-existing Docker build command:
+# python -m unittest operations.test_engine -q
+# They are also available separately as operations.test_v41.
+from .test_v41 import (
+    V41UniverseAuditTests, V41StructuralMissingTests,
+    V41IntegrationTests, V41RepairClassificationTests,
+)

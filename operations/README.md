@@ -1,3 +1,17 @@
+## V4 verified daily-bar reference (2026-11-15)
+
+The KRX reference trade date is derived from a completed, venue-bound KIS
+READY manifest and checked against the bundled XKRX exchange calendar;
+`round_id` is a scan identifier, not the EOD candle. Daily OHLCV must come from
+real LS t8410 bars on exactly that completed date. Missing or invalid bars,
+missing last-five actual sessions, or missing the predecessor session for the
+first of the last five (+25% event) are PENDING and cannot be promoted.
+MA5/20/60/120/200 require exact matching XKRX sessions, not merely N cached
+rows. The bundled exchange calendar covers 2025-01-01 to 2027-11-15; outside
+that range (or after an unreflected exchange holiday change) revalidation is
+required. New KRX-only repair code does not replace native KIS/LS collectors.
+See README_V4_검증_및_업로드.md for deployment and verification.
+
 # KRX/NXT operational projection
 
 This extends the existing `kr-market-news-radar` process and repository. It does not register a Sites project or create a Render service. `/` and `/operations` serve the operational dashboard, while `/legacy` preserves the original ALPHA500 dashboard. The existing HTTP APIs, broker sessions, WebSocket subscriptions, collection loops, original decision engines, and their files remain unchanged.
@@ -143,3 +157,19 @@ round starting `20261113_143514_KRX`, while the live full universe included
 6. If rate limits or service degradation occur, set
    `KRX_DAILY_REPAIR_ENABLED=false` in Render and redeploy. This is a
    reversible safety switch that does not affect the original collectors.
+
+## V4.1: historical-listing gaps and cross-snapshot KIS universe audit (2026-11-15)
+
+This patch does **not** make existing LS bars current by changing dates. It only changes the criteria for `COMPLETE`, preserving independently verified 2026-11-13 KIS READY round and actual LS daily OHLCV.
+
+**1. Mismatched KIS universe membership.** The service independently downloads full `live/rows` and the immutable latest READY `latest/rows`. `history_universe_audit` reports live/READY totals, exact set difference counts and up to 30 example codes from each side. A 2,403-vs-2,387 mismatch is **not automatically** classified as 16 new listings; it is `PENDING_CROSS_SNAPSHOT_MEMBERSHIP_DIFF`. The live scanner still examines all 2,403 validated codes (including alphanumeric codes), but full KRX daily/RE25 completeness remains PENDING until membership is reconciled. Request timestamps are not proof of an exchange session; matching code sets are labeled `MATCHED_CODES_UNVERIFIED_SAME_SESSION`.
+
+**2. Structural missing bars.** `universe_audit.classify_window` classifies each verified recent-six-session history as `COMPLETE`, `STRUCTURAL_NOT_EVALUABLE`, or `DATA_PENDING`. A verified prelisting exception requires `listing_date`, `listing_date_source` in (`KRX`, `KIS_VERIFIED_REFERENCE`), and `listing_date_verified is True`. A verified trading suspension requires `verified_suspension_periods: [{start, end, source, verified}]` with the same trusted sources and `verified=True`. A single missing postlisting/unsuspended day is DATA_PENDING even when some other missing dates are covered by verified exceptions. Bare `trading_status='SUSPENDED'`, an incomplete KIS bar feed, and missing days alone are **never** evidence of an exception. Current KIS row API may not expose these verified metadata fields. In that case the stock remains DATA_PENDING; the patch does not fabricate them.
+
+**3. Completion counts and promotion veto are explicit.** `history_ready_symbols` counts fully validated 5-session KRX daily records, `history_structural_exception_symbols` counts non-evaluable securities whose 5-session gaps have verified exceptional provenance, and `history_stale_symbols` counts unresolved/invalid records. For RE25 event completeness, the required predecessor makes the window six trading sessions: `re25_evaluable_symbols`, `re25_structural_exception_symbols`, and `re25_pending_symbols`. Only when all eligible symbols are complete AND the KIS membership audit matches does the status become `COMPLETE` or `COMPLETE_EVALUABLE_WITH_VERIFIED_EXCLUSIONS`; exceptions are displayed and **never** promoted to a buy candidate. The `KRX_UNIVERSE_MATCH` mandatory entry gate also blocks individual KRX PRIME promotion when the two KIS code sets differ. NXT post-acceleration is not subject to this KRX-only gate. This is evidence coverage, **not** a statement that a winning trade exists.
+
+**4. Existing integrations preserved.** KRX and NXT remain separate. Existing KIS/LS collector, OAuth/WebSocket, native V1.7 and Render Dockerfiles are unchanged. Existing repair worker uses the same LS provider and verified cache; structural exceptions are not queried repeatedly but any unresolved missing bars continue to be investigated. `KRX_DAILY_REPAIR_ENABLED=false` remains the immediate kill switch for extra LS requests.
+
+**5. Build-time tests.** Upload **all 10** files from the root of the V4.1 direct ZIP to `/operations` (not the repository root). The original Docker build command `python -m unittest operations.test_engine -q` now also runs `test_v41` tests imported by `test_engine`. A standalone local check is also available: `python -m unittest operations.test_v41 -q`. Do not delete unchanged `operations/__init__.py`, `install.py`, `persistence.py`; do not replace Dockerfile or render.yaml. If GitHub's mobile upload does not accept direct folder contents, download the ZIP, extract in the iPhone Files app, and upload the 10 internal files from the existing GitHub `operations/` directory.
+
+**Live limitation:** The modifications have been tested locally against the V4 source. No KIS/LS live writes or Render deploy was performed by these tests. Real unverified IPO/suspension dates and the 16-code cross-snapshot gap need authoritative metadata or a new consistent completed KIS round. Do **not** interpret PENDING as either zero signals or permission to trade.

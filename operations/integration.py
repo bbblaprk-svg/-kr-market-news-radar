@@ -1,5 +1,6 @@
 """Adapters use only existing local objects; never start a broker client or collect bars."""
 from .engine import Operations, number, code, dt, stamp, fresh, tri, valid_code
+from .trading_calendar import recent_sessions
 from pathlib import Path
 import json, hashlib, threading
 
@@ -23,7 +24,8 @@ def attach(app):
         for r in rows:
             c=code(r); bars=hist.get(c,[])
             if number(r.get('market_cap_100m')) is not None and number(r['market_cap_100m'])<700:continue
-            if len(bars)<cfg.min_rows:missing.append(c);continue
+            required=recent_sessions(bars[-1]['date'],cfg.min_rows) if bars else None
+            if len(bars)<cfg.min_rows or not required or not set(required)<={z['date'] for z in bars}:missing.append(c);continue
             # Hash all of the evaluated bars, not only the last five; historic
             # corrections to older candles must invalidate native V1.7 cache.
             digest=hashlib.blake2b(digest_size=16)

@@ -6,8 +6,10 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from .trading_calendar import recent_sessions, last_closed_session, is_snapshot_session
+from .universe_audit import classify_window, universe_membership_audit
 
-VERSION = 'KRX_NXT_OPERATIONS_V1'
+VERSION = 'KRX_NXT_OPERATIONS_V4_1'
 KST = timezone(timedelta(hours=9))
 LANES = ('NXT_POST_ACCEL_LANE', 'V17_ACTION_PRE', 'ASYMMETRIC_RS', 'CAPITAL_HANDOFF', 'RE_EXPLOSION_25')
 VETO = {'RISK_OFF_ACCEL', 'PROGRAM_SELL_ACCEL', 'BREADTH_COLLAPSE'}
@@ -72,35 +74,42 @@ def trade_date(v):
     return None
 
 def closed_trade_date_from_manifest(manifest, market=None):
-    """Authoritative immutable KIS snapshot trading date; no request timestamp guess."""
-    m = manifest or {}
-    if not isinstance(m, dict) or m.get('status') != 'READY': return None
-    if market and m.get('market') not in (None,market): return None
-    candidate = trade_date(m.get('trade_date'))
-    round_id = str(m.get('round_id') or '')
-    r = re.fullmatch(r'(\d{8})_\d{6}_(KRX|NXT)', round_id)
-    if not r or (market and r.group(2)!=market): return None
-    round_date=trade_date(r.group(1))
-    if candidate and candidate!=round_date: return None
-    # A source must say which trading session was scanned, not just when fetched.
-    started=dt(m.get('started_at'))
-    if started and started.date().isoformat()!=round_date: return None
-    return candidate or round_date
+    """Only a completed, explicitly venue-bound KIS scan gives a scan date.
 
-def expected_closed_daily_date(manifest, current, market=None):
-    """KIS confirmed latest completed exchange scan, fail closed on stale/unknown."""
+    This date is NOT a KRX daily close price or a complete OHLC candle; those
+    must be read independently from the LS daily cache and validated below.
+    """
+    m=manifest or {}
+    if not isinstance(m,dict) or m.get('status') != 'READY':return None
+    if market and m.get('market') not in (None,market):return None
+    rid=str(m.get('round_id') or '')
+    r=re.fullmatch(r'(\d{8})_(\d{6})_(KRX|NXT)',rid)
+    if not r or (market and r.group(3)!=market):return None
+    round_day=trade_date(r.group(1))
+    explicit=trade_date(m.get('trade_date')) if m.get('trade_date') is not None else round_day
+    if not round_day or not explicit or explicit!=round_day:return None
+    began=dt(m.get('started_at'))
+    ended=dt(m.get('completed_at'))
+    if not began or not ended or ended<began:return None
+    if began.date().isoformat()!=round_day or ended.date().isoformat()!=round_day:return None
+    # `round_id` time is a KST scan start marker, not the exchange closing bar.
+    hhmmss=began.strftime('%H%M%S')
+    if hhmmss != r.group(2):return None
+    return round_day
+
+def expected_closed_daily_date(manifest,current,market=None):
+    """Only accept the most recently *closed* XKRX trading session.
+
+    A KIS scan completed at e.g. 14:43 cannot establish a 15:30 closing bar.
+    After close the KIS session date is checked against an independent XKRX
+    session calendar. LS OHLCV is separately validated for exactly this date.
+    """
     d=closed_trade_date_from_manifest(manifest,market)
-    if not d: return None
-    today=current.date().isoformat()
-    if d>today: return None
-    # No holiday calendar can be fabricated. Old source >3 calendar days is unknown.
-    if (current.date()-datetime.strptime(d,'%Y-%m-%d').date()).days>3:return None
-    if d==today and (current.hour,current.minute)<(15,30):return None
-    # On a new weekday after the normal close, previous-day-only KIS manifest
-    # cannot establish whether today's completed KRX session has been scanned.
-    if market=='KRX' and current.weekday()<5 and (current.hour,current.minute)>=(15,30) and d!=today:
-        return None
-    return d
+    if not d:return None
+    if market=='KRX' or market is None:
+        last=last_closed_session(current)
+        return d if last is not None and d==last else None
+    return d if d<=current.date().isoformat() else None
 
 def fresh(at, current, seconds=180):
     d = dt(at)
@@ -122,7 +131,7 @@ class HistorySnapshot:
         verified=[]
         for t,o,h,l,p,v,tv in reversed(rows):
             d=trade_date(t)
-            if not d or d!=str(t) or datetime.strptime(d,'%Y-%m-%d').weekday()>=5:
+            if not d or d!=str(t) or is_snapshot_session(d) is not True:
                 continue  # never promote synthetic weekend/invalid trade dates
             vals=(number(o),number(h),number(l),number(p))
             vol=number(v)
@@ -144,7 +153,15 @@ class History:
         try:
             con=sqlite3.connect(self.path.resolve().as_uri()+'?mode=ro',uri=True,timeout=2)
             # No schema, upserts or write pragmas in the source cache.
-            dates=[str(r[0]) for r in con.execute("SELECT DISTINCT timestamp FROM bars WHERE provider='LS' AND venue='KRX' AND strftime('%w',timestamp) NOT IN ('0','6') ORDER BY timestamp DESC LIMIT 8").fetchall() if trade_date(str(r[0]))==str(r[0])]
+            dates=[str(r[0]) for r in con.execute("""
+                SELECT DISTINCT timestamp FROM bars
+                WHERE provider='LS' AND venue='KRX'
+                  AND open>0 AND high>0 AND low>0 AND close>0
+                  AND volume>=0 AND low<=open AND low<=close
+                  AND high>=open AND high>=close
+                  AND strftime('%w',timestamp) NOT IN ('0','6')
+                ORDER BY timestamp DESC LIMIT 260
+            """).fetchall() if trade_date(str(r[0]))==str(r[0]) and is_snapshot_session(str(r[0])) is True]
             count=con.execute("SELECT COUNT(DISTINCT symbol) FROM bars WHERE provider='LS' AND venue='KRX'").fetchone()[0]
             return HistorySnapshot(con,count),sorted(dates),'READY' if dates else 'PENDING_EMPTY_CACHE'
         except (sqlite3.Error,OSError) as e:
@@ -152,15 +169,23 @@ class History:
             return {}, [], 'PENDING_'+type(e).__name__
 
 def history_metrics(bars, asof):
-    x = [r for r in bars if str(r['date']) <= asof]
-    out = {'history_asof': x[-1]['date'] if x else None, 'history_bars': len(x)}
-    closes = [number(r['close']) for r in x]
+    """MA and RVOL require exact preceding XKRX sessions, not just N rows.
+
+    Missing past sessions must not shift the meaning of MA20/60/200. Date-only
+    candle rows are never reinterpreted as intraday price or signal timestamps.
+    """
+    x=[r for r in bars if asof and r['date']<=asof]
+    ix={r['date']:r for r in x}
+    out={'history_asof':x[-1]['date'] if x else None,'history_bars':len(x)}
     for n in (5,20,60,120,200):
-        out['ma'+str(n)] = sum(closes[-n:])/n if len(closes)>=n and all(z is not None and z>0 for z in closes[-n:]) else None
-    if len(x) >= 6:
-        vols=[number(r['volume']) for r in x[-6:-1]]
-        last=number(x[-1]['volume'])
-        out['rvol_eod5'] = last/(sum(vols)/5) if all(z is not None for z in vols) and sum(vols)>0 and last is not None else None
+        sessions=recent_sessions(asof,n)
+        values=[number(ix[d]['close']) if d in ix else None for d in sessions] if sessions else []
+        out['ma'+str(n)]=(sum(values)/n if len(values)==n and all(z is not None and z>0 for z in values) else None)
+    sessions=recent_sessions(asof,6)
+    if sessions and all(d in ix for d in sessions):
+        prev=[number(ix[d]['volume']) for d in sessions[:-1]]
+        last=number(ix[sessions[-1]]['volume'])
+        out['rvol_eod5']=last/(sum(prev)/5) if all(z is not None and z>=0 for z in prev) and sum(prev)>0 and last is not None else None
     return out
 
 def spike_events(bars, recent_dates):
@@ -199,6 +224,10 @@ def core_gates(row, current):
     # NXT post-acceleration is independent and uses observed NXT minute bars instead.
     if row['lane'] != 'NXT_POST_ACCEL_LANE':
         gates['KRX_DAILY_CURRENT']=tri(row.get('history_current'))
+        # A verified per-symbol candle alone is not a full-universe authority.
+        # Reject promotion until KIS live membership and the immutable completed
+        # snapshot are reconciled. NXT post-acceleration stays independent.
+        gates['KRX_UNIVERSE_MATCH']=tri(row.get('authority_universe_consistent'))
     p,s,t = (number(row.get(k)) for k in ('entry_price','stop_price','target_price'))
     valid = p is not None and s is not None and t is not None and 0<s<p<t
     rr = (t-p)/(p-s) if valid else None
@@ -229,8 +258,8 @@ def core_gates(row, current):
     elif gates['LANE_SETUP'] is True and gates['DATA_FRESH'] and gates['SIGNAL_FRESH'] and gates['SESSION'] and not pending and set(fail)<= {'ENTRY_CONFIRM'}:
         classification='ARMED'
     else: classification='WATCH'
-    row.update(classification=classification,decision='PENDING' if pending or any(k in fail for k in ('DATA_FRESH','SIGNAL_FRESH','SESSION','NXT_INDEPENDENT_SESSION','KRX_DAILY_CURRENT')) else classification,
-               data_status='PENDING' if pending or not gates['DATA_FRESH'] or not gates['SIGNAL_FRESH'] or gates.get('KRX_DAILY_CURRENT') is False else 'READY',
+    row.update(classification=classification,decision='PENDING' if pending or any(k in fail for k in ('DATA_FRESH','SIGNAL_FRESH','SESSION','NXT_INDEPENDENT_SESSION','KRX_DAILY_CURRENT','KRX_UNIVERSE_MATCH')) else classification,
+               data_status='PENDING' if pending or not gates['DATA_FRESH'] or not gates['SIGNAL_FRESH'] or gates.get('KRX_DAILY_CURRENT') is False or ('KRX_UNIVERSE_MATCH' in gates and gates['KRX_UNIVERSE_MATCH'] is not True) else 'READY',
                gate_failures=fail, gate_pending=pending,
                promotion_conditions=[k+'=PASS' for k,v in row['gates'].items() if v!='PASS'],
                invalidation_conditions=['MARKET_STATE veto','NO_CHASE','뉴스 차단','손익비 2R 미달','명시된 지지/손절선 이탈'],
@@ -347,6 +376,7 @@ class Operations:
         self.kis=(kis_base or os.getenv('KIS_LEDGER_BASE_URL','https://quant-signal-v3-7-51-clean2.onrender.com')).rstrip('/')
         self.history=History(history_path or os.getenv('V17_ORIGINAL_HISTORY_DB',os.getenv('CACHE_DB','/data/alpha500_bars.sqlite3')))
         self.fetch=fetch;self.providers={};self.runtime={};self.lock=threading.Lock();self.stop=threading.Event();self.thread=None
+        self.authority_audit={}  # KIS live vs immutable READY snapshot: per-market, per-call
     def attach(self,**providers): self.providers=providers
     def local(self,name,*args):
         try:return self.providers[name](*args) if name in self.providers else {}
@@ -358,6 +388,7 @@ class Operations:
         failed live feed a verified latest snapshot is a *reference*, not live.
         """
         errors=[]; completed={}; completed_rows=[]; completed_ok=False
+        self.authority_audit[market]={'status':'PENDING_SOURCES_NOT_YET_COMPARED', 'membership_matched':False}
         try:
             completed=self.fetch(self.kis+'/api/ledger/latest/rows?market='+market+'&limit=5000')
             if completed.get('market') not in (None,market):raise ValueError('LATEST_MARKET_MISMATCH')
@@ -366,7 +397,7 @@ class Operations:
                 errors.append('KIS_READY_SNAPSHOT_DATE_UNVERIFIED')
             a=completed.get('rows') or []
             completed_rows=[r for r in a if isinstance(r,dict) and venue(r)==market and valid_code(code(r))]
-            completed_ok=len(completed_rows)==len(a) and len(completed_rows)>=int(completed.get('total') or 0)>0
+            completed_ok=(len(completed_rows)==len(a)==int(completed.get('total') or 0)>0 and len({code(r) for r in completed_rows})==len(completed_rows))
         except Exception as e:
             manifest={};errors.append('KIS_LATEST:'+type(e).__name__)
         try:
@@ -376,8 +407,15 @@ class Operations:
             if not isinstance(original,list):raise ValueError('NO_LIVE_ROWS')
             rows=[r for r in original if isinstance(r,dict) and venue(r)==market and valid_code(code(r))]
             total=number(obj.get('total'))
-            complete=(total is not None and total>0 and len(original)==len(rows) and len(rows)>=total)
+            complete=(total is not None and total>0 and len(original)==len(rows) and len(rows)==int(total) and len({code(r) for r in rows})==len(rows))
             if not complete:errors.append('LIVE_INCOMPLETE_OR_INVALID_IDENTIFIERS')
+            audit=universe_membership_audit(rows,completed_rows,len(original),int(completed.get('total') or 0) if isinstance(completed,dict) else 0,manifest)
+            self.authority_audit[market]=audit
+            if audit['status']=='PENDING_CROSS_SNAPSHOT_MEMBERSHIP_DIFF':
+                # A 2403-row live set and a 2387-row immutable round are NOT the
+                # same sample. Keep all live codes in discovery, but never claim
+                # full-universe event completeness without reconciliation.
+                errors.append('KIS_CROSS_SNAPSHOT_UNIVERSE_DELTA_UNVERIFIED')
             if complete: return rows,manifest,True,'/api/ledger/live/rows + latest/manifest',errors
             if completed_ok:
                 errors.append('FALLBACK_LAST_KIS_READY_NOT_LIVE')
@@ -389,7 +427,7 @@ class Operations:
                 errors.append('FALLBACK_LAST_KIS_READY_NOT_LIVE')
                 return completed_rows,manifest,False,'/api/ledger/latest/rows',errors
         return [],manifest,False,None,errors
-    def base(self,r,market,signal,signal_at,alpha,velocity,bars,current):
+    def base(self,r,market,signal,signal_at,alpha,velocity,bars,current,reference_daily=None):
         c=code(r);ls=alpha.get(c) or {};p=number(r.get('price'));q_at=r.get('source_timestamp')
         # Generated_at/row's calendar date are not exchange signal timestamps.
         # Prefer an explicit signal event timestamp only; never synthesize 15:30.
@@ -399,7 +437,7 @@ class Operations:
         ls_price=number(pick(ls,'price','current_price'))
         cross=(abs(ls_price/p-1)<=.005) if p and ls_price and fresh(ls_at,current) and fresh(q_at,current) else None
         typ=pick(r,'security_type','instrument_type'); common=True if typ in ('COMMON','COMMON_STOCK','보통주') else (False if typ in ('ETF','ETN','PREFERRED','SPAC','REIT') else None)
-        hist=history_metrics(bars,current.date().isoformat())
+        hist=history_metrics(bars,reference_daily)
         out=dict(code=c,name=r.get('name') if r.get('name') and r.get('name')!=c else 'UNAVAILABLE',market=market,
             price=p,change_pct=number(r.get('change_rate')),turnover=number(r.get('turnover')),volume=number(r.get('volume')),
             price_asof=q_at,timestamp_quality=r.get('source_timestamp_quality'),quote_quality=r.get('quality'),signal_asof=signal_at,signal_reference_date=trade_date(pick(signal,'signal_reference_date','signal_history_date','date')),
@@ -428,8 +466,9 @@ class Operations:
     def scan(self,current=None):
         if not self.lock.acquire(False):return {'status':'BUSY'}
         try:
-            current=current or now();hist,dates,hstate=self.history.read_all();recent=dates[-5:]
+            current=current or now();hist,dates,hstate=self.history.read_all()
             global_history_latest=dates[-1] if dates else None
+            recent=[];re25_reference_window=[];krx_reference_day=None
             upstream=self.local('v17');v17={code(x):x for x in upstream.get('candidates',[])+upstream.get('watch',[]) if isinstance(x,dict) and venue(x)=='KRX'}
             v17_at=upstream.get('generated_at')
             # Existing fullmarket output is a traceable discovery source, never a BUY authority.
@@ -439,9 +478,21 @@ class Operations:
                 rows,manifest,complete,path,errors=self.source(market);qmap={code(r):r for r in rows}
                 manifest_trade_date=closed_trade_date_from_manifest(manifest,market)
                 expected_daily=expected_closed_daily_date(manifest,current,market)
-                # Never claim the last 5 trading days are current without a verified KIS trade date.
+                # Last 5 sessions come from versioned XKRX calendar, never the last
+                # five cache dates (which may skip an entire trading session).
+                if market=='KRX':
+                    recent=recent_sessions(expected_daily,5) or []
+                    re25_reference_window=recent_sessions(expected_daily,6) or []
+                    krx_reference_day=expected_daily
                 global_daily_current=(global_history_latest==expected_daily) if expected_daily else None
+                source_audit=self.authority_audit.get(market,{})
+                # Live rows are still scanned Zero-Base even if a historical
+                # universe differs. Differences are reported, not silently dropped.
+                universe_alignment_ok=source_audit.get('membership_matched') is True
                 history_stale_symbols=history_ready_symbols=0
+                history_exception_symbols=0
+                history_exception_examples=[]
+                re25_window_ready=re25_window_exempt=re25_window_pending=0
                 alpha_obj=self.local('alpha',market)
                 # A stock-market name such as KOSPI does not constitute a venue tag.
                 alpha={code(r):dict(r,timestamp_kst=pick(r,'timestamp_kst','source_timestamp') or alpha_obj.get('timestamp_kst')) for key in ('sector_live_pool','live_pool','top_watch','top_final') for r in alpha_obj.get(key,[]) if isinstance(r,dict) and (venue(r) or venue(alpha_obj))==market}
@@ -456,12 +507,35 @@ class Operations:
                 nxtrows={code(r):r for r in nxt.get('rows',[]) if isinstance(r,dict) and venue(r)=='NXT'}
                 news=self.local('news',market,current)
                 re25=self.local('re25',market);rerows={code(r):r for r in re25.get('rows',[]) if isinstance(r,dict) and venue(r)==market}
-                pending=Counter();full_recent=bool(recent) and len(recent)==5 and global_daily_current is True
+                pending=Counter();full_recent=market=='KRX' and len(recent)==5 and global_daily_current is True
                 for r in rows:
-                    c=code(r);b=hist.get(c,[]);candidates=[]
+                    c=code(r)
+                    # KRX daily references are shared for NXT moving averages,
+                    # but neither venue may use a bar later than the confirmed day.
+                    b_all=hist.get(c,[])
+                    b=[z for z in b_all if krx_reference_day and z['date']<=krx_reference_day]
+                    candidates=[]
                     last_symbol_date=trade_date(b[-1]['date']) if b else None
-                    if expected_daily and last_symbol_date==expected_daily:history_ready_symbols+=1
-                    else:history_stale_symbols+=1
+                    daily_last_current=bool(krx_reference_day and last_symbol_date==krx_reference_day)
+                    bar_days={z['date'] for z in b}
+                    recent5_complete=bool(daily_last_current and len(recent)==5 and set(recent)<=bar_days)
+                    re25_window_complete=bool(daily_last_current and len(re25_reference_window)==6 and set(re25_reference_window)<=bar_days)
+                    eligibility=classify_window(r,re25_reference_window,bar_days) if market=='KRX' else None
+                    if market=='KRX':
+                        if eligibility.state=='COMPLETE' and re25_window_complete:
+                            re25_window_ready+=1
+                        elif eligibility.state=='STRUCTURAL_NOT_EVALUABLE':
+                            re25_window_exempt+=1
+                            if not recent5_complete: history_exception_symbols+=1
+                            if len(history_exception_examples)<40:
+                                history_exception_examples.append({'code':c,'reason':eligibility.reason,'missing_dates':list(eligibility.missing)})
+                        else:re25_window_pending+=1
+                    # A valid final bar alone is not evidence of a complete
+                    # five-session history or 200-bar MA depth.
+                    daily_history_ready=(daily_last_current and recent5_complete) if market=='KRX' else None
+                    if daily_history_ready is True:history_ready_symbols+=1
+                    elif not (eligibility and eligibility.state=='STRUCTURAL_NOT_EVALUABLE'):
+                        history_stale_symbols+=1
                     if market=='NXT':
                         s=nxtrows.get(c,{})
                         if s:
@@ -482,19 +556,27 @@ class Operations:
                     if rotation or f.get('capital_handoff_confirmed') is True:
                         candidates.append(('CAPITAL_HANDOFF',f,fm.get('generated_at') if market=='KRX' else f.get('timestamp_kst'),f.get('selection_state'),tri(f.get('capital_handoff_confirmed'))))
                     else:pending['HANDOFF_CONFIRM']+=1
-                    ev=spike_events(b,recent) if b and market=='KRX' else []
+                    ev=spike_events(b,recent) if b and market=='KRX' and re25_window_complete and eligibility.state=='COMPLETE' else []
                     if ev:
-                        s=dict(rerows.get(c,{ }));s.update(ev[-1]);s['events']=ev;s['recent5_complete']=full_recent and all(d in {z['date'] for z in b} for d in recent)
+                        s=dict(rerows.get(c,{ }));s.update(ev[-1]);s['events']=ev;s['recent5_complete']=full_recent and re25_window_complete
                         candidates.append(('RE_EXPLOSION_25',s,re25.get('source_asof'),s.get('setup_state','FAST_NEW_SPIKE' if ev[-1]['fast_new_spike'] else 'RE25_OBSERVED'),tri(s.get('lane_confirmed'))))
                     elif market=='KRX':pending['RE25_HISTORY_OR_EVENT']+=1
                     for lane,s,signal_at,upstate,confirmed in candidates:
                         s=dict(s)
                         if c in news:s.update(news[c])
-                        out=self.base(r,market,s,signal_at,alpha,velocities.get(c,{}),b,current)
+                        out=self.base(r,market,s,signal_at,alpha,velocities.get(c,{}),b,current,reference_daily=krx_reference_day)
                         out.update(lane=lane,selection_path=[lane,str(s.get('signal_track') or upstate or 'PENDING')],upstream_state=upstate,lane_confirmed=confirmed)
                         out['history_expected_asof']=expected_daily
-                        out['history_current']=last_symbol_date==expected_daily if expected_daily else None
-                        out['history_quality']='CURRENT' if out['history_current'] is True else ('STALE' if expected_daily and last_symbol_date else 'PENDING')
+                        out['authority_universe_consistent']=universe_alignment_ok if market=='KRX' else None
+                        out['history_current']=daily_history_ready if market=='KRX' and expected_daily else None
+                        out['history_last_bar_current']=daily_last_current
+                        out['history_recent5_complete']=recent5_complete
+                        out['history_missing_recent_sessions']=[d for d in recent if d not in bar_days] if market=='KRX' else []
+                        out['history_re25_predecessor_complete']=(re25_window_complete if market=='KRX' else None)
+                        out['history_reference_source']='XKRX_CALENDAR_AND_KIS_READY_MANIFEST_AND_LS_KRX_OHLCV' if market=='KRX' else 'KRX_DAILY_REFERENCE_NOT_NXT_BAR'
+                        out['history_200ma_ready']=out.get('ma200') is not None
+                        out['history_quality']=('STRUCTURAL_NOT_EVALUABLE' if eligibility and eligibility.state=='STRUCTURAL_NOT_EVALUABLE' else 'CURRENT_5SESSIONS' if out['history_current'] is True else ('STALE_OR_GAPPED' if expected_daily and last_symbol_date else 'PENDING'))
+                        out['history_structural_exception']=eligibility.reason if eligibility and eligibility.state=='STRUCTURAL_NOT_EVALUABLE' else None
                         # If a source cannot prove the current KRX daily series, no lane may promote it.
                         # This is a view-only check; underlying LS collectors are unchanged.
                         # Engine decisions are evidence, not a substitute for the shared hard gates.
@@ -517,11 +599,12 @@ class Operations:
                     lane_complete=complete and applicable and (set(upstream.get('evaluated_codes',[])) or bool(upstream.get('universe_complete')) if lane=='V17_ACTION_PRE' else bool(fm.get('universe_complete')) if lane=='CAPITAL_HANDOFF' else bool(nxt.get('universe_complete')) if lane=='NXT_POST_ACCEL_LANE' else full_recent if lane=='RE_EXPLOSION_25' else len(alpha)>=len(rows))
                     self.store.reconcile(market,lane,data,lane_complete,current)
                 self.store.track(market,qmap,current)
-                krx_daily_coverage=(global_daily_current is True and complete and history_ready_symbols==len(rows) and len(rows)>0)
+                krx_daily_coverage=(market=='KRX' and full_recent and complete and universe_alignment_ok and
+                                    history_stale_symbols==0 and history_ready_symbols+history_exception_symbols==len(rows) and len(rows)>0)
                 nxt_minute_coverage=(complete and nxt.get('status')=='READY' and nxt.get('universe_complete') is True and len(nxtrows)==len(rows) and len(rows)>0)
                 # NXT price-action lane is not dependent on the KRX daily-history cache.
                 coverage_complete=krx_daily_coverage if market=='KRX' else nxt_minute_coverage
-                meta=dict(status='READY' if coverage_complete else 'PENDING',source_path=path,scan_scope='ZERO_BASE_AUTHORITY_ALL_ROWS',source_code_policy='ALPHANUMERIC_6_ALLOWED',rows_scanned=len(rows),complete=complete,source_errors=errors,manifest=manifest,history_state=hstate,history_symbols=len(hist),history_latest_date=global_history_latest,history_expected_date=expected_daily,history_manifest_trade_date=manifest_trade_date,history_latest_verified=(krx_daily_coverage if market=='KRX' else None),history_date_matches_kis=(global_daily_current if market=='KRX' else None),history_coverage_complete=(krx_daily_coverage if market=='KRX' else None),history_repair=(self.local('history_repair_state') if market=='KRX' else {'status':'NOT_APPLICABLE','reason':'KRX_ONLY'}),history_ready_symbols=history_ready_symbols,history_stale_symbols=history_stale_symbols,recent5_dates=recent,re25_universe_status=('NOT_APPLICABLE' if market=='NXT' else 'COMPLETE' if full_recent and all(all(d in {z['date'] for z in hist.get(code(r),[])} for d in recent) for r in rows) else 'PENDING_PARTIAL_HISTORY'),
+                meta=dict(status='READY' if coverage_complete else 'PENDING',source_path=path,scan_scope='ZERO_BASE_AUTHORITY_ALL_ROWS',source_code_policy='ALPHANUMERIC_6_ALLOWED',rows_scanned=len(rows),complete=complete,source_errors=errors,manifest=manifest,history_state=hstate,history_symbols=len(hist),history_latest_date=global_history_latest,history_expected_date=expected_daily,history_manifest_trade_date=manifest_trade_date,history_latest_verified=(krx_daily_coverage if market=='KRX' else None),history_date_matches_kis=(global_daily_current if market=='KRX' else None),history_calendar_source=('XKRX_SNAPSHOT_2025_2027' if market=='KRX' and recent else 'CALENDAR_UNVERIFIED' if market=='KRX' else 'NOT_APPLICABLE'),history_recent5_expected=(recent if market=='KRX' else []),history_re25_predecessor_date=(re25_reference_window[0] if market=='KRX' and len(re25_reference_window)==6 else None),history_coverage_complete=(krx_daily_coverage if market=='KRX' else None),history_repair=(self.local('history_repair_state') if market=='KRX' else {'status':'NOT_APPLICABLE','reason':'KRX_ONLY'}),history_ready_symbols=history_ready_symbols,history_stale_symbols=history_stale_symbols,history_structural_exception_symbols=history_exception_symbols,history_structural_exception_examples=history_exception_examples,history_universe_audit=source_audit,history_recent5_status=('COMPLETE_EVALUABLE_WITH_VERIFIED_EXCLUSIONS' if krx_daily_coverage and history_exception_symbols else 'COMPLETE' if krx_daily_coverage else 'PENDING'),recent5_dates=recent,re25_universe_status=('NOT_APPLICABLE' if market=='NXT' else 'COMPLETE_EVALUABLE_WITH_VERIFIED_EXCLUSIONS' if full_recent and complete and universe_alignment_ok and re25_window_pending==0 and re25_window_exempt>0 and re25_window_ready+re25_window_exempt==len(rows) else 'COMPLETE' if full_recent and complete and universe_alignment_ok and re25_window_pending==0 and re25_window_exempt==0 and re25_window_ready==len(rows) else 'PENDING_PARTIAL_HISTORY'),re25_evaluable_symbols=re25_window_ready,re25_structural_exception_symbols=re25_window_exempt,re25_pending_symbols=re25_window_pending,
                           pending_axes=dict(pending),lanes={k:{'observed':len(v),'status':'READY' if v and coverage_complete else 'PENDING','prime':sum(z['classification']=='PRIME' for z in v)} for k,v in lanes.items()},scan_at=stamp(current),nxt_independent=True)
                 market_meta[market]=meta
                 with self.store.connect() as con:con.execute('INSERT INTO cycles(at,market,status,payload) VALUES(?,?,?,?)',(stamp(current),market,meta['status'],json.dumps(clean(meta),ensure_ascii=False)))
