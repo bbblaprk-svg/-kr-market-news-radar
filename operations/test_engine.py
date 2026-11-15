@@ -149,7 +149,7 @@ class EngineTests(unittest.TestCase):
         class FakeOp:
             def source(self,market):
                 return [{'code':'000001','market':'KRX','market_cap_100m':900}, {'code':'0120G0','market':'KRX','market_cap_100m':800}],{'status':'READY',**KIS_C,'round_id':'20261113_143514_KRX','market':'KRX'},True,'/api/ledger/live/rows',[]
-        r=KRXHistoryRepair(FakeOp(),lambda venue:h,state_path=Path(self.tmp.name)/'state.json',sleep=lambda s:None)
+        r=KRXHistoryRepair(FakeOp(),lambda venue:h,state_path=Path(self.tmp.name)/'state.json',sleep=lambda s:None,clock=lambda:datetime(2026,11,15,20,tzinfo=KST))
         out=r.batch(datetime(2026,11,15,20,tzinfo=KST),max_calls=2,pacing=0)
         self.assertEqual(out['updated'],0)
         self.assertGreater(out['stale'],0)
@@ -166,7 +166,7 @@ class EngineTests(unittest.TestCase):
             def bootstrap_one(self,symbol):pass
         class FakeOp:
             def source(self,market):return [{'code':'0120G0','market':'KRX'}],{'status':'READY',**KIS_C,'round_id':'20261113_143514_KRX'},True,'latest',[]
-        r=KRXHistoryRepair(FakeOp(),lambda venue:FakeHistory(),state_path=Path(self.tmp.name)/'state.json',sleep=lambda s:None)
+        r=KRXHistoryRepair(FakeOp(),lambda venue:FakeHistory(),state_path=Path(self.tmp.name)/'state.json',sleep=lambda s:None,clock=lambda:datetime(2026,11,15,20,tzinfo=KST))
         out=r.batch(datetime(2026,11,15,20,tzinfo=KST),max_calls=1,pacing=0)
         self.assertEqual(out['updated'],0)
         self.assertGreater(out['failed'],0)
