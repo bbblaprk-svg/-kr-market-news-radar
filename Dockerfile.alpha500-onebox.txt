@@ -31682,3 +31682,9 @@ RUN python -m py_compile /tmp/apply_nxt_v522_runtime_correction.py /tmp/nxt_v522
 # NXT_V5_2_2_RUNTIME_CORRECTION_DOCKER_PATCH_END
 
 # NXT_V5_2_3_CAP700_THRESHOLD_PATCH
+
+# OPERATIONS_PROJECTION_V1: additive same-service dashboard; all earlier collector layers unchanged.
+COPY operations /app/operations
+RUN python /app/operations/install.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && python -m py_compile /app/operations/*.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
+ && PYTHONPATH=/app python -m unittest operations.test_engine -q
