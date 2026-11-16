@@ -8,8 +8,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from .trading_calendar import recent_sessions, last_closed_session, is_snapshot_session
 from .universe_audit import classify_window, universe_membership_audit
+from .candidate_integrity import verified_scope, data_hold, native_nxt_minute_proven
 
-VERSION = 'KRX_NXT_OPERATIONS_V4_2_CANDIDATE_LIFECYCLE_FIX'
+VERSION = 'KRX_NXT_OPERATIONS_V5_EVIDENCE_LEDGER'
 KST = timezone(timedelta(hours=9))
 LANES = ('NXT_POST_ACCEL_LANE', 'V17_ACTION_PRE', 'ASYMMETRIC_RS', 'CAPITAL_HANDOFF', 'RE_EXPLOSION_25')
 VETO = {'RISK_OFF_ACCEL', 'PROGRAM_SELL_ACCEL', 'BREADTH_COLLAPSE'}
@@ -607,16 +608,31 @@ class Store:
                                'rearm_watch_volume_velocity','rearm_confirmed_at',
                                'rearm_prev_volume','rearm_prev_at','rearm_prev_volume_velocity'):
                         if rk in prev:row[rk]=prev[rk]
-                row.update(candidate_seen_at=at,candidate_miss_count=0,candidate_stale=False,
-                           candidate_last_miss_at=None,candidate_lifecycle='CONFIRMED_THIS_CYCLE')
+                source_proven=(complete is True or
+                               (isinstance(complete,set) and row['code'] in complete))
+                if old and not old['active'] and not source_proven:
+                    # A previously closed episode cannot be reopened by an
+                    # unverified observation (even if an old upstream cache repeats it).
+                    continue
+                if not source_proven:
+                    if row.get('classification')=='PRIME':row['classification']='WATCH'
+                    row['decision']='PENDING'
+                    row['data_status']='PENDING'
+                    row['gate_pending']=sorted(set(list(row.get('gate_pending') or [])+['SOURCE_RECONFIRM_PENDING']))
+                row.update(candidate_seen_at=at if source_proven else prev.get('candidate_seen_at'),
+                           candidate_observed_at=at,
+                           candidate_miss_count=0 if source_proven else int(prev.get('candidate_miss_count') or 0),
+                           candidate_stale=False if source_proven else (prev.get('candidate_stale') is True),
+                           candidate_last_miss_at=None if source_proven else prev.get('candidate_last_miss_at'),
+                           candidate_lifecycle='CONFIRMED_THIS_CYCLE' if source_proven else 'OBSERVED_UNVERIFIED')
                 state_keys=('classification','decision','upstream_state','gate_failures','gate_pending','spike_date',
                             're25_runtime_state','candidate_stale')
                 changed=any(prev.get(k)!=row.get(k) for k in state_keys)
-                event='NEW' if not old or not old['active'] else ('EXIT' if row['classification']=='REJECT' and prev.get('classification')!='REJECT'
-                       else 'REENTER' if prev.get('candidate_stale') is True else 'CHANGE' if changed else 'HOLD')
+                event='NEW' if not old or not old['active'] else ('EXIT' if source_proven and row['classification']=='REJECT' and prev.get('classification')!='REJECT'
+                       else 'REENTER' if source_proven and prev.get('candidate_stale') is True else 'CHANGE' if changed else 'HOLD')
                 occ=(old['occurrences'] if old else 0)+(event in ('NEW','REENTER'))
                 row.update(first_seen_at=old['first_at'] if old else at,
-                           occurred_at=at if changed or event in ('NEW','REENTER') else prev.get('occurred_at',at),
+                           occurred_at=at if source_proven and (changed or event in ('NEW','REENTER')) else prev.get('occurred_at',at),
                            last_seen_at=at,occurrences=occ)
                 sid=old['signal_id'] if old else None
                 if row['classification']=='PRIME' and (not old or not old['active'] or prev.get('classification')!='PRIME'):
@@ -629,29 +645,40 @@ class Store:
                     c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',
                               (at,market,lane,row['code'],row['name'],event,reason,json.dumps(clean(row),ensure_ascii=False)))
                 c.execute('INSERT OR REPLACE INTO candidates VALUES(?,?,?,?,?,?,?,?,?,?)',
-                          (key,market,lane,row['code'],1,json.dumps(clean(row),ensure_ascii=False),row['first_seen_at'],at,occ,sid))
+                          (key,market,lane,row['code'],1,json.dumps(clean(row),ensure_ascii=False),
+                           row['first_seen_at'],at if source_proven or not old else old['last_at'],occ,sid))
             for key,old in previous.items():
                 if key in seen:continue
                 p=json.loads(old['payload'])
                 fully_evaluated=(complete is True) or (isinstance(complete,set) and old['code'] in complete)
-                if fully_evaluated:
-                    c.execute('UPDATE candidates SET active=0,last_at=? WHERE key=?',(at,key))
-                    c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',
-                              (at,market,lane,p['code'],p['name'],'EXIT','ZERO_BASE_RESCAN_NOT_SELECTED',old['payload']))
+                if not fully_evaluated:
+                    # Cannot equate missing provider/market evidence with a losing setup.
+                    p=data_hold(p,at=at,reason='SOURCE_INCOMPLETE')
+                    # Do not advance candidate last_at on a missing feed: old watch
+                    # entries must not outrank genuinely refreshed stocks.
+                    c.execute('UPDATE candidates SET payload=? WHERE key=?',
+                              (json.dumps(clean(p),ensure_ascii=False),key))
                     continue
-                prior_miss_at=dt(p.get('candidate_last_miss_at'));cycle_at=dt(at)
-                advance_miss=not (prior_miss_at and cycle_at and cycle_at<=prior_miss_at)
-                misses=int(p.get('candidate_miss_count') or 0)+(1 if advance_miss else 0);stale=misses>=max_misses
-                p.update(data_status='PENDING',decision='PENDING',classification='WATCH',
-                         gate_pending=sorted(set(p.get('gate_pending',[])+['SOURCE_INCOMPLETE'])),
-                         candidate_miss_count=misses,candidate_stale=stale,
-                         candidate_last_miss_at=at if advance_miss else p.get('candidate_last_miss_at'),
-                         candidate_lifecycle='HIDDEN_STALE' if stale else 'RETAINED_UNCONFIRMED')
-                if stale and not json.loads(old['payload']).get('candidate_stale'):
-                    c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',
-                              (at,market,lane,p.get('code'),p.get('name','UNAVAILABLE'),'STALE_HIDE',
-                               'NOT_RECONFIRMED_'+str(misses)+'_CYCLES',json.dumps(clean(p),ensure_ascii=False)))
-                c.execute('UPDATE candidates SET payload=?,last_at=? WHERE key=?',(json.dumps(clean(p),ensure_ascii=False),at,key))
+                # A true missing confirmation must be tied to a completed
+                # per-stock evaluation proof. Three separate verified cycles
+                # are required before a normal EXIT; source outages do not count.
+                previous_miss_at=dt(p.get('candidate_last_miss_at'))
+                scan_at=dt(at)
+                distinct=not (previous_miss_at and scan_at and scan_at<=previous_miss_at)
+                missed=min(max_misses,int(p.get('candidate_miss_count') or 0)+(1 if distinct else 0))
+                if missed<max_misses:
+                    p.update(classification='WATCH',decision='PENDING',data_status='PENDING',
+                             candidate_miss_count=missed,candidate_stale=False,
+                             candidate_last_miss_at=at if distinct else p.get('candidate_last_miss_at'),
+                             candidate_lifecycle='VERIFIED_MISS_'+str(missed),
+                             gate_pending=sorted(set(list(p.get('gate_pending') or [])+['CONFIRMED_RESCAN_NOT_SELECTED'])))
+                    c.execute('UPDATE candidates SET payload=?,last_at=? WHERE key=?',
+                              (json.dumps(clean(p),ensure_ascii=False),at,key))
+                    continue
+                c.execute('UPDATE candidates SET active=0,last_at=? WHERE key=?',(at,key))
+                c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',
+                          (at,market,lane,p['code'],p['name'],'EXIT',
+                           'VERIFIED_CODE_NOT_SELECTED_3_CYCLES',old['payload']))
     def track(self,market,quotes,current):
         with self.connect() as c:
             for r in c.execute("SELECT * FROM outcomes WHERE market=? AND status='TRACKING_SIGNAL'",(market,)).fetchall():
@@ -680,7 +707,8 @@ class Store:
                      " ORDER BY CASE json_extract(payload,'$.classification')"+
                      " WHEN 'PRIME' THEN 0 WHEN 'ARMED' THEN 1"+
                      " WHEN 'PRE_EXPLOSION_ARMED' THEN 2 WHEN 'WATCH' THEN 3"+
-                     " WHEN 'REJECT' THEN 4 ELSE 5 END, last_at DESC"+
+                     " WHEN 'REJECT' THEN 4 ELSE 5 END,"+
+                     " COALESCE(json_extract(payload,'$.candidate_seen_at'),last_at) DESC, last_at DESC"+
                      ' LIMIT ? OFFSET ?')
                 rows=[json.loads(z[0]) for z in c.execute(sql,params+[limit,offset])]
             except sqlite3.OperationalError:
@@ -788,7 +816,10 @@ class Operations:
                     newrow,_=apply_runtime_quote(row,q,current)
                     if newrow.get('runtime_quote_grade')=='STALE':stale_quotes+=1
                     lane=row.get('lane');c=row.get('code')
-                    if lane=='RE_EXPLOSION_25':
+                    if newrow.get('candidate_lifecycle')=='DATA_HOLD':
+                        newrow['runtime_lane_state']='DATA_HOLD'
+                        newrow['re25_state_refresh_status']='PENDING_SOURCE_RECONFIRM' if lane=='RE_EXPLOSION_25' else None
+                    elif lane=='RE_EXPLOSION_25':
                         newrow,_=re25_runtime_transition(newrow,q,current)
                     elif lane=='V17_ACTION_PRE':
                         z=v17_map.get(c)
@@ -960,6 +991,7 @@ class Operations:
                 history_exception_symbols=0
                 history_exception_examples=[]
                 re25_window_ready=re25_window_exempt=re25_window_pending=0
+                re25_evaluated_codes=set()  # audited per-stock verified completed 6-session windows
                 alpha_obj=self.local('alpha',market)
                 # A stock-market name such as KOSPI does not constitute a venue tag.
                 alpha={code(r):dict(r,timestamp_kst=pick(r,'timestamp_kst','source_timestamp') or alpha_obj.get('timestamp_kst')) for key in ('sector_live_pool','live_pool','top_watch','top_final') for r in alpha_obj.get(key,[]) if isinstance(r,dict) and (venue(r) or venue(alpha_obj))==market}
@@ -991,6 +1023,7 @@ class Operations:
                     if market=='KRX':
                         if eligibility.state=='COMPLETE' and re25_window_complete:
                             re25_window_ready+=1
+                            re25_evaluated_codes.add(c)
                         elif eligibility.state=='STRUCTURAL_NOT_EVALUABLE':
                             re25_window_exempt+=1
                             if not recent5_complete: history_exception_symbols+=1
@@ -1070,7 +1103,32 @@ class Operations:
                 for lane,data in lanes.items():
                     applicable=lane!='NXT_POST_ACCEL_LANE' or market=='NXT'
                     # Never infer disappearance from a capped/failed upstream lane response.
-                    lane_complete=complete and applicable and (set(upstream.get('evaluated_codes',[])) or bool(upstream.get('universe_complete')) if lane=='V17_ACTION_PRE' else bool(fm.get('universe_complete')) if lane=='CAPITAL_HANDOFF' else bool(nxt.get('universe_complete')) if lane=='NXT_POST_ACCEL_LANE' else full_recent if lane=='RE_EXPLOSION_25' else len(alpha)>=len(rows))
+                    if lane=='RE_EXPLOSION_25':
+                        # A latest-date header alone is NOT proof all six OHLCV sessions exist.
+                        # Each verified symbol may exit independently, even if the broad scan is partial.
+                        evidence=verified_scope('KRX',lane,re25_evaluated_codes,
+                            source_complete=bool(complete and len(re25_reference_window)==6),
+                            last_close=global_history_latest,expected_close=expected_daily,
+                            reason='KRX_SIX_SESSION_KIS_LS_VERIFIED') if market=='KRX' else None
+                        lane_complete=set(evidence.evaluated_codes) if evidence and evidence.source_complete else set()
+                    else:
+                        # An upstream 'complete' flag from an old snapshot is
+                        # not evidence of a newly evaluated rejection.
+                        # Require fresh producer run time; do NOT infer exchange
+                        # quote freshness or remove a candidate on stale data.
+                        if lane=='V17_ACTION_PRE':
+                            ready=set(upstream.get('evaluated_codes',[])) if fresh(upstream.get('generated_at'),current,1200) else set()
+                        elif lane=='CAPITAL_HANDOFF':
+                            ready=bool(fm.get('universe_complete')) and fresh(fm.get('generated_at'),current,1200)
+                        elif lane=='NXT_POST_ACCEL_LANE':
+                            # integration.nxt() has source_asof=None by design;
+                            # use native per-stock minute-series timestamps and
+                            # 60-bar coverage instead of a nonexistent global clock.
+                            ready={c for c,z in nxtrows.items() if native_nxt_minute_proven(z,current)}
+                        elif lane=='ASYMMETRIC_RS':
+                            ready=bool(len(alpha)>=len(rows)) and fresh(alpha_obj.get('timestamp_kst'),current,1200)
+                        else:ready=False
+                        lane_complete=ready if complete and applicable else set()
                     self.store.reconcile(market,lane,data,lane_complete,current)
                 self.store.track(market,qmap,current)
                 krx_daily_coverage=(market=='KRX' and full_recent and complete and universe_alignment_ok and
