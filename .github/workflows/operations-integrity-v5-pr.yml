@@ -21,6 +21,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      # The production LS fixture imports pandas even though the code migration
+      # itself is broker-agnostic. Match that dependency in CI; do not skip tests.
+      - name: Install LS fixture test dependencies
+        run: python -m pip install --disable-pip-version-check "numpy>=1.26" "pandas>=2.1" "requests>=2.31" "websocket-client>=1.8" "psycopg[binary]>=3.2"
       - name: Check audited source hashes and patch anchors before writing
         run: python operations/apply_integrity_v5.py --repo . --check > /tmp/operations-v5.diff
       - name: Work on a review branch, not on main
