@@ -356,6 +356,31 @@ class Store:
                 reason='STOP_OBSERVED' if p<=r['stop'] else ('TARGET_OBSERVED' if p>=r['target'] else None)
                 c.execute('UPDATE outcomes SET last_at=?,last_price=?,mfe=?,mae=?,status=?,exit_at=?,exit_price=?,exit_reason=? WHERE id=?',
                           (at,p,mfe,mae,'CLOSED_SAMPLED' if reason else 'TRACKING_SIGNAL',at if reason else None,p if reason else None,reason,r['id']))
+    def board(self,market,limit=80,offset=0,lane=None):
+        """Bounded dashboard read. Never materializes the full candidate ledger."""
+        limit=max(20,min(300,int(limit)))
+        where='market=? AND active=1';params=[market]
+        if lane:
+            where+=' AND lane=?';params.append(lane)
+        with self.connect() as c:
+            total=c.execute('SELECT COUNT(*) FROM candidates WHERE '+where,params).fetchone()[0]
+            try:
+                sql=('SELECT payload FROM candidates WHERE '+where+
+                     " ORDER BY CASE json_extract(payload,'$.classification')"+
+                     " WHEN 'PRIME' THEN 0 WHEN 'ARMED' THEN 1"+
+                     " WHEN 'PRE_EXPLOSION_ARMED' THEN 2 WHEN 'WATCH' THEN 3"+
+                     " WHEN 'REJECT' THEN 4 ELSE 5 END, last_at DESC"+
+                     ' LIMIT ? OFFSET ?')
+                rows=[json.loads(z[0]) for z in c.execute(sql,params+[limit,offset])]
+            except sqlite3.OperationalError:
+                recs=[dict(r) for r in c.execute(
+                    'SELECT payload,last_at FROM candidates WHERE '+where+
+                    ' ORDER BY last_at DESC LIMIT ? OFFSET ?',params+[limit,offset])]
+                rows=[json.loads(z['payload']) for z in recs]
+                rows.sort(key=lambda r:(RANK.get(r.get('classification'),9),
+                    -(dt(r.get('occurred_at')).timestamp() if dt(r.get('occurred_at')) else 0)))
+        return {'total':total,'rows':rows,'offset':offset,'limit':limit}
+
     def records(self,kind,market,limit=500,offset=0,lane=None):
         with self.connect() as c:
             where='market=?';params=[market]
@@ -633,8 +658,8 @@ class Operations:
         kind=u.path.rsplit('/',1)[-1]
         if kind=='status':return 200,clean(self.runtime or {'status':'PENDING','storage':self.checkpoint.info(),'version':VERSION})
         if kind=='board':
-            data=self.store.records('candidates',m,1000,0,lane)
-            rows=[r['payload'] for r in data['rows']];rows.sort(key=lambda r:(RANK.get(r['classification'],9),-(dt(r.get('occurred_at')).timestamp() if dt(r.get('occurred_at')) else 0)),reverse=False)
-            return 200,clean({'market':m,'rows':rows[offset:offset+limit],'total':data['total'],'offset':offset,'status':(self.runtime.get('markets',{}).get(m) or {}).get('status','PENDING'),'scan':self.runtime.get('markets',{}).get(m,{}),'storage':self.checkpoint.info(),'version':VERSION})
+            data=self.store.board(m,limit,offset,lane)
+            rows=data['rows']
+            return 200,clean({'market':m,'rows':rows,'total':data['total'],'offset':offset,'status':(self.runtime.get('markets',{}).get(m) or {}).get('status','PENDING'),'scan':self.runtime.get('markets',{}).get(m,{}),'storage':self.checkpoint.info(),'version':VERSION})
         if kind in ('events','outcomes'):return 200,clean(self.store.records(kind,m,limit,offset,lane))
         return 404,{'error':'not found'}
