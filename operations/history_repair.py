@@ -167,6 +167,7 @@ class KRXHistoryRepair:
         return safe
 
     def batch(self, current=None, max_calls=None, pacing=None):
+        explicit_current = current is not None
         current = current or self.clock()
         if os.getenv('KRX_DAILY_REPAIR_ENABLED','true').strip().lower() not in ('1','true','yes','on'):
             self._set(status='DISABLED',reason='CONFIG_DISABLED',asof=stamp(current));return self.snapshot()
@@ -249,7 +250,8 @@ class KRXHistoryRepair:
         pace=max(0.0,pace)
         consecutive=0
         for symbol,row,last in eligible[:n]:
-            if self.stop.is_set() or not self.allowed(self.clock()):break
+            guard_now=current if explicit_current else self.clock()
+            if self.stop.is_set() or not self.allowed(guard_now):break
             try:
                 if self.busy():break
             except Exception:break

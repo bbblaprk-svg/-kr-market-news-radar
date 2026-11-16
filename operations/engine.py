@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlparse
 from .trading_calendar import recent_sessions, last_closed_session, is_snapshot_session
 from .universe_audit import classify_window, universe_membership_audit
 
-VERSION = 'KRX_NXT_OPERATIONS_V4_1'
+VERSION = 'KRX_NXT_OPERATIONS_V4_2_CANDIDATE_LIFECYCLE_FIX'
 KST = timezone(timedelta(hours=9))
 LANES = ('NXT_POST_ACCEL_LANE', 'V17_ACTION_PRE', 'ASYMMETRIC_RS', 'CAPITAL_HANDOFF', 'RE_EXPLOSION_25')
 VETO = {'RISK_OFF_ACCEL', 'PROGRAM_SELL_ACCEL', 'BREADTH_COLLAPSE'}
@@ -143,7 +143,7 @@ def apply_runtime_quote(row,quote,current):
     if old_at and new_at and new_at<old_at:
         out['runtime_quote_status']='IGNORED_OLDER'
         return out, False
-    before=(out.get('price'),out.get('change_pct'),out.get('volume'),out.get('turnover'))
+    before=(out.get('price'),out.get('change_pct'),out.get('volume'),out.get('turnover'),out.get('price_asof'),out.get('timestamp_quality'),out.get('quote_quality'),out.get('runtime_quote_status'))
     out.update(price=p,change_pct=number(quote.get('change_rate')),
                volume=number(quote.get('volume')),turnover=number(quote.get('turnover')),
                price_asof=quote.get('source_timestamp'),
@@ -151,7 +151,7 @@ def apply_runtime_quote(row,quote,current):
                quote_quality=quote.get('quality'),
                runtime_quote_status='READY' if grade=='EXCHANGE' else 'REFERENCE_CURRENT',
                runtime_no_chase=(number(quote.get('change_rate')) is not None and number(quote.get('change_rate'))>5))
-    after=(out.get('price'),out.get('change_pct'),out.get('volume'),out.get('turnover'))
+    after=(out.get('price'),out.get('change_pct'),out.get('volume'),out.get('turnover'),out.get('price_asof'),out.get('timestamp_quality'),out.get('quote_quality'),out.get('runtime_quote_status'))
     return out, before!=after
 
 def get_json(url):
@@ -608,7 +608,7 @@ class Store:
                                'rearm_prev_volume','rearm_prev_at','rearm_prev_volume_velocity'):
                         if rk in prev:row[rk]=prev[rk]
                 row.update(candidate_seen_at=at,candidate_miss_count=0,candidate_stale=False,
-                           candidate_lifecycle='CONFIRMED_THIS_CYCLE')
+                           candidate_last_miss_at=None,candidate_lifecycle='CONFIRMED_THIS_CYCLE')
                 state_keys=('classification','decision','upstream_state','gate_failures','gate_pending','spike_date',
                             're25_runtime_state','candidate_stale')
                 changed=any(prev.get(k)!=row.get(k) for k in state_keys)
@@ -639,10 +639,13 @@ class Store:
                     c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',
                               (at,market,lane,p['code'],p['name'],'EXIT','ZERO_BASE_RESCAN_NOT_SELECTED',old['payload']))
                     continue
-                misses=int(p.get('candidate_miss_count') or 0)+1;stale=misses>=max_misses
+                prior_miss_at=dt(p.get('candidate_last_miss_at'));cycle_at=dt(at)
+                advance_miss=not (prior_miss_at and cycle_at and cycle_at<=prior_miss_at)
+                misses=int(p.get('candidate_miss_count') or 0)+(1 if advance_miss else 0);stale=misses>=max_misses
                 p.update(data_status='PENDING',decision='PENDING',classification='WATCH',
                          gate_pending=sorted(set(p.get('gate_pending',[])+['SOURCE_INCOMPLETE'])),
                          candidate_miss_count=misses,candidate_stale=stale,
+                         candidate_last_miss_at=at if advance_miss else p.get('candidate_last_miss_at'),
                          candidate_lifecycle='HIDDEN_STALE' if stale else 'RETAINED_UNCONFIRMED')
                 if stale and not json.loads(old['payload']).get('candidate_stale'):
                     c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',

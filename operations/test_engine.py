@@ -195,10 +195,11 @@ class EngineTests(unittest.TestCase):
         z=qualify_re25_event(e,{'price':128,'change_rate':2})
         self.assertTrue(z['re25_event_only']);self.assertFalse(z['re25_candidate_visible'])
         self.assertEqual(z['re25_setup_state'],'EVENT_ONLY_FAST_NEW_SPIKE')
-    def test_re25_already_expanded_is_event_only(self):
+    def test_re25_already_expanded_enters_red_no_chase_watch(self):
         e=dict(spike_age=2,fast_new_spike=False,spike_high=130,price_preserved=True,volume_contracting=True,compression_confirmed=True,support_near=True)
         z=qualify_re25_event(e,{'price':135,'change_rate':6.1})
-        self.assertTrue(z['re25_event_only']);self.assertEqual(z['re25_setup_state'],'EVENT_ONLY_ALREADY_EXPANDED')
+        self.assertFalse(z['re25_event_only']);self.assertTrue(z['re25_candidate_visible'])
+        self.assertEqual(z['re25_setup_state'],'RED_NO_CHASE');self.assertEqual(z['re25_runtime_state'],'RED_NO_CHASE')
     def test_re25_requires_all_four_recompression_gates(self):
         e=dict(spike_age=2,fast_new_spike=False,spike_high=130,price_preserved=True,volume_contracting=True,compression_confirmed=True,support_near=False)
         z=qualify_re25_event(e,{'price':125,'change_rate':1})
