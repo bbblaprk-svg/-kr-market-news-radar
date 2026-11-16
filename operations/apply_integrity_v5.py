@@ -98,6 +98,13 @@ def modify_engine(s: str) -> str:
                         lane_complete=ready if complete and applicable else set()"""
     s=once(s,old,new,'per-code RE25 expiration evidence')
 
+    # A verified MISS can update last_at; only a confirmed positive sighting
+    # may lift a candidate above a newly discovered one in the board.
+    old_sort = """" WHEN 'REJECT' THEN 4 ELSE 5 END, last_at DESC"+"""
+    new_sort = """" WHEN 'REJECT' THEN 4 ELSE 5 END,"+
+                     " COALESCE(json_extract(payload,'$.candidate_seen_at'),last_at) DESC, last_at DESC"+"""
+    s=once(s,old_sort,new_sort,'sort on positive verified candidate_seen_at')
+
     # Row presence in an upstream feed is NOT proof of a tradeable signal.
     # Separate observations from completed per-security evaluations. This also
     # blocks false PRIME/outcome creation when an upstream feed is partial.
@@ -196,7 +203,7 @@ def modify_engine(s: str) -> str:
                 c.execute('UPDATE candidates SET active=0,last_at=? WHERE key=?',(at,key))
                 c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',
                           (at,market,lane,p['code'],p['name'],'EXIT',
-                           'VERIFIED_EVALUATION_NOT_SELECTED_3_CYCLES',old['payload']))
+                           'VERIFIED_CODE_NOT_SELECTED_3_CYCLES',old['payload']))
 """
     s=s[:i]+replacement+s[j:]
     return s
@@ -281,7 +288,8 @@ class IntegrityPersistenceTests(unittest.TestCase):
         self.assertEqual([s['code'] for s in survivors],['005930'])
         ev=self.store.records('events','KRX')['rows']
         self.assertEqual(len([e for e in ev if e['event']=='EXIT']),1)
-        self.assertIn('VERIFIED_CODE',next(e['reason'] for e in ev if e['event']=='EXIT'))
+        self.assertEqual(next(e['reason'] for e in ev if e['event']=='EXIT'),
+                         'VERIFIED_CODE_NOT_SELECTED_3_CYCLES')
     def test_nxt_and_krx_same_code_is_isolated(self):
         self.store.reconcile('KRX','RE_EXPLOSION_25',[self.row()],False,AT)
         self.store.reconcile('NXT','NXT_POST_ACCEL_LANE',[self.row('NXT','NXT_POST_ACCEL_LANE')],False,AT)
