@@ -115,6 +115,45 @@ def fresh(at, current, seconds=180):
     d = dt(at)
     return d is not None and -5 <= (current-d).total_seconds() <= seconds
 
+def runtime_quote_grade(row,current,seconds=180):
+    at=row.get('source_timestamp')
+    if not fresh(at,current,seconds):
+        return 'STALE'
+    tq=str(row.get('source_timestamp_quality') or '')
+    qq=str(row.get('quality') or '')
+    if tq=='EXCHANGE_TIMESTAMP' and qq not in ('EXPIRED','REST_STALE','STALE'):
+        return 'EXCHANGE'
+    if qq=='REST_CURRENT' and tq in ('REQUEST_TIMESTAMP','REQUEST_TIME_ONLY','REQUEST_TIME'):
+        return 'REST_CURRENT'
+    return 'REFERENCE'
+
+def apply_runtime_quote(row,quote,current):
+    out=dict(row or {})
+    grade=runtime_quote_grade(quote,current)
+    out['runtime_quote_grade']=grade
+    out['runtime_quote_checked_at']=stamp(current)
+    if grade=='STALE':
+        out['runtime_quote_status']='PENDING_STALE'
+        return out, False
+    p=number(quote.get('price'))
+    if p is None:
+        out['runtime_quote_status']='PENDING_PRICE'
+        return out, False
+    old_at=dt(out.get('price_asof'));new_at=dt(quote.get('source_timestamp'))
+    if old_at and new_at and new_at<old_at:
+        out['runtime_quote_status']='IGNORED_OLDER'
+        return out, False
+    before=(out.get('price'),out.get('change_pct'),out.get('volume'),out.get('turnover'))
+    out.update(price=p,change_pct=number(quote.get('change_rate')),
+               volume=number(quote.get('volume')),turnover=number(quote.get('turnover')),
+               price_asof=quote.get('source_timestamp'),
+               timestamp_quality=quote.get('source_timestamp_quality'),
+               quote_quality=quote.get('quality'),
+               runtime_quote_status='READY' if grade=='EXCHANGE' else 'REFERENCE_CURRENT',
+               runtime_no_chase=(number(quote.get('change_rate')) is not None and number(quote.get('change_rate'))>5))
+    after=(out.get('price'),out.get('change_pct'),out.get('volume'),out.get('turnover'))
+    return out, before!=after
+
 def get_json(url):
     req = urllib.request.Request(url, headers={'User-Agent': VERSION, 'Accept': 'application/json'})
     with urllib.request.urlopen(req, timeout=12) as r:
@@ -189,23 +228,263 @@ def history_metrics(bars, asof):
     return out
 
 def spike_events(bars, recent_dates):
+    """25% event ledger. This detects the event only; it does not make it a buy candidate."""
     events=[]
     for i in range(1,len(bars)):
         r, prev = bars[i], bars[i-1]
         p,h=number(prev['close']),number(r['high'])
         if r['date'] not in recent_dates or not p or h is None or h/p < 1.25: continue
         later=bars[i+1:]
-        age = sum(d>r['date'] for d in recent_dates)
+        age=sum(d>r['date'] for d in recent_dates)
         after=[z for z in later if z['date'] in recent_dates]
-        v=number(r['volume']); last=after[-1] if after else r
+        spike_close=number(r['close']); spike_vol=number(r['volume'])
+        last=after[-1] if after else r
+        last_close=number(last['close'])
         postv=[number(z['volume']) for z in after]
-        ranges=[(z['high']-z['low'])/z['close'] for z in after if all(number(z[k]) is not None and number(z[k])>0 for k in ('high','low','close'))]
-        events.append({'spike_date':r['date'],'spike_high_pct':round((h/p-1)*100,4),'spike_close':number(r['close']),'spike_high':h,'spike_age':age,'fast_new_spike':age==0,
-                       'price_preservation_pct':round(number(last['close'])/h*100,4) if number(last['close']) is not None else None,
-                       'pullback_volume_ratio':sum(postv)/len(postv)/v if postv and v and all(z is not None for z in postv) else None,
-                       'post_range_pct':sum(ranges)/len(ranges)*100 if ranges else None,
-                       'support_price':min(z['low'] for z in after) if after and all(number(z['low']) is not None for z in after) else None})
+        post_ranges=[(number(z['high'])-number(z['low']))/number(z['close'])
+                     for z in after if all(number(z[k]) is not None and number(z[k])>0 for k in ('high','low','close'))]
+        spike_range=((number(r['high'])-number(r['low']))/spike_close
+                     if spike_close and number(r['high']) and number(r['low']) else None)
+        support=min(number(z['low']) for z in after) if after and all(number(z['low']) is not None for z in after) else None
+        post_max_high=max(number(z['high']) for z in after) if after and all(number(z['high']) is not None for z in after) else None
+        historical_extension=((post_max_high/h)-1)*100 if post_max_high and h and h>0 else None
+        volume_ratio=(sum(postv)/len(postv)/spike_vol
+                      if postv and spike_vol and spike_vol>0 and all(z is not None and z>=0 for z in postv) else None)
+        post_range=(sum(post_ranges)/len(post_ranges) if post_ranges else None)
+        support_distance=((last_close/support)-1)*100 if last_close and support and support>0 else None
+        retest_to_close=((last_close/spike_close)-1)*100 if last_close and spike_close and spike_close>0 else None
+        price_preserved=(last_close>=spike_close*.90) if last_close and spike_close else None
+        volume_contracting=(volume_ratio<=.75) if volume_ratio is not None else None
+        compression_confirmed=(post_range<=spike_range*.65) if post_range is not None and spike_range is not None and spike_range>0 else None
+        support_near=(support_distance<=6 and -7<=retest_to_close<=3) if support_distance is not None and retest_to_close is not None else None
+        events.append({
+            'spike_date':r['date'],'spike_high_pct':round((h/p-1)*100,4),
+            'spike_close':spike_close,'spike_high':h,'spike_age':age,'fast_new_spike':age==0,
+            'price_preservation_pct':round(last_close/h*100,4) if last_close else None,
+            'pullback_from_high_pct':round((last_close/h-1)*100,4) if last_close else None,
+            'close_retention_pct':round(last_close/spike_close*100,4) if last_close and spike_close else None,
+            'pullback_volume_ratio':volume_ratio,
+            'post_range_pct':post_range*100 if post_range is not None else None,
+            'spike_range_pct':spike_range*100 if spike_range is not None else None,
+            'support_price':support,'support_distance_pct':support_distance,
+            'retest_to_spike_close_pct':retest_to_close,
+            'post_spike_max_high':post_max_high,
+            'post_spike_max_extension_pct':historical_extension,
+            'historical_reexpansion':(historical_extension>=5) if historical_extension is not None else False,
+            'price_preserved':price_preserved,
+            'volume_contracting':volume_contracting,
+            'compression_confirmed':compression_confirmed,
+            'support_near':support_near
+        })
     return events
+
+def qualify_re25_event(event, live_row):
+    """Separate raw 25% events from second-wave entry candidates.
+
+    EVENT_ONLY rows stay in the event ledger, but are never returned on the RE25
+    candidate board. A candidate requires age 1-5 plus all four daily
+    re-compression gates, and must not already be re-expanded intraday.
+    """
+    s=dict(event or {})
+    age=s.get('spike_age')
+    live_change=number(live_row.get('change_rate'))
+    live_price=number(live_row.get('price'))
+    high=number(s.get('spike_high'))
+    extension=((live_price/high)-1)*100 if live_price and high and high>0 else None
+    live_no_chase=live_change is not None and live_change>5
+    source_no_chase=(s.get('no_chase') is True)
+    historical_reexpansion=(s.get('historical_reexpansion') is True)
+    already_expanded=bool(
+        s.get('fast_new_spike') or
+        live_no_chase or
+        source_no_chase or
+        historical_reexpansion or
+        (extension is not None and extension>=8)
+    )
+    daily_setup=all(s.get(k) is True for k in (
+        'price_preserved','volume_contracting','compression_confirmed','support_near'
+    ))
+    in_window=isinstance(age,int) and 1<=age<=5
+
+    if s.get('fast_new_spike') or age==0:
+        state='EVENT_ONLY_FAST_NEW_SPIKE'
+    elif not in_window:
+        state='EVENT_ONLY_OUT_OF_WINDOW'
+    elif already_expanded:
+        state='RED_NO_CHASE'
+    elif not daily_setup:
+        state='EVENT_ONLY_NOT_RECOMPRESSED'
+    else:
+        state='COMPRESSION_ARMED'
+
+    s.update(
+        re25_setup_state=state,
+        re25_candidate_visible=(state in ('COMPRESSION_ARMED','RED_NO_CHASE')),
+        re25_event_only=(state not in ('COMPRESSION_ARMED','RED_NO_CHASE')),
+        re25_runtime_state=('RED_NO_CHASE' if state=='RED_NO_CHASE' else 'WATCH' if state=='COMPRESSION_ARMED' else state),
+        re25_daily_setup_confirmed=daily_setup,
+        re25_already_expanded=already_expanded,
+        re25_live_change_pct=live_change,
+        re25_extension_above_spike_high_pct=extension,
+        re25_historical_reexpansion=historical_reexpansion,
+        no_chase=True if already_expanded else s.get('no_chase'),
+        lane_confirmed=(state=='COMPRESSION_ARMED')
+    )
+    return s
+
+
+def re25_runtime_transition(row, quote, current):
+    """Fast state transition for a fixed RE25 candidate pool.
+
+    Candidate membership is NOT changed here. Only the row's runtime state is
+    updated. Promotion needs two consecutive confirmations; degradation needs
+    three consecutive failures unless hard support is broken.
+    """
+    out=dict(row or {})
+    price=number(quote.get('price'))
+    volume=number(quote.get('volume'))
+    q_at=quote.get('source_timestamp')
+    q_quality=quote.get('source_timestamp_quality')
+    change=number(quote.get('change_rate'))
+    quote_grade=runtime_quote_grade(quote,current)
+    if price is None or quote_grade=='STALE':
+        out['re25_state_refresh_status']='PENDING_QUOTE'
+        out['runtime_quote_grade']=quote_grade
+        return out, False
+
+    state=str(out.get('re25_runtime_state') or (
+        'RED_NO_CHASE' if out.get('re25_setup_state')=='RED_NO_CHASE'
+        else 'WATCH' if out.get('re25_setup_state')=='COMPRESSION_ARMED'
+        else out.get('re25_setup_state') or 'WATCH'
+    ))
+    previous_state=state
+
+    # Update only current quote fields; do not rerun universe selection.
+    out.update(
+        price=price,
+        change_pct=change,
+        volume=volume,
+        price_asof=q_at,
+        timestamp_quality=q_quality,
+        quote_quality=quote.get('quality'),
+        re25_state_refresh_at=stamp(current),
+        re25_state_refresh_status='READY' if quote_grade=='EXCHANGE' else 'REFERENCE_CURRENT',
+        runtime_quote_grade=quote_grade
+    )
+
+    spike_high=number(out.get('spike_high'))
+    second_high=number(out.get('post_spike_max_high'))
+    existing_peak=number(out.get('rearm_peak_price'))
+    peak=max([x for x in (existing_peak,second_high,spike_high,price) if x is not None], default=price)
+    # Once a rearm watch begins, freeze the peak reference so the pullback band
+    # does not chase price upward.
+    if state in ('REARM_WATCH','REARM_TRIGGER_PENDING_AUTH','REARMED') and existing_peak is not None:
+        peak=existing_peak
+    out['rearm_peak_price']=peak
+
+    spike_close=number(out.get('spike_close'))
+    support=number(out.get('support_price'))
+    if spike_close:
+        conservative=spike_close*.93
+        support=max([x for x in (support,conservative) if x is not None], default=conservative)
+    out['rearm_support_reference']=support
+
+    pullback=((price/peak)-1)*100 if peak else None
+    out['rearm_pullback_from_peak_pct']=pullback
+
+    prev_vol=number(out.get('rearm_prev_volume'))
+    prev_at=dt(out.get('rearm_prev_at'))
+    velocity=None
+    if volume is not None and prev_vol is not None and prev_at and current>prev_at:
+        sec=(current-prev_at).total_seconds()
+        if 5<=sec<=180 and volume>=prev_vol:
+            velocity=(volume-prev_vol)/sec*60
+    prev_velocity=number(out.get('rearm_prev_volume_velocity'))
+    out['rearm_volume_velocity']=velocity
+
+    hard_break=bool(
+        support is not None and price<support
+    ) or bool(pullback is not None and pullback < -12)
+
+    pullback_band=bool(
+        pullback is not None and -12 <= pullback <= -5
+    )
+    not_chasing=(change is None or change<=5)
+    volume_quiet=bool(
+        velocity is not None and prev_velocity is not None and velocity <= prev_velocity*.85
+    )
+    quiet_ok=pullback_band and not_chasing and not hard_break and volume_quiet
+
+    quiet_count=int(out.get('rearm_quiet_confirm_count') or 0)
+    trigger_count=int(out.get('rearm_trigger_confirm_count') or 0)
+    fail_count=int(out.get('rearm_fail_count') or 0)
+
+    if hard_break:
+        state='INVALIDATED'
+        quiet_count=trigger_count=0
+        fail_count=3
+    elif state=='RED_NO_CHASE':
+        quiet_count=quiet_count+1 if quiet_ok else 0
+        if quiet_count>=2:
+            state='REARM_WATCH'
+            out['rearm_watch_started_at']=stamp(current)
+            out['rearm_watch_price']=price
+            out['rearm_breakout_level']=price*1.02
+            out['rearm_watch_volume_velocity']=velocity
+            trigger_count=0
+            fail_count=0
+    elif state in ('REARM_WATCH','REARM_TRIGGER_PENDING_AUTH'):
+        breakout=number(out.get('rearm_breakout_level'))
+        baseline=number(out.get('rearm_watch_volume_velocity'))
+        price_ok=bool(breakout is not None and price>=breakout)
+        vol_ok=bool(velocity is not None and baseline is not None and velocity>=max(baseline*1.30, baseline+1))
+        trigger_ok=price_ok and vol_ok and not_chasing
+        trigger_count=trigger_count+1 if trigger_ok else 0
+        watch_price=number(out.get('rearm_watch_price'))
+        soft_fail=bool(watch_price is not None and price<watch_price*.98) or bool(change is not None and change>5)
+        fail_count=fail_count+1 if soft_fail else 0
+        if trigger_count>=2:
+            if quote_grade=='EXCHANGE':
+                state='REARMED';fail_count=0;out['rearm_confirmed_at']=stamp(current)
+            else:
+                state='REARM_TRIGGER_PENDING_AUTH'
+        elif fail_count>=3:
+            state='RED_NO_CHASE';quiet_count=trigger_count=fail_count=0
+    elif state=='REARMED':
+        breakout=number(out.get('rearm_breakout_level'))
+        hold_ok=bool(breakout is not None and price>=breakout*.99 and not_chasing)
+        fail_count=0 if hold_ok else fail_count+1
+        if fail_count>=3:
+            state='REARM_WATCH'
+            trigger_count=0
+            fail_count=0
+
+    out['rearm_quiet_confirm_count']=quiet_count
+    out['rearm_trigger_confirm_count']=trigger_count
+    out['rearm_fail_count']=fail_count
+    out['re25_runtime_state']=state
+
+    # Runtime state is the primary trading-status label. Core classification
+    # remains untouched until the next scheduled full decision scan.
+    if state=='RED_NO_CHASE':
+        out['entry_phase']='재발산 · 추격금지 / 재응축 감시'
+    elif state=='REARM_WATCH':
+        out['entry_phase']='재응축 2회 확인 · 재돌파 대기'
+    elif state=='REARM_TRIGGER_PENDING_AUTH':
+        out['entry_phase']='재돌파 감지 · KIS 교환시각 확인 대기'
+    elif state=='REARMED':
+        out['entry_phase']='재무장 확인 · 진입 게이트 재검증'
+    elif state=='INVALIDATED':
+        out['entry_phase']='재무장 무효 · 지지 이탈'
+    elif state=='WATCH':
+        out['entry_phase']='재응축 후보 · 진입 조건 대기'
+
+    out['rearm_prev_volume']=volume
+    out['rearm_prev_at']=stamp(current)
+    if velocity is not None:
+        out['rearm_prev_volume_velocity']=velocity
+
+    return out, state!=previous_state
 
 def core_gates(row, current):
     """All required gates must pass. Unknown is never a successful observation."""
@@ -243,6 +522,7 @@ def core_gates(row, current):
         for k in ('impulse_seen','recompression_seen','reaccel_seen','high_hold60_confirmed'):
             gates['NXT_'+k.upper()]=tri(row.get(k))
     if row['lane']=='RE_EXPLOSION_25':
+        gates['RE25_CANDIDATE_VISIBLE']=tri(row.get('re25_candidate_visible'))
         gates['SPIKE_AGE_1_5']=1<=row.get('spike_age',-1)<=5
         gates['FULL_RECENT5_HISTORY']=tri(row.get('recent5_complete'))
         for k in ('price_preserved','volume_contracting','compression_confirmed','support_near'):
@@ -307,45 +587,68 @@ class Store:
                     c.execute('INSERT OR REPLACE INTO observations VALUES(?,?,?)',(key,at,json.dumps(clean(r))))
         return out
     def reconcile(self,market,lane,rows,complete,current):
-        at=stamp(current)
+        at=stamp(current);max_misses=max(1,int(os.getenv('OPERATIONS_CANDIDATE_MAX_MISSES','3')))
         with self.connect() as c:
             previous={r['key']:r for r in c.execute('SELECT * FROM candidates WHERE market=? AND lane=? AND active=1',(market,lane))}
             seen=set()
             for row in rows:
-                key=market+':'+lane+':'+row['code']; seen.add(key)
-                old=c.execute('SELECT * FROM candidates WHERE key=?',(key,)).fetchone(); prev=json.loads(old['payload']) if old else {}
-                state_keys=('classification','decision','upstream_state','gate_failures','gate_pending','spike_date')
+                key=market+':'+lane+':'+row['code'];seen.add(key)
+                old=c.execute('SELECT * FROM candidates WHERE key=?',(key,)).fetchone()
+                prev=json.loads(old['payload']) if old else {}
+                if prev:
+                    for rk in ('runtime_lane_state','runtime_upstream_state','runtime_capital_handoff_confirmed',
+                               'runtime_quote_grade','runtime_quote_status','runtime_quote_checked_at','runtime_no_chase',
+                               'state_refresh_at'):
+                        if rk in prev:row[rk]=prev[rk]
+                if lane=='RE_EXPLOSION_25' and prev:
+                    for rk in ('re25_runtime_state','rearm_peak_price','rearm_support_reference',
+                               'rearm_quiet_confirm_count','rearm_trigger_confirm_count','rearm_fail_count',
+                               'rearm_watch_started_at','rearm_watch_price','rearm_breakout_level',
+                               'rearm_watch_volume_velocity','rearm_confirmed_at',
+                               'rearm_prev_volume','rearm_prev_at','rearm_prev_volume_velocity'):
+                        if rk in prev:row[rk]=prev[rk]
+                row.update(candidate_seen_at=at,candidate_miss_count=0,candidate_stale=False,
+                           candidate_lifecycle='CONFIRMED_THIS_CYCLE')
+                state_keys=('classification','decision','upstream_state','gate_failures','gate_pending','spike_date',
+                            're25_runtime_state','candidate_stale')
                 changed=any(prev.get(k)!=row.get(k) for k in state_keys)
-                event='NEW' if not old or not old['active'] else ('EXIT' if row['classification']=='REJECT' and prev.get('classification')!='REJECT' else 'CHANGE' if changed else 'HOLD')
-                # An occurrence is a new episode, not a timer tick or metric refresh.
-                occ=(old['occurrences'] if old else 0)+(event=='NEW')
-                row.update(first_seen_at=old['first_at'] if old else at,occurred_at=at if changed or event=='NEW' else prev.get('occurred_at',at),last_seen_at=at,occurrences=occ)
+                event='NEW' if not old or not old['active'] else ('EXIT' if row['classification']=='REJECT' and prev.get('classification')!='REJECT'
+                       else 'REENTER' if prev.get('candidate_stale') is True else 'CHANGE' if changed else 'HOLD')
+                occ=(old['occurrences'] if old else 0)+(event in ('NEW','REENTER'))
+                row.update(first_seen_at=old['first_at'] if old else at,
+                           occurred_at=at if changed or event in ('NEW','REENTER') else prev.get('occurred_at',at),
+                           last_seen_at=at,occurrences=occ)
                 sid=old['signal_id'] if old else None
                 if row['classification']=='PRIME' and (not old or not old['active'] or prev.get('classification')!='PRIME'):
                     sid=key+':'+at
                     c.execute('INSERT OR IGNORE INTO outcomes(id,market,lane,code,name,entry_at,entry_price,stop,target,mfe,mae,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
                               (sid,market,lane,row['code'],row['name'],at,row['entry_price'],row['stop_price'],row['target_price'],0,0,'TRACKING_SIGNAL'))
                 row['signal_id']=sid
-                # Identical source and state => no duplicate HOLD from polling or a restart.
                 if event!='HOLD' or (row.get('price_asof')!=prev.get('price_asof') and row.get('data_status')=='READY'):
-                    reason='; '.join(row['gate_failures']+row['gate_pending']) or 'ALL_REQUIRED_GATES_PASS'
-                    c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',(at,market,lane,row['code'],row['name'],event,reason,json.dumps(clean(row),ensure_ascii=False)))
-                c.execute('INSERT OR REPLACE INTO candidates VALUES(?,?,?,?,?,?,?,?,?,?)',(key,market,lane,row['code'],1,json.dumps(clean(row),ensure_ascii=False),row['first_seen_at'],at,occ,sid))
-            if complete:
-                for key,old in previous.items():
-                    if key in seen:continue
-                    if isinstance(complete,set) and old['code'] not in complete:
-                        p=json.loads(old['payload']);p.update(data_status='PENDING',decision='PENDING',classification='WATCH',gate_pending=sorted(set(p.get('gate_pending',[])+['SOURCE_INCOMPLETE'])))
-                        c.execute('UPDATE candidates SET payload=? WHERE key=?',(json.dumps(p,ensure_ascii=False),key));continue
-                    p=json.loads(old['payload']);reason='ZERO_BASE_RESCAN_NOT_SELECTED'
+                    reason='; '.join(row.get('gate_failures',[])+row.get('gate_pending',[])) or 'ALL_REQUIRED_GATES_PASS'
+                    c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',
+                              (at,market,lane,row['code'],row['name'],event,reason,json.dumps(clean(row),ensure_ascii=False)))
+                c.execute('INSERT OR REPLACE INTO candidates VALUES(?,?,?,?,?,?,?,?,?,?)',
+                          (key,market,lane,row['code'],1,json.dumps(clean(row),ensure_ascii=False),row['first_seen_at'],at,occ,sid))
+            for key,old in previous.items():
+                if key in seen:continue
+                p=json.loads(old['payload'])
+                fully_evaluated=(complete is True) or (isinstance(complete,set) and old['code'] in complete)
+                if fully_evaluated:
                     c.execute('UPDATE candidates SET active=0,last_at=? WHERE key=?',(at,key))
-                    c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',(at,market,lane,p['code'],p['name'],'EXIT',reason,old['payload']))
-            else:
-                # Partial/failed feed is an outage, never evidence of selection exit.
-                for key,old in previous.items():
-                    if key in seen:continue
-                    p=json.loads(old['payload']);p.update(data_status='PENDING',decision='PENDING',classification='WATCH',gate_pending=sorted(set(p.get('gate_pending',[])+['SOURCE_INCOMPLETE'])))
-                    c.execute('UPDATE candidates SET payload=? WHERE key=?',(json.dumps(p,ensure_ascii=False),key))
+                    c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',
+                              (at,market,lane,p['code'],p['name'],'EXIT','ZERO_BASE_RESCAN_NOT_SELECTED',old['payload']))
+                    continue
+                misses=int(p.get('candidate_miss_count') or 0)+1;stale=misses>=max_misses
+                p.update(data_status='PENDING',decision='PENDING',classification='WATCH',
+                         gate_pending=sorted(set(p.get('gate_pending',[])+['SOURCE_INCOMPLETE'])),
+                         candidate_miss_count=misses,candidate_stale=stale,
+                         candidate_lifecycle='HIDDEN_STALE' if stale else 'RETAINED_UNCONFIRMED')
+                if stale and not json.loads(old['payload']).get('candidate_stale'):
+                    c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',
+                              (at,market,lane,p.get('code'),p.get('name','UNAVAILABLE'),'STALE_HIDE',
+                               'NOT_RECONFIRMED_'+str(misses)+'_CYCLES',json.dumps(clean(p),ensure_ascii=False)))
+                c.execute('UPDATE candidates SET payload=?,last_at=? WHERE key=?',(json.dumps(clean(p),ensure_ascii=False),at,key))
     def track(self,market,quotes,current):
         with self.connect() as c:
             for r in c.execute("SELECT * FROM outcomes WHERE market=? AND status='TRACKING_SIGNAL'",(market,)).fetchall():
@@ -357,15 +660,20 @@ class Store:
                 c.execute('UPDATE outcomes SET last_at=?,last_price=?,mfe=?,mae=?,status=?,exit_at=?,exit_price=?,exit_reason=? WHERE id=?',
                           (at,p,mfe,mae,'CLOSED_SAMPLED' if reason else 'TRACKING_SIGNAL',at if reason else None,p if reason else None,reason,r['id']))
     def board(self,market,limit=80,offset=0,lane=None):
-        """Bounded dashboard read. Never materializes the full candidate ledger."""
+        """Bounded dashboard read. RE25 event-only rows stay in ledger, not buy board."""
         limit=max(20,min(300,int(limit)))
         where='market=? AND active=1';params=[market]
         if lane:
             where+=' AND lane=?';params.append(lane)
+        re25_only=(lane=='RE_EXPLOSION_25')
         with self.connect() as c:
-            total=c.execute('SELECT COUNT(*) FROM candidates WHERE '+where,params).fetchone()[0]
             try:
-                sql=('SELECT payload FROM candidates WHERE '+where+
+                scoped=where+" AND COALESCE(json_extract(payload,'$.candidate_stale'),0)=0"
+                if re25_only:
+                    scoped+=(" AND json_extract(payload,'$.re25_setup_state') IN ('COMPRESSION_ARMED','RED_NO_CHASE')"
+                             " AND COALESCE(json_extract(payload,'$.re25_runtime_state'),'WATCH')!='INVALIDATED'")
+                total=c.execute('SELECT COUNT(*) FROM candidates WHERE '+scoped,params).fetchone()[0]
+                sql=('SELECT payload FROM candidates WHERE '+scoped+
                      " ORDER BY CASE json_extract(payload,'$.classification')"+
                      " WHEN 'PRIME' THEN 0 WHEN 'ARMED' THEN 1"+
                      " WHEN 'PRE_EXPLOSION_ARMED' THEN 2 WHEN 'WATCH' THEN 3"+
@@ -373,13 +681,41 @@ class Store:
                      ' LIMIT ? OFFSET ?')
                 rows=[json.loads(z[0]) for z in c.execute(sql,params+[limit,offset])]
             except sqlite3.OperationalError:
+                # Bounded fallback: never restore the old 1000-row full materialization.
                 recs=[dict(r) for r in c.execute(
                     'SELECT payload,last_at FROM candidates WHERE '+where+
-                    ' ORDER BY last_at DESC LIMIT ? OFFSET ?',params+[limit,offset])]
-                rows=[json.loads(z['payload']) for z in recs]
-                rows.sort(key=lambda r:(RANK.get(r.get('classification'),9),
+                    ' ORDER BY last_at DESC LIMIT 300',params)]
+                pool=[json.loads(z['payload']) for z in recs]
+                pool=[z for z in pool if z.get('candidate_stale') is not True]
+                if re25_only:
+                    pool=[z for z in pool if z.get('re25_setup_state') in ('COMPRESSION_ARMED','RED_NO_CHASE')
+                          and z.get('re25_runtime_state')!='INVALIDATED']
+                pool.sort(key=lambda r:(RANK.get(r.get('classification'),9),
                     -(dt(r.get('occurred_at')).timestamp() if dt(r.get('occurred_at')) else 0)))
+                total=len(pool);rows=pool[offset:offset+limit]
         return {'total':total,'rows':rows,'offset':offset,'limit':limit}
+
+    def active_payloads(self,market,lane=None,limit=1500):
+        with self.connect() as c:
+            where='market=? AND active=1';params=[market]
+            if lane:
+                where+=' AND lane=?';params.append(lane)
+            rows=c.execute(
+                'SELECT key,payload FROM candidates WHERE '+where+' ORDER BY last_at DESC LIMIT ?',
+                params+[limit]).fetchall()
+        return [(r['key'],json.loads(r['payload'])) for r in rows]
+
+    def update_payload(self,key,payload,current,event=None,reason=None):
+        at=stamp(current)
+        with self.connect() as c:
+            old=c.execute('SELECT * FROM candidates WHERE key=?',(key,)).fetchone()
+            if not old:return
+            c.execute('UPDATE candidates SET payload=?,last_at=? WHERE key=?',
+                      (json.dumps(clean(payload),ensure_ascii=False),at,key))
+            if event:
+                c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',
+                          (at,old['market'],old['lane'],old['code'],payload.get('name','UNAVAILABLE'),
+                           event,reason or event,json.dumps(clean(payload),ensure_ascii=False)))
 
     def records(self,kind,market,limit=500,offset=0,lane=None):
         with self.connect() as c:
@@ -401,11 +737,114 @@ class Operations:
         self.kis=(kis_base or os.getenv('KIS_LEDGER_BASE_URL','https://quant-signal-v3-7-51-clean2.onrender.com')).rstrip('/')
         self.history=History(history_path or os.getenv('V17_ORIGINAL_HISTORY_DB',os.getenv('CACHE_DB','/data/alpha500_bars.sqlite3')))
         self.fetch=fetch;self.providers={};self.runtime={};self.lock=threading.Lock();self.stop=threading.Event();self.thread=None
+        self.candidate_refresh_seconds=max(300,int(os.getenv('OPERATIONS_CANDIDATE_REFRESH_SECONDS','600')))
+        self.state_refresh_seconds=max(20,int(os.getenv('OPERATIONS_STATE_REFRESH_SECONDS','30')))
+        self.last_full_scan_at=None;self.last_state_refresh_at=None
         self.authority_audit={}  # KIS live vs immutable READY snapshot: per-market, per-call
     def attach(self,**providers): self.providers=providers
     def local(self,name,*args):
         try:return self.providers[name](*args) if name in self.providers else {}
         except Exception as e:return {'status':'PENDING','error':type(e).__name__}
+    def live_rows_only(self,market):
+        """Lightweight live quote refresh. No latest-manifest/history/provider fan-out."""
+        obj=self.fetch(self.kis+'/api/ledger/live/rows?market='+market+'&limit=5000')
+        if obj.get('market') not in (None,market):raise ValueError('LIVE_MARKET_MISMATCH')
+        rows=obj.get('rows')
+        if not isinstance(rows,list):raise ValueError('NO_LIVE_ROWS')
+        return [r for r in rows if isinstance(r,dict) and venue(r)==market and valid_code(code(r))]
+
+    def refresh_candidate_states(self,current=None):
+        if not self.lock.acquire(False):return {'status':'BUSY'}
+        try:
+            current=current or now();changes=[];updated=0;by_lane=Counter();stale_quotes=0
+            krx_rows=self.live_rows_only('KRX');nxt_rows=self.live_rows_only('NXT')
+            krx_quotes={code(r):r for r in krx_rows};nxt_quotes={code(r):r for r in nxt_rows}
+            v17_obj=self.local('v17');v17_map={}
+            if isinstance(v17_obj,dict):
+                for z in v17_obj.get('candidates',[])+v17_obj.get('watch',[]):
+                    if isinstance(z,dict) and valid_code(code(z)):v17_map[code(z)]=z
+            alpha_obj=self.local('alpha','KRX');alpha_map={}
+            if isinstance(alpha_obj,dict):
+                for k in ('sector_live_pool','live_pool','top_watch','top_final'):
+                    for z in alpha_obj.get(k,[]) or []:
+                        if isinstance(z,dict) and valid_code(code(z)):alpha_map[code(z)]=z
+            fm_obj=self.local('fullmarket');fm_map={}
+            if isinstance(fm_obj,dict):
+                for z in fm_obj.get('candidates',[]) or []:
+                    if isinstance(z,dict) and valid_code(code(z)):fm_map[code(z)]=z
+            nxt_obj=self.local('nxt',nxt_rows,current)
+            nxt_map={code(z):z for z in (nxt_obj.get('rows',[]) if isinstance(nxt_obj,dict) else [])
+                     if isinstance(z,dict) and valid_code(code(z))}
+            for market,qmap in (('KRX',krx_quotes),('NXT',nxt_quotes)):
+                for key,row in self.store.active_payloads(market,None,1500):
+                    if row.get('candidate_stale') is True:continue
+                    q=qmap.get(row.get('code'))
+                    if not q:continue
+                    before=(row.get('re25_runtime_state'),row.get('runtime_lane_state'),
+                            row.get('runtime_upstream_state'),row.get('runtime_quote_grade'))
+                    newrow,_=apply_runtime_quote(row,q,current)
+                    if newrow.get('runtime_quote_grade')=='STALE':stale_quotes+=1
+                    lane=row.get('lane');c=row.get('code')
+                    if lane=='RE_EXPLOSION_25':
+                        newrow,_=re25_runtime_transition(newrow,q,current)
+                    elif lane=='V17_ACTION_PRE':
+                        z=v17_map.get(c)
+                        if z:
+                            newrow['runtime_upstream_state']=pick(z,'status','pre_status','signal_track') or row.get('upstream_state')
+                            newrow['runtime_signal_asof']=pick(z,'signal_asof','generated_at')
+                            newrow['runtime_lane_state']='NATIVE_REFRESHED'
+                        else:newrow['runtime_lane_state']='NATIVE_NOT_RECONFIRMED'
+                    elif lane=='ASYMMETRIC_RS':
+                        z=alpha_map.get(c)
+                        if z:
+                            for k in ('rs5','rs20','sector_breadth'):
+                                v=pick(z,k,k.upper())
+                                if v is not None:newrow[k]=number(v)
+                            sec=pick(z,'sector','ENERGY_CLUSTER')
+                            if sec is not None:newrow['sector']=sec
+                            newrow['runtime_lane_state']='RS_REFRESHED'
+                        else:newrow['runtime_lane_state']='RS_NOT_RECONFIRMED'
+                    elif lane=='CAPITAL_HANDOFF':
+                        z=fm_map.get(c)
+                        if z:
+                            newrow['runtime_capital_handoff_confirmed']=tri(z.get('capital_handoff_confirmed'))
+                            newrow['runtime_upstream_state']=z.get('selection_state')
+                            newrow['runtime_lane_state']='HANDOFF_REFRESHED'
+                        else:newrow['runtime_lane_state']='HANDOFF_NOT_RECONFIRMED'
+                    elif lane=='NXT_POST_ACCEL_LANE':
+                        z=nxt_map.get(c)
+                        if z:
+                            for k in ('impulse_seen','recompression_seen','reaccel_seen','high_hold60_confirmed',
+                                      'price_hold','entry_price','stop_price','target_price','stop_source','target_source','signal_asof'):
+                                if k in z:newrow[k]=z[k]
+                            newrow['high_hold60']=number(z.get('nxt_high_hold60'))
+                            newrow['volume_accel15']=number(z.get('nxt_volume_accel15'))
+                            newrow['turnover_accel15']=number(z.get('nxt_turnover_accel15'))
+                            newrow['runtime_lane_state']='TRIGGERED_PENDING_CORE' if z.get('gate_status')=='PASS' else 'WATCH'
+                        else:newrow['runtime_lane_state']='SERIES_PENDING'
+                    if newrow.get('runtime_no_chase') is True and lane!='RE_EXPLOSION_25':
+                        newrow['runtime_lane_state']='NO_CHASE'
+                    newrow['state_refresh_at']=stamp(current)
+                    after=(newrow.get('re25_runtime_state'),newrow.get('runtime_lane_state'),
+                           newrow.get('runtime_upstream_state'),newrow.get('runtime_quote_grade'))
+                    changed=before!=after
+                    self.store.update_payload(key,newrow,current,'STATE_CHANGE' if changed else None,
+                                              ('RUNTIME_STATE '+repr(before)+' -> '+repr(after)) if changed else None)
+                    updated+=1;by_lane[lane]+=1
+                    if changed:changes.append({'code':c,'lane':lane,'state':newrow.get('re25_runtime_state') or newrow.get('runtime_lane_state')})
+            self.last_state_refresh_at=current
+            self.runtime['state_refresh_at']=stamp(current);self.runtime['state_refresh_seconds']=self.state_refresh_seconds
+            self.runtime['candidate_refresh_seconds']=self.candidate_refresh_seconds
+            self.runtime['state_refresh_counts']=dict(by_lane);self.runtime['state_refresh_stale_quotes']=stale_quotes
+            self.runtime['state_changes']=changes[-40:];self.runtime.pop('state_refresh_error',None)
+            return {'status':'READY','updated':updated,'changed':len(changes),'by_lane':dict(by_lane),
+                    'stale_quotes':stale_quotes,'at':stamp(current)}
+        except Exception as exc:
+            self.last_state_refresh_at=current or now();self.runtime['state_refresh_at']=stamp(self.last_state_refresh_at)
+            self.runtime['state_refresh_error']=type(exc).__name__
+            return {'status':'PENDING','error':type(exc).__name__}
+        finally:self.lock.release()
+
     def source(self,market):
         """KIS live full-universe rows + independently verified immutable date manifest.
 
@@ -583,8 +1022,15 @@ class Operations:
                     else:pending['HANDOFF_CONFIRM']+=1
                     ev=spike_events(b,recent) if b and market=='KRX' and re25_window_complete and eligibility.state=='COMPLETE' else []
                     if ev:
-                        s=dict(rerows.get(c,{ }));s.update(ev[-1]);s['events']=ev;s['recent5_complete']=full_recent and re25_window_complete
-                        candidates.append(('RE_EXPLOSION_25',s,re25.get('source_asof'),s.get('setup_state','FAST_NEW_SPIKE' if ev[-1]['fast_new_spike'] else 'RE25_OBSERVED'),tri(s.get('lane_confirmed'))))
+                        s=dict(rerows.get(c,{ }));s.update(ev[-1]);s=qualify_re25_event(s,r)
+                        s['events']=ev;s['recent5_complete']=full_recent and re25_window_complete
+                        if s.get('re25_candidate_visible'):
+                            live_price=number(r.get('price'));support=number(s.get('support_price'));prior_high=number(s.get('spike_high'))
+                            if live_price and support and 0<support<live_price:
+                                s.setdefault('entry_price',live_price);s.setdefault('stop_price',support);s.setdefault('stop_source','RE25_OBSERVED_POST_SPIKE_SUPPORT')
+                            if live_price and prior_high and prior_high>live_price:
+                                s.setdefault('target_price',prior_high);s.setdefault('target_source','RE25_OBSERVED_SPIKE_HIGH')
+                        candidates.append(('RE_EXPLOSION_25',s,re25.get('source_asof'),s['re25_setup_state'],s['lane_confirmed']))
                     elif market=='KRX':pending['RE25_HISTORY_OR_EVENT']+=1
                     for lane,s,signal_at,upstate,confirmed in candidates:
                         s=dict(s)
@@ -605,7 +1051,7 @@ class Operations:
                         # If a source cannot prove the current KRX daily series, no lane may promote it.
                         # This is a view-only check; underlying LS collectors are unchanged.
                         # Engine decisions are evidence, not a substitute for the shared hard gates.
-                        for k in ('impulse_seen','recompression_seen','reaccel_seen','high_hold60_confirmed','spike_date','spike_high_pct','spike_age','fast_new_spike','price_preservation_pct','pullback_volume_ratio','post_range_pct','support_price','price_preserved','volume_contracting','compression_confirmed','support_near','recent5_complete','events'):
+                        for k in ('impulse_seen','recompression_seen','reaccel_seen','high_hold60_confirmed','spike_date','spike_high_pct','spike_age','fast_new_spike','price_preservation_pct','pullback_from_high_pct','close_retention_pct','pullback_volume_ratio','post_range_pct','spike_range_pct','support_price','support_distance_pct','retest_to_spike_close_pct','post_spike_max_high','post_spike_max_extension_pct','historical_reexpansion','price_preserved','volume_contracting','compression_confirmed','support_near','re25_setup_state','re25_candidate_visible','re25_event_only','re25_daily_setup_confirmed','re25_already_expanded','re25_live_change_pct','re25_extension_above_spike_high_pct','recent5_complete','events'):
                             if k in s:out[k]=s[k]
                         if lane=='NXT_POST_ACCEL_LANE':
                             for k,src in [('impulse_seen','nxt_impulse_seen'),('recompression_seen','nxt_recompression_seen')]:
@@ -634,7 +1080,13 @@ class Operations:
                 market_meta[market]=meta
                 with self.store.connect() as con:con.execute('INSERT INTO cycles(at,market,status,payload) VALUES(?,?,?,?)',(stamp(current),market,meta['status'],json.dumps(clean(meta),ensure_ascii=False)))
             self.checkpoint.save()
-            self.runtime={'version':VERSION,'scan_at':stamp(current),'markets':clean(market_meta),'storage':self.checkpoint.info(),'status':'READY' if all(v['status']=='READY' for v in market_meta.values()) else 'PENDING'}
+            self.last_full_scan_at=current
+            self.runtime={'version':VERSION,'scan_at':stamp(current),'candidate_refresh_at':stamp(current),
+                          'candidate_refresh_seconds':self.candidate_refresh_seconds,
+                          'state_refresh_at':stamp(self.last_state_refresh_at) if self.last_state_refresh_at else None,
+                          'state_refresh_seconds':self.state_refresh_seconds,
+                          'markets':clean(market_meta),'storage':self.checkpoint.info(),
+                          'status':'READY' if all(v['status']=='READY' for v in market_meta.values()) else 'PENDING'}
             return self.runtime
         finally:
             if 'hist' in locals() and hasattr(hist,'close'):hist.close()
@@ -643,10 +1095,22 @@ class Operations:
         if self.thread and self.thread.is_alive():return
         def loop():
             self.stop.wait(15)
+            next_full=0.0;next_state=0.0
             while not self.stop.is_set():
-                try:self.scan()
-                except Exception as e:self.runtime={'status':'PENDING','error':type(e).__name__,'at':stamp()}
-                self.stop.wait(max(60,int(os.getenv('OPERATIONS_INTERVAL_SECONDS','120'))))
+                mono=time.monotonic()
+                try:
+                    if mono>=next_full:
+                        self.scan()
+                        next_full=time.monotonic()+self.candidate_refresh_seconds
+                        next_state=time.monotonic()+self.state_refresh_seconds
+                    elif mono>=next_state:
+                        self.refresh_candidate_states()
+                        next_state=time.monotonic()+self.state_refresh_seconds
+                except Exception as exc:
+                    self.runtime={'status':'PENDING','error':type(exc).__name__,'at':stamp(),
+                                  'candidate_refresh_seconds':self.candidate_refresh_seconds,
+                                  'state_refresh_seconds':self.state_refresh_seconds}
+                self.stop.wait(2)
         self.thread=threading.Thread(target=loop,daemon=True,name='operations-readonly');self.thread.start()
     def api(self,raw_path):
         u=urlparse(raw_path);q=parse_qs(u.query);m=(q.get('market') or ['KRX'])[0]
@@ -660,6 +1124,15 @@ class Operations:
         if kind=='board':
             data=self.store.board(m,limit,offset,lane)
             rows=data['rows']
-            return 200,clean({'market':m,'rows':rows,'total':data['total'],'offset':offset,'status':(self.runtime.get('markets',{}).get(m) or {}).get('status','PENDING'),'scan':self.runtime.get('markets',{}).get(m,{}),'storage':self.checkpoint.info(),'version':VERSION})
+            return 200,clean({'market':m,'rows':rows,'total':data['total'],'offset':offset,
+                              'status':(self.runtime.get('markets',{}).get(m) or {}).get('status','PENDING'),
+                              'scan':self.runtime.get('markets',{}).get(m,{}),
+                              'candidate_refresh_at':self.runtime.get('candidate_refresh_at'),
+                              'candidate_refresh_seconds':self.runtime.get('candidate_refresh_seconds',self.candidate_refresh_seconds),
+                              'state_refresh_at':self.runtime.get('state_refresh_at'),
+                              'state_refresh_seconds':self.runtime.get('state_refresh_seconds',self.state_refresh_seconds),
+                              'state_refresh_counts':self.runtime.get('state_refresh_counts',{}),
+                              'state_refresh_stale_quotes':self.runtime.get('state_refresh_stale_quotes'),
+                              'storage':self.checkpoint.info(),'version':VERSION})
         if kind in ('events','outcomes'):return 200,clean(self.store.records(kind,m,limit,offset,lane))
         return 404,{'error':'not found'}

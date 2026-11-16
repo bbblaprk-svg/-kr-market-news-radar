@@ -149,7 +149,7 @@ class EngineTests(unittest.TestCase):
         class FakeOp:
             def source(self,market):
                 return [{'code':'000001','market':'KRX','market_cap_100m':900}, {'code':'0120G0','market':'KRX','market_cap_100m':800}],{'status':'READY',**KIS_C,'round_id':'20261113_143514_KRX','market':'KRX'},True,'/api/ledger/live/rows',[]
-        r=KRXHistoryRepair(FakeOp(),lambda venue:h,state_path=Path(self.tmp.name)/'state.json',sleep=lambda s:None,clock=lambda:datetime(2026,11,15,20,tzinfo=KST))
+        r=KRXHistoryRepair(FakeOp(),lambda venue:h,state_path=Path(self.tmp.name)/'state.json',sleep=lambda s:None)
         out=r.batch(datetime(2026,11,15,20,tzinfo=KST),max_calls=2,pacing=0)
         self.assertEqual(out['updated'],0)
         self.assertGreater(out['stale'],0)
@@ -166,7 +166,7 @@ class EngineTests(unittest.TestCase):
             def bootstrap_one(self,symbol):pass
         class FakeOp:
             def source(self,market):return [{'code':'0120G0','market':'KRX'}],{'status':'READY',**KIS_C,'round_id':'20261113_143514_KRX'},True,'latest',[]
-        r=KRXHistoryRepair(FakeOp(),lambda venue:FakeHistory(),state_path=Path(self.tmp.name)/'state.json',sleep=lambda s:None,clock=lambda:datetime(2026,11,15,20,tzinfo=KST))
+        r=KRXHistoryRepair(FakeOp(),lambda venue:FakeHistory(),state_path=Path(self.tmp.name)/'state.json',sleep=lambda s:None)
         out=r.batch(datetime(2026,11,15,20,tzinfo=KST),max_calls=1,pacing=0)
         self.assertEqual(out['updated'],0)
         self.assertGreater(out['failed'],0)
@@ -188,8 +188,114 @@ class EngineTests(unittest.TestCase):
     def test_nxt_missing_sixty_minutes(self):
         r=candidate('NXT','NXT_POST_ACCEL_LANE');r['high_hold60_confirmed']=None;self.assertEqual(core_gates(r,AT)['decision'],'PENDING')
     def test_fast_is_not_second_wave(self):
-        r=candidate(lane='RE_EXPLOSION_25');r.update(spike_age=0,recent5_complete=True,price_preserved=True,volume_contracting=True,compression_confirmed=True,support_near=True)
+        r=candidate(lane='RE_EXPLOSION_25');r.update(spike_age=0,recent5_complete=True,price_preserved=True,volume_contracting=True,compression_confirmed=True,support_near=True,re25_candidate_visible=False)
         self.assertNotEqual(core_gates(r,AT)['classification'],'PRIME')
+    def test_re25_fast_event_is_event_only(self):
+        e=dict(spike_age=0,fast_new_spike=True,spike_high=130,price_preserved=True,volume_contracting=True,compression_confirmed=True,support_near=True)
+        z=qualify_re25_event(e,{'price':128,'change_rate':2})
+        self.assertTrue(z['re25_event_only']);self.assertFalse(z['re25_candidate_visible'])
+        self.assertEqual(z['re25_setup_state'],'EVENT_ONLY_FAST_NEW_SPIKE')
+    def test_re25_already_expanded_is_event_only(self):
+        e=dict(spike_age=2,fast_new_spike=False,spike_high=130,price_preserved=True,volume_contracting=True,compression_confirmed=True,support_near=True)
+        z=qualify_re25_event(e,{'price':135,'change_rate':6.1})
+        self.assertTrue(z['re25_event_only']);self.assertEqual(z['re25_setup_state'],'EVENT_ONLY_ALREADY_EXPANDED')
+    def test_re25_requires_all_four_recompression_gates(self):
+        e=dict(spike_age=2,fast_new_spike=False,spike_high=130,price_preserved=True,volume_contracting=True,compression_confirmed=True,support_near=False)
+        z=qualify_re25_event(e,{'price':125,'change_rate':1})
+        self.assertFalse(z['re25_candidate_visible']);self.assertEqual(z['re25_setup_state'],'EVENT_ONLY_NOT_RECOMPRESSED')
+    def test_re25_compression_candidate_visible(self):
+        e=dict(spike_age=2,fast_new_spike=False,spike_high=130,price_preserved=True,volume_contracting=True,compression_confirmed=True,support_near=True)
+        z=qualify_re25_event(e,{'price':125,'change_rate':1})
+        self.assertTrue(z['re25_candidate_visible']);self.assertEqual(z['re25_setup_state'],'COMPRESSION_ARMED')
+    def test_re25_historical_second_wave_never_reappears(self):
+        e=dict(spike_age=3,fast_new_spike=False,spike_high=130,historical_reexpansion=True,price_preserved=True,volume_contracting=True,compression_confirmed=True,support_near=True)
+        z=qualify_re25_event(e,{'price':124,'change_rate':-1})
+        self.assertTrue(z['re25_candidate_visible'])
+        self.assertTrue(z['re25_historical_reexpansion'])
+        self.assertEqual(z['re25_setup_state'],'RED_NO_CHASE')
+        self.assertEqual(z['re25_runtime_state'],'RED_NO_CHASE')
+    def test_re25_red_requires_two_quiet_confirmations(self):
+        base=dict(code='000001',name='가상',market='KRX',lane='RE_EXPLOSION_25',
+                  re25_setup_state='RED_NO_CHASE',re25_runtime_state='RED_NO_CHASE',
+                  spike_high=130,spike_close=120,post_spike_max_high=132,support_price=112,
+                  rearm_prev_volume=1000,rearm_prev_at=stamp(AT-timedelta(seconds=30)),
+                  rearm_prev_volume_velocity=200)
+        q={'price':123,'volume':1080,'change_rate':1,'source_timestamp':stamp(AT),
+           'source_timestamp_quality':'EXCHANGE_TIMESTAMP','quality':'FRESH'}
+        a,_=re25_runtime_transition(base,q,AT)
+        self.assertEqual(a['re25_runtime_state'],'RED_NO_CHASE')
+        self.assertEqual(a['rearm_quiet_confirm_count'],1)
+        b=dict(a,rearm_prev_at=stamp(AT),rearm_prev_volume=a['volume'],rearm_prev_volume_velocity=160)
+        q2={'price':122.5,'volume':1140,'change_rate':.5,'source_timestamp':stamp(AT+timedelta(seconds=30)),
+            'source_timestamp_quality':'EXCHANGE_TIMESTAMP','quality':'FRESH'}
+        c,_=re25_runtime_transition(b,q2,AT+timedelta(seconds=30))
+        self.assertEqual(c['re25_runtime_state'],'REARM_WATCH')
+
+    def test_re25_rearmed_requires_two_breakout_confirmations(self):
+        base=dict(code='000001',name='가상',market='KRX',lane='RE_EXPLOSION_25',
+                  re25_setup_state='RED_NO_CHASE',re25_runtime_state='REARM_WATCH',
+                  spike_high=130,spike_close=120,post_spike_max_high=132,support_price=112,
+                  rearm_peak_price=132,rearm_watch_price=122,rearm_breakout_level=124.44,
+                  rearm_watch_volume_velocity=100,rearm_prev_volume=1000,
+                  rearm_prev_at=stamp(AT-timedelta(seconds=30)),rearm_prev_volume_velocity=80)
+        q={'price':125,'volume':1070,'change_rate':2,'source_timestamp':stamp(AT),
+           'source_timestamp_quality':'EXCHANGE_TIMESTAMP','quality':'FRESH'}
+        a,_=re25_runtime_transition(base,q,AT)
+        self.assertEqual(a['re25_runtime_state'],'REARM_WATCH')
+        self.assertEqual(a['rearm_trigger_confirm_count'],1)
+        b=dict(a,rearm_prev_at=stamp(AT),rearm_prev_volume=a['volume'])
+        q2={'price':125.5,'volume':1140,'change_rate':2.2,'source_timestamp':stamp(AT+timedelta(seconds=30)),
+            'source_timestamp_quality':'EXCHANGE_TIMESTAMP','quality':'FRESH'}
+        c,_=re25_runtime_transition(b,q2,AT+timedelta(seconds=30))
+        self.assertEqual(c['re25_runtime_state'],'REARMED')
+
+    def test_re25_rearmed_needs_three_soft_fails_to_downgrade(self):
+        base=dict(code='000001',name='가상',market='KRX',lane='RE_EXPLOSION_25',
+                  re25_setup_state='RED_NO_CHASE',re25_runtime_state='REARMED',
+                  spike_high=130,spike_close=120,post_spike_max_high=132,support_price=112,
+                  rearm_peak_price=132,rearm_breakout_level=125,rearm_fail_count=0,
+                  rearm_prev_volume=1000,rearm_prev_at=stamp(AT-timedelta(seconds=30)),
+                  rearm_prev_volume_velocity=100)
+        cur=base
+        for i in range(1,3):
+            tm=AT+timedelta(seconds=30*i)
+            q={'price':123,'volume':1000+50*i,'change_rate':1,'source_timestamp':stamp(tm),
+               'source_timestamp_quality':'EXCHANGE_TIMESTAMP','quality':'FRESH'}
+            cur,_=re25_runtime_transition(cur,q,tm)
+            self.assertEqual(cur['re25_runtime_state'],'REARMED')
+        tm=AT+timedelta(seconds=90)
+        q={'price':123,'volume':1180,'change_rate':1,'source_timestamp':stamp(tm),
+           'source_timestamp_quality':'EXCHANGE_TIMESTAMP','quality':'FRESH'}
+        cur,_=re25_runtime_transition(cur,q,tm)
+        self.assertEqual(cur['re25_runtime_state'],'REARM_WATCH')
+
+    def test_re25_support_break_invalidates_immediately(self):
+        base=dict(code='000001',name='가상',market='KRX',lane='RE_EXPLOSION_25',
+                  re25_setup_state='RED_NO_CHASE',re25_runtime_state='REARM_WATCH',
+                  spike_high=130,spike_close=120,post_spike_max_high=132,support_price=112,
+                  rearm_peak_price=132,rearm_prev_volume=1000,
+                  rearm_prev_at=stamp(AT-timedelta(seconds=30)),rearm_prev_volume_velocity=100)
+        q={'price':110,'volume':1100,'change_rate':-3,'source_timestamp':stamp(AT),
+           'source_timestamp_quality':'EXCHANGE_TIMESTAMP','quality':'FRESH'}
+        z,_=re25_runtime_transition(base,q,AT)
+        self.assertEqual(z['re25_runtime_state'],'INVALIDATED')
+
+    def test_re25_board_hides_invalidated_runtime_state(self):
+        base=candidate(lane='RE_EXPLOSION_25')
+        x=core_gates(dict(base,re25_candidate_visible=True,re25_setup_state='RED_NO_CHASE',
+                          re25_runtime_state='INVALIDATED',spike_age=2,recent5_complete=True,
+                          price_preserved=True,volume_contracting=True,compression_confirmed=True,support_near=True),AT)
+        self.store.reconcile('KRX','RE_EXPLOSION_25',[x],False,AT)
+        self.assertEqual(self.store.board('KRX',80,0,'RE_EXPLOSION_25')['total'],0)
+    def test_re25_board_hides_event_only_rows(self):
+        base=candidate(lane='RE_EXPLOSION_25')
+        visible=core_gates(dict(base,re25_candidate_visible=True,re25_setup_state='COMPRESSION_ARMED',re25_runtime_state='WATCH',spike_age=2,recent5_complete=True,price_preserved=True,volume_contracting=True,compression_confirmed=True,support_near=True),AT)
+        red=core_gates(dict(base,code='000002',re25_candidate_visible=True,re25_setup_state='RED_NO_CHASE',re25_runtime_state='RED_NO_CHASE',re25_event_only=False,no_chase=True,spike_age=2,recent5_complete=True,price_preserved=True,volume_contracting=True,compression_confirmed=True,support_near=True),AT)
+        hidden=core_gates(dict(base,code='000003',re25_candidate_visible=False,re25_setup_state='EVENT_ONLY_FAST_NEW_SPIKE',re25_event_only=True,spike_age=0,recent5_complete=True,price_preserved=True,volume_contracting=True,compression_confirmed=True,support_near=True),AT)
+        self.store.reconcile('KRX','RE_EXPLOSION_25',[visible,red,hidden],False,AT)
+        page=self.store.board('KRX',80,0,'RE_EXPLOSION_25')
+        self.assertEqual(page['total'],2);self.assertEqual(len(page['rows']),2)
+        self.assertEqual({r['code'] for r in page['rows']},{base['code'],'000002'})
     def test_signal_lifecycle_dedup_restart_and_reentry(self):
         r=self.evaluate();self.store.reconcile('KRX',r['lane'],[r],True,AT)
         self.store.reconcile('KRX',r['lane'],[self.evaluate()],True,AT)
@@ -240,6 +346,83 @@ class EngineTests(unittest.TestCase):
     def test_full_scope_no_top_cap(self):
         rows=[dict(code=str(i).zfill(6),market='KRX',name='fixture') for i in range(2403)]
         op=Operations(self.tmp.name,fetch=lambda url:{'market':'KRX','rows':rows,'total':2403});self.assertEqual(len(op.source('KRX')[0]),2403);self.assertTrue(op.source('KRX')[2])
+    def test_runtime_quote_grade_rest_current_is_reference_not_exchange(self):
+        q={'price':100,'change_rate':1,'source_timestamp':stamp(AT),
+           'source_timestamp_quality':'REQUEST_TIMESTAMP','quality':'REST_CURRENT'}
+        self.assertEqual(runtime_quote_grade(q,AT),'REST_CURRENT')
+        z,changed=apply_runtime_quote(candidate(),q,AT)
+        self.assertEqual(z['runtime_quote_status'],'REFERENCE_CURRENT');self.assertTrue(changed)
+    def test_runtime_quote_stale_does_not_overwrite_price(self):
+        r=candidate();r['price']=100
+        q={'price':120,'change_rate':9,'source_timestamp':stamp(AT-timedelta(minutes=10)),
+           'source_timestamp_quality':'REQUEST_TIMESTAMP','quality':'REST_STALE'}
+        z,changed=apply_runtime_quote(r,q,AT)
+        self.assertEqual(z['price'],100);self.assertFalse(changed);self.assertEqual(z['runtime_quote_grade'],'STALE')
+    def test_partial_lane_hides_after_three_unconfirmed_cycles(self):
+        r=core_gates(candidate(lane='ASYMMETRIC_RS'),AT)
+        self.store.reconcile('KRX','ASYMMETRIC_RS',[r],False,AT)
+        for n in range(1,4):self.store.reconcile('KRX','ASYMMETRIC_RS',[],False,AT+timedelta(minutes=10*n))
+        row=self.store.active_payloads('KRX','ASYMMETRIC_RS')[0][1]
+        self.assertTrue(row['candidate_stale']);self.assertEqual(row['candidate_miss_count'],3)
+        self.assertEqual(self.store.board('KRX',80,0,'ASYMMETRIC_RS')['total'],0)
+    def test_reconfirmed_candidate_resets_miss_counter(self):
+        r=core_gates(candidate(lane='CAPITAL_HANDOFF'),AT)
+        self.store.reconcile('KRX','CAPITAL_HANDOFF',[r],False,AT)
+        self.store.reconcile('KRX','CAPITAL_HANDOFF',[],False,AT+timedelta(minutes=10))
+        r2=core_gates(candidate(lane='CAPITAL_HANDOFF'),AT+timedelta(minutes=20))
+        self.store.reconcile('KRX','CAPITAL_HANDOFF',[r2],False,AT+timedelta(minutes=20))
+        row=self.store.active_payloads('KRX','CAPITAL_HANDOFF')[0][1]
+        self.assertEqual(row['candidate_miss_count'],0);self.assertFalse(row['candidate_stale'])
+    def test_re25_rest_current_can_watch_but_not_rearmed(self):
+        base=dict(code='000001',name='가상',market='KRX',lane='RE_EXPLOSION_25',
+                  re25_setup_state='RED_NO_CHASE',re25_runtime_state='REARM_WATCH',
+                  spike_high=130,spike_close=120,post_spike_max_high=132,support_price=112,
+                  rearm_peak_price=132,rearm_watch_price=122,rearm_breakout_level=124,
+                  rearm_watch_volume_velocity=100,rearm_prev_volume=1000,
+                  rearm_prev_at=stamp(AT-timedelta(seconds=30)),rearm_prev_volume_velocity=80,
+                  rearm_trigger_confirm_count=1)
+        q={'price':125,'volume':1070,'change_rate':2,'source_timestamp':stamp(AT),
+           'source_timestamp_quality':'REQUEST_TIMESTAMP','quality':'REST_CURRENT'}
+        z,_=re25_runtime_transition(base,q,AT)
+        self.assertEqual(z['re25_runtime_state'],'REARM_TRIGGER_PENDING_AUTH')
+        self.assertEqual(z['runtime_quote_grade'],'REST_CURRENT')
+
+    def test_runtime_refresh_updates_all_non_re25_lanes_without_membership_change(self):
+        quotes={
+            'KRX':[{'code':'000001','name':'A','venue':'KRX','price':101,'change_rate':1,'volume':1000,'turnover':100000,
+                    'source_timestamp':stamp(AT),'source_timestamp_quality':'EXCHANGE_TIMESTAMP','quality':'FRESH'},
+                   {'code':'000002','name':'B','venue':'KRX','price':102,'change_rate':1,'volume':1000,'turnover':100000,
+                    'source_timestamp':stamp(AT),'source_timestamp_quality':'EXCHANGE_TIMESTAMP','quality':'FRESH'},
+                   {'code':'000003','name':'C','venue':'KRX','price':103,'change_rate':1,'volume':1000,'turnover':100000,
+                    'source_timestamp':stamp(AT),'source_timestamp_quality':'EXCHANGE_TIMESTAMP','quality':'FRESH'}],
+            'NXT':[{'code':'000004','name':'D','venue':'NXT','price':104,'change_rate':1,'volume':1000,'turnover':100000,
+                    'source_timestamp':stamp(AT),'source_timestamp_quality':'EXCHANGE_TIMESTAMP','quality':'FRESH'}]
+        }
+        def fetch(url):
+            market='NXT' if 'market=NXT' in url else 'KRX'
+            return {'market':market,'rows':quotes[market],'total':len(quotes[market])}
+        ops=Operations(data_dir=str(Path(self.tmp.name)/'ops2'),fetch=fetch,history_path=str(Path(self.tmp.name)/'none.db'))
+        ops.attach(
+            v17=lambda:{'candidates':[{'code':'000001','venue':'KRX','status':'ACTION'}],'watch':[]},
+            alpha=lambda market:{'live_pool':[{'code':'000002','venue':'KRX','rs5':2.0,'rs20':1.0,'sector':'TEST'}]},
+            fullmarket=lambda:{'candidates':[{'code':'000003','venue':'KRX','capital_handoff_confirmed':True,'selection_state':'HANDOFF'}]},
+            nxt=lambda rows,current:{'rows':[{'code':'000004','venue':'NXT','gate_status':'PASS','nxt_high_hold60':.99,
+                                              'nxt_volume_accel15':2.0,'nxt_turnover_accel15':2.0,'impulse_seen':True,
+                                              'recompression_seen':True,'reaccel_seen':True,'high_hold60_confirmed':True}]}
+        )
+        for code_,lane_ in [('000001','V17_ACTION_PRE'),('000002','ASYMMETRIC_RS'),('000003','CAPITAL_HANDOFF')]:
+            r=core_gates(candidate('KRX',lane_,code_),AT);ops.store.reconcile('KRX',lane_,[r],False,AT)
+        r=core_gates(candidate('NXT','NXT_POST_ACCEL_LANE','000004'),AT);ops.store.reconcile('NXT','NXT_POST_ACCEL_LANE',[r],False,AT)
+        out=ops.refresh_candidate_states(AT)
+        self.assertEqual(out['status'],'READY')
+        states={}
+        for market_ in ('KRX','NXT'):
+            for _,row in ops.store.active_payloads(market_):states[row['code']]=row.get('runtime_lane_state')
+        self.assertEqual(states['000001'],'NATIVE_REFRESHED')
+        self.assertEqual(states['000002'],'RS_REFRESHED')
+        self.assertEqual(states['000003'],'HANDOFF_REFRESHED')
+        self.assertEqual(states['000004'],'TRIGGERED_PENDING_CORE')
+
     def test_api_validation(self):
         op=Operations(self.tmp.name);self.assertEqual(op.api('/api/operations/board?market=ALL')[0],400);self.assertEqual(op.api('/api/operations/events?limit=no')[0],400)
     def test_additive_handler_patch(self):
