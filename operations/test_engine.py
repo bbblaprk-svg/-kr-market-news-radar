@@ -307,9 +307,10 @@ class EngineTests(unittest.TestCase):
         reopened.reconcile('KRX',r['lane'],[],False,AT+timedelta(minutes=1))
         self.assertEqual(reopened.records('events','KRX')['total'],1)
         self.assertEqual(reopened.records('candidates','KRX')['rows'][0]['payload']['decision'],'PENDING')
-        reopened.reconcile('KRX',r['lane'],[],True,AT+timedelta(minutes=2))
+        for n in range(2,5):
+            reopened.reconcile('KRX',r['lane'],[],True,AT+timedelta(minutes=n))
         self.assertEqual(reopened.records('events','KRX')['rows'][0]['event'],'EXIT')
-        reopened.reconcile('KRX',r['lane'],[self.evaluate()],True,AT+timedelta(minutes=3))
+        reopened.reconcile('KRX',r['lane'],[self.evaluate()],True,AT+timedelta(minutes=5))
         p=reopened.records('candidates','KRX')['rows'][0]['payload'];self.assertEqual(p['occurrences'],2)
     def test_venue_collision_never_merges(self):
         for m in ('KRX','NXT'):
@@ -319,7 +320,8 @@ class EngineTests(unittest.TestCase):
         r=self.evaluate();self.store.reconcile('KRX',r['lane'],[r],True,AT)
         self.store.reconcile('KRX',r['lane'],[],{'999999'},AT)
         self.assertEqual(self.store.records('candidates','KRX')['total'],1)
-        self.store.reconcile('KRX',r['lane'],[],{r['code']},AT)
+        for n in range(1,4):
+            self.store.reconcile('KRX',r['lane'],[],{r['code']},AT+timedelta(minutes=n))
         self.assertEqual(self.store.records('candidates','KRX')['total'],0)
     def test_more_than_two_hundred_events_retained(self):
         for i in range(251):
@@ -359,13 +361,13 @@ class EngineTests(unittest.TestCase):
            'source_timestamp_quality':'REQUEST_TIMESTAMP','quality':'REST_STALE'}
         z,changed=apply_runtime_quote(r,q,AT)
         self.assertEqual(z['price'],100);self.assertFalse(changed);self.assertEqual(z['runtime_quote_grade'],'STALE')
-    def test_partial_lane_hides_after_three_unconfirmed_cycles(self):
+    def test_partial_lane_data_hold_does_not_count_as_failure(self):
         r=core_gates(candidate(lane='ASYMMETRIC_RS'),AT)
         self.store.reconcile('KRX','ASYMMETRIC_RS',[r],False,AT)
         for n in range(1,4):self.store.reconcile('KRX','ASYMMETRIC_RS',[],False,AT+timedelta(minutes=10*n))
         row=self.store.active_payloads('KRX','ASYMMETRIC_RS')[0][1]
-        self.assertTrue(row['candidate_stale']);self.assertEqual(row['candidate_miss_count'],3)
-        self.assertEqual(self.store.board('KRX',80,0,'ASYMMETRIC_RS')['total'],0)
+        self.assertFalse(row['candidate_stale']);self.assertEqual(row['candidate_miss_count'],0)
+        self.assertEqual(self.store.board('KRX',80,0,'ASYMMETRIC_RS')['total'],1)
     def test_reconfirmed_candidate_resets_miss_counter(self):
         r=core_gates(candidate(lane='CAPITAL_HANDOFF'),AT)
         self.store.reconcile('KRX','CAPITAL_HANDOFF',[r],False,AT)
@@ -781,3 +783,83 @@ from .test_v41 import (
     V41UniverseAuditTests, V41StructuralMissingTests,
     V41IntegrationTests, V41RepairClassificationTests,
 )
+
+# Evidence-based candidate retention: persistent local SQLite path.
+class IntegrityPersistenceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.store=Store(Path(self.tmp.name)/'persist.db')
+    def row(self,market='KRX',lane='RE_EXPLOSION_25',code='005930'):
+        return dict(code=code,name='검증용종목',market=market,lane=lane,
+                    classification='WATCH',decision='PENDING',data_status='PENDING',
+                    gate_pending=[],re25_setup_state='COMPRESSION_ARMED',
+                    re25_runtime_state='WATCH',entry_phase='조건 대기')
+    def test_fifty_incomplete_scans_never_exit_or_count_real_miss(self):
+        self.store.reconcile('KRX','RE_EXPLOSION_25',[self.row()],False,AT)
+        for i in range(1,51):
+            self.store.reconcile('KRX','RE_EXPLOSION_25',[],set(),AT+timedelta(minutes=10*i))
+        v=self.store.board('KRX',lane='RE_EXPLOSION_25')
+        self.assertEqual(v['total'],1)
+        self.assertEqual(v['rows'][0]['candidate_miss_count'],0)
+        self.assertEqual(v['rows'][0]['candidate_lifecycle'],'DATA_HOLD')
+        ev=self.store.records('events','KRX')['rows']
+        self.assertFalse(any(e['event']=='EXIT' for e in ev))
+        self.assertEqual(sum(e['event']=='DATA_HOLD' for e in ev),0)
+    def test_proven_complete_code_may_exit_but_other_code_cannot(self):
+        for code in ('005930','0120G0'):
+            self.store.reconcile('KRX','RE_EXPLOSION_25',[self.row(code=code)],False,AT)
+        for i in range(1,4):self.store.reconcile('KRX','RE_EXPLOSION_25',[],{'0120G0'},AT+timedelta(minutes=10*i))
+        survivors=self.store.board('KRX',lane='RE_EXPLOSION_25')['rows']
+        self.assertEqual([s['code'] for s in survivors],['005930'])
+        ev=self.store.records('events','KRX')['rows']
+        self.assertEqual(len([e for e in ev if e['event']=='EXIT']),1)
+        self.assertEqual(next(e['reason'] for e in ev if e['event']=='EXIT'),
+                         'VERIFIED_CODE_NOT_SELECTED_3_CYCLES')
+    def test_nxt_and_krx_same_code_is_isolated(self):
+        self.store.reconcile('KRX','RE_EXPLOSION_25',[self.row()],False,AT)
+        self.store.reconcile('NXT','NXT_POST_ACCEL_LANE',[self.row('NXT','NXT_POST_ACCEL_LANE')],False,AT)
+        self.store.reconcile('NXT','NXT_POST_ACCEL_LANE',[],set(),AT+timedelta(minutes=1))
+        self.assertEqual(self.store.board('KRX',lane='RE_EXPLOSION_25')['total'],1)
+        self.assertEqual(self.store.board('NXT',lane='NXT_POST_ACCEL_LANE')['total'],1)
+    def test_unverified_prime_cannot_open_a_tracked_trade(self):
+        p=self.row()
+        p.update(classification='PRIME',decision='PRIME',entry_price=100,
+                 stop_price=96,target_price=112)
+        self.store.reconcile('KRX','RE_EXPLOSION_25',[p],set(),AT)
+        rows=self.store.board('KRX',lane='RE_EXPLOSION_25')['rows']
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['classification'],'WATCH')
+        self.assertEqual(rows[0]['candidate_lifecycle'],'OBSERVED_UNVERIFIED')
+        self.assertEqual(self.store.records('outcomes','KRX')['total'],0)
+    def test_partial_source_does_not_reenter_stale_candidate(self):
+        p=self.row()
+        self.store.reconcile('KRX','RE_EXPLOSION_25',[p],True,AT)
+        for i in range(1,4):self.store.reconcile('KRX','RE_EXPLOSION_25',[],{'005930'},AT+timedelta(minutes=i))
+        # An unverified observation must NOT reenter or become PRIME.
+        self.store.reconcile('KRX','RE_EXPLOSION_25',[self.row()],set(),AT+timedelta(minutes=5))
+        self.assertEqual(self.store.records('candidates','KRX')['total'],0)
+
+    def test_outage_does_not_make_old_candidate_newest(self):
+        first=self.row(code='005930')
+        second=self.row(code='0120G0')
+        self.store.reconcile('KRX','RE_EXPLOSION_25',[first],True,AT)
+        self.store.reconcile('KRX','RE_EXPLOSION_25',[],set(),AT+timedelta(minutes=10))
+        self.store.reconcile('KRX','RE_EXPLOSION_25',[second],True,AT+timedelta(minutes=20))
+        self.store.reconcile('KRX','RE_EXPLOSION_25',[],set(),AT+timedelta(minutes=30))
+        visible=self.store.board('KRX',lane='RE_EXPLOSION_25')['rows']
+        self.assertEqual(visible[0]['code'],'0120G0')
+        self.assertEqual(visible[1]['code'],'005930')
+    def test_source_age_never_substitutes_for_executed_trade(self):
+        self.assertFalse(fresh(stamp(AT-timedelta(minutes=30)),AT,1200))
+        self.assertTrue(fresh(stamp(AT-timedelta(minutes=8)),AT,1200))
+        self.assertFalse(fresh('2026-11-13',AT,1200))
+    def test_scan_protects_stale_producer_snapshots(self):
+        import inspect
+        src=inspect.getsource(Operations.scan)
+        self.assertIn("fresh(fm.get('generated_at'),current,1200)",src)
+        self.assertIn("native_nxt_minute_proven(z,current)",src)
+    def test_ui_has_pinned_quote_without_fabricated_exchange_time(self):
+        html=Path(__file__).with_name('dashboard.html').read_text(encoding='utf-8')
+        for keyword in ('stock-quote','REST_STALE','DATA_PENDING · 전체시장','function emptyStateMessage()'):
+            self.assertIn(keyword,html)
+
