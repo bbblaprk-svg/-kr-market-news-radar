@@ -21,6 +21,31 @@ RANK = {'PRIME': 0, 'ARMED': 1, 'PRE_EXPLOSION_ARMED': 2, 'WATCH': 3, 'REJECT': 
 MISSING = ('UNAVAILABLE', 'PENDING', '', None)
 
 def now(): return datetime.now(KST)
+
+SPECIAL_SESSION_DATE = '2026-11-19'
+
+def session_open_for_market(market, current, observed):
+    """Apply one-day CSAT schedule without changing normal-day behavior.
+
+    2026-11-19: KRX 10:00-16:30; NXT pre-market closed,
+    main 10:00:30-16:20, after-market 16:40-20:00.
+    Outside that date, preserve the existing runtime session policy.
+    """
+    observed = tri(observed)
+    if current.weekday() >= 5:
+        return False
+    if observed is not True:
+        return observed
+    hm = current.hour * 60 + current.minute + current.second / 60.0
+    market = str(market or '').upper()
+    if current.date().isoformat() == SPECIAL_SESSION_DATE:
+        if market == 'KRX':
+            return 600 <= hm < 990
+        if market == 'NXT':
+            return (600.5 <= hm < 980) or (1000 <= hm < 1200)
+        return False
+    return (540 <= hm < 930) if market == 'KRX' else (480 <= hm < 1200) if market == 'NXT' else False
+
 def stamp(d=None): return (d or now()).isoformat(timespec='seconds')
 def dt(v):
     try:
@@ -1288,11 +1313,9 @@ class Operations:
                         if lane=='NXT_POST_ACCEL_LANE':
                             for k,src in [('impulse_seen','nxt_impulse_seen'),('recompression_seen','nxt_recompression_seen')]:
                                 if src in s:out[k]=s[src]
-                        # Session calendar must come from an observed source; weekdays alone are insufficient.
-                        out['session_open']=tri(r.get('session_open'))
-                        if current.weekday()>=5:out['session_open']=False
-                        elif out['session_open'] is True:
-                            hm=current.hour*60+current.minute;out['session_open']=(540<=hm<930) if market=='KRX' else (480<=hm<1200)
+                        # Session calendar must come from an observed source.
+                        # 2026-11-19 uses a one-day CSAT override; all other dates keep normal behavior.
+                        out['session_open']=session_open_for_market(market,current,r.get('session_open'))
                         out=core_gates(out,current)
                         out['unavailable_fields']=[k for k in ('name','vwap','price_hold','high_hold60','rvol','execution_strength','ma5','ma20','ma60','ma120','ma200','rs5','rs20','compression','sector_breadth','foreign_net','institution_net','program_net','news_gate','entry_price','stop_price','target_price') if out.get(k) is None]
                         lanes[lane].append(out)
