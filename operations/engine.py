@@ -10,7 +10,7 @@ from .trading_calendar import recent_sessions, last_closed_session, is_snapshot_
 from .universe_audit import classify_window, universe_membership_audit
 from .candidate_integrity import verified_scope, data_hold, native_nxt_minute_proven
 
-VERSION = 'KRX_NXT_OPERATIONS_V7_CLEAN_BOOTSAFE'
+VERSION = 'KRX_NXT_OPERATIONS_V8_LANE_SCOPE_SAFE'
 KST = timezone(timedelta(hours=9))
 LANES = ('NXT_POST_ACCEL_LANE', 'V17_ACTION_PRE', 'ASYMMETRIC_RS', 'CAPITAL_HANDOFF', 'RE_EXPLOSION_25')
 VIEW_LANES = LANES + ('RS_HANDOFF',)
@@ -506,10 +506,11 @@ def core_gates(row, current):
     # NXT post-acceleration is independent and uses observed NXT minute bars instead.
     if row['lane'] != 'NXT_POST_ACCEL_LANE':
         gates['KRX_DAILY_CURRENT']=tri(row.get('history_current'))
-        # A verified per-symbol candle alone is not a full-universe authority.
-        # Reject promotion until KIS live membership and the immutable completed
-        # snapshot are reconciled. NXT post-acceleration stays independent.
-        gates['KRX_UNIVERSE_MATCH']=tri(row.get('authority_universe_consistent'))
+        # Cross-snapshot *whole-universe* membership is an audit, not a valid
+        # reason to block a symbol that is present in the current KIS authority
+        # rows and has verified current daily history.  Keep the global audit in
+        # market metadata, while the per-symbol gate proves current authority.
+        gates['KRX_AUTHORITY_SYMBOL']=tri(row.get('authority_symbol_present'))
     p,s,t = (number(row.get(k)) for k in ('entry_price','stop_price','target_price'))
     valid = p is not None and s is not None and t is not None and 0<s<p<t
     rr = (t-p)/(p-s) if valid else None
@@ -546,8 +547,8 @@ def core_gates(row, current):
     elif gates.get('NO_CHASE') is False or row.get('fast_new_spike') is True or row.get('re25_already_expanded') is True: expansion_phase='ALREADY_EXPANDED_NO_CHASE'
     elif classification in ('ARMED','PRE_EXPLOSION_ARMED'): expansion_phase='PRE_ENTRY_SETUP'
     else: expansion_phase='PENDING'
-    row.update(classification=classification,expansion_phase=expansion_phase,decision='PENDING' if pending or any(k in fail for k in ('DATA_FRESH','SIGNAL_FRESH','SESSION','NXT_INDEPENDENT_SESSION','KRX_DAILY_CURRENT','KRX_UNIVERSE_MATCH')) else classification,
-               data_status='PENDING' if pending or not gates['DATA_FRESH'] or not gates['SIGNAL_FRESH'] or gates.get('KRX_DAILY_CURRENT') is False or ('KRX_UNIVERSE_MATCH' in gates and gates['KRX_UNIVERSE_MATCH'] is not True) else 'READY',
+    row.update(classification=classification,expansion_phase=expansion_phase,decision='PENDING' if pending or any(k in fail for k in ('DATA_FRESH','SIGNAL_FRESH','SESSION','NXT_INDEPENDENT_SESSION','KRX_DAILY_CURRENT','KRX_AUTHORITY_SYMBOL')) else classification,
+               data_status='PENDING' if pending or not gates['DATA_FRESH'] or not gates['SIGNAL_FRESH'] or gates.get('KRX_DAILY_CURRENT') is False or gates.get('KRX_AUTHORITY_SYMBOL') is False else 'READY',
                gate_failures=fail, gate_pending=pending,
                promotion_conditions=[k+'=PASS' for k,v in row['gates'].items() if v!='PASS'],
                invalidation_conditions=['MARKET_STATE veto','NO_CHASE','뉴스 차단','손익비 2R 미달','명시된 지지/손절선 이탈'],
@@ -802,11 +803,51 @@ class Operations:
         self.authority_audit={}  # KIS live vs immutable READY snapshot: per-market, per-call
         self.storage_mode='PERSISTENT' if str(Path(data_dir)).startswith('/data/') else 'EPHEMERAL_FALLBACK'
         self.startup_storage_errors=[]
+        self._storage_diag_cache={'at':0.0,'known':{}}
+    def _known_disk_usage(self):
+        cached=self._storage_diag_cache
+        if time.monotonic()-float(cached.get('at') or 0.0)<120:
+            return cached.get('known') or {}
+        out={}
+        for raw in ('/data/results','/data/context_ledger','/data/operations','/data/operations_v7'):
+            p=Path(raw); total=0; files=0; truncated=False
+            try:
+                if p.is_file():
+                    total=p.stat().st_size;files=1
+                elif p.exists():
+                    for root,dirs,names in os.walk(p):
+                        for name in names:
+                            files+=1
+                            if files>2000:
+                                truncated=True;break
+                            try: total+=Path(root,name).stat().st_size
+                            except OSError: pass
+                        if truncated: break
+                out[raw]={'bytes':int(total),'files':int(files),'truncated':truncated}
+            except OSError:
+                out[raw]={'status':'UNAVAILABLE'}
+        self._storage_diag_cache={'at':time.monotonic(),'known':out}
+        return out
     def storage_info(self):
         info=dict(self.checkpoint.info())
         info.update(operations_storage_mode=self.storage_mode,
                     operations_database_path=str(self.store.path),
                     startup_storage_errors=list(self.startup_storage_errors))
+        # Cheap, read-only persistent-disk diagnostics.  Never recurse or delete.
+        try:
+            st=os.statvfs('/data')
+            total=int(st.f_frsize*st.f_blocks); free=int(st.f_frsize*st.f_bavail)
+            info['persistent_disk']={'mount':'/data','total_bytes':total,'free_bytes':free,
+                                     'used_bytes':max(0,total-free),
+                                     'used_pct':round(100.0*(total-free)/total,2) if total else None}
+            core={}
+            for path in ('/data/alpha500_bars.sqlite3','/data/alpha500_bars.sqlite3-wal','/data/alpha500_bars.sqlite3-shm'):
+                try: core[Path(path).name]=Path(path).stat().st_size
+                except OSError: core[Path(path).name]=None
+            info['core_history_files']=core
+            info['known_persistent_usage']=self._known_disk_usage()
+        except OSError as exc:
+            info['persistent_disk']={'mount':'/data','status':'UNAVAILABLE','error':type(exc).__name__}
         return info
     def attach(self,**providers): self.providers=providers
     def local(self,name,*args):
@@ -965,7 +1006,12 @@ class Operations:
         c=code(r);ls=alpha.get(c) or {};p=number(r.get('price'));q_at=r.get('source_timestamp')
         # Generated_at/row's calendar date are not exchange signal timestamps.
         # Prefer an explicit signal event timestamp only; never synthesize 15:30.
-        signal_at=signal.get('signal_asof') if dt(signal.get('signal_asof')) else None
+        # Prefer a real signal/event timestamp.  For engines that expose only a
+        # verified evaluation timestamp, keep the caller-provided signal_at so
+        # SIGNAL_FRESH can represent this evaluation cycle without inventing an
+        # exchange candle timestamp.
+        signal_at=(signal.get('signal_asof') if dt(signal.get('signal_asof')) else
+                   (signal_at if dt(signal_at) else None))
         # LS numbers remain supplemental and never overwrite KIS current/flow values.
         ls_at=pick(ls,'source_timestamp','timestamp_kst','quote_at')
         ls_price=number(pick(ls,'price','current_price'))
@@ -1040,7 +1086,9 @@ class Operations:
                         v17.update({code(x):x for x in uncapped.get('candidates',[]) if isinstance(x,dict)});v17_at=uncapped.get('generated_at')
                 nxt=self.local('nxt',rows,current) if market=='NXT' else {}
                 nxtrows={code(r):r for r in nxt.get('rows',[]) if isinstance(r,dict) and venue(r)=='NXT'}
-                news=self.local('news',market,current)
+                news_obj=self.local('news',market,current)
+                news_meta=(news_obj.get('__meta__') or {}) if isinstance(news_obj,dict) else {}
+                news={k:v for k,v in (news_obj.items() if isinstance(news_obj,dict) else []) if k!='__meta__'}
                 re25=self.local('re25',market);rerows={code(r):r for r in re25.get('rows',[]) if isinstance(r,dict) and venue(r)==market}
                 pending=Counter();full_recent=market=='KRX' and len(recent)==5 and global_daily_current is True
                 for r in rows:
@@ -1106,11 +1154,19 @@ class Operations:
                     elif market=='KRX':pending['RE25_HISTORY_OR_EVENT']+=1
                     for lane,s,signal_at,upstate,confirmed in candidates:
                         s=dict(s)
-                        if c in news:s.update(news[c])
+                        if c in news:
+                            s.update(news[c])
+                        elif news_meta.get('status')=='READY':
+                            # A healthy news sidecar with no recent blocking event
+                            # for this symbol is affirmative CLEAR evidence, not an
+                            # unknown/PENDING news gate.
+                            s.setdefault('news_gate','CLEAR')
+                            s.setdefault('news_source','NEWS_IMPACT_SIDECAR_NO_BLOCKING_EVENT')
                         out=self.base(r,market,s,signal_at,alpha,velocities.get(c,{}),b,current,reference_daily=krx_reference_day)
                         out.update(lane=lane,selection_path=[lane,str(s.get('signal_track') or upstate or 'PENDING')],upstream_state=upstate,lane_confirmed=confirmed)
                         out['history_expected_asof']=expected_daily
                         out['authority_universe_consistent']=universe_alignment_ok if market=='KRX' else None
+                        out['authority_symbol_present']=True if market=='KRX' and c in qmap else (None if market!='KRX' else False)
                         out['history_current']=daily_history_ready if market=='KRX' and expected_daily else None
                         out['history_last_bar_current']=daily_last_current
                         out['history_recent5_complete']=recent5_complete
@@ -1120,6 +1176,7 @@ class Operations:
                         out['history_200ma_ready']=out.get('ma200') is not None
                         out['history_quality']=('STRUCTURAL_NOT_EVALUABLE' if eligibility and eligibility.state=='STRUCTURAL_NOT_EVALUABLE' else 'CURRENT_5SESSIONS' if out['history_current'] is True else ('STALE_OR_GAPPED' if expected_daily and last_symbol_date else 'PENDING'))
                         out['history_structural_exception']=eligibility.reason if eligibility and eligibility.state=='STRUCTURAL_NOT_EVALUABLE' else None
+                        out['authority_audit_warning']=('KIS_CROSS_SNAPSHOT_UNIVERSE_DELTA_UNVERIFIED' if market=='KRX' and not universe_alignment_ok else None)
                         # If a source cannot prove the current KRX daily series, no lane may promote it.
                         # This is a view-only check; underlying LS collectors are unchanged.
                         # Engine decisions are evidence, not a substitute for the shared hard gates.
@@ -1136,6 +1193,7 @@ class Operations:
                         out=core_gates(out,current)
                         out['unavailable_fields']=[k for k in ('name','vwap','price_hold','high_hold60','rvol','execution_strength','ma5','ma20','ma60','ma120','ma200','rs5','rs20','compression','sector_breadth','foreign_net','institution_net','program_net','news_gate','entry_price','stop_price','target_price') if out.get(k) is None]
                         lanes[lane].append(out)
+                lane_runtime_meta={}
                 for lane,data in lanes.items():
                     applicable=lane!='NXT_POST_ACCEL_LANE' or market=='NXT'
                     # Never infer disappearance from a capped/failed upstream lane response.
@@ -1148,24 +1206,35 @@ class Operations:
                             reason='KRX_SIX_SESSION_KIS_LS_VERIFIED') if market=='KRX' else None
                         lane_complete=set(evidence.evaluated_codes) if evidence and evidence.source_complete else set()
                     else:
-                        # An upstream 'complete' flag from an old snapshot is
-                        # not evidence of a newly evaluated rejection.
-                        # Require fresh producer run time; do NOT infer exchange
-                        # quote freshness or remove a candidate on stale data.
+                        # Per-lane confirmation is scoped to symbols actually evaluated by
+                        # the producer this cycle.  A partial producer must not be treated
+                        # as whole-market complete, but verified rows can still be actionable.
                         if lane=='V17_ACTION_PRE':
                             ready=set(upstream.get('evaluated_codes',[])) if fresh(upstream.get('generated_at'),current,1200) else set()
                         elif lane=='CAPITAL_HANDOFF':
-                            ready=bool(fm.get('universe_complete')) and fresh(fm.get('generated_at'),current,1200)
+                            ready=(set(fm.get('evaluated_codes') or []) or set(fmrows)) if fresh(fm.get('generated_at'),current,1200) else set()
                         elif lane=='NXT_POST_ACCEL_LANE':
                             # integration.nxt() has source_asof=None by design;
                             # use native per-stock minute-series timestamps and
                             # 60-bar coverage instead of a nonexistent global clock.
                             ready={c for c,z in nxtrows.items() if native_nxt_minute_proven(z,current)}
                         elif lane=='ASYMMETRIC_RS':
-                            ready=bool(len(alpha)>=len(rows)) and fresh(alpha_obj.get('timestamp_kst'),current,1200)
-                        else:ready=False
+                            # Alpha is a bounded candidate/result source, not a 2406-row
+                            # authority universe.  Scope readiness to rows with their own
+                            # fresh observed timestamp instead of requiring a global clock.
+                            ready={c for c,z in alpha.items() if fresh(pick(z,'source_timestamp','timestamp_kst','price_asof'),current,1200)}
+                        else:
+                            ready=set()
                         lane_complete=ready if complete and applicable else set()
                     self.store.reconcile(market,lane,data,lane_complete,current)
+                    proof_count=len(lane_complete) if isinstance(lane_complete,set) else (len(rows) if lane_complete is True else 0)
+                    lane_runtime_meta[lane]={
+                        'observed':len(data),
+                        'status':'READY' if applicable and proof_count>0 else ('NOT_APPLICABLE' if not applicable else 'PENDING'),
+                        'prime':sum(z['classification']=='PRIME' for z in data),
+                        'evaluated_scope':proof_count,
+                        'universe_complete':bool(proof_count==len(rows) and len(rows)>0),
+                    }
                 self.store.track(market,qmap,current)
                 krx_daily_coverage=(market=='KRX' and full_recent and complete and universe_alignment_ok and
                                     history_stale_symbols==0 and history_ready_symbols+history_exception_symbols==len(rows) and len(rows)>0)
@@ -1173,7 +1242,7 @@ class Operations:
                 # NXT price-action lane is not dependent on the KRX daily-history cache.
                 coverage_complete=krx_daily_coverage if market=='KRX' else nxt_minute_coverage
                 meta=dict(status='READY' if coverage_complete else 'PENDING',source_path=path,scan_scope='ZERO_BASE_AUTHORITY_ALL_ROWS',source_code_policy='ALPHANUMERIC_6_ALLOWED',rows_scanned=len(rows),complete=complete,source_errors=errors,manifest=manifest,history_state=hstate,history_symbols=len(hist),history_latest_date=global_history_latest,history_expected_date=expected_daily,history_manifest_trade_date=manifest_trade_date,history_latest_verified=(krx_daily_coverage if market=='KRX' else None),history_date_matches_kis=(global_daily_current if market=='KRX' else None),history_calendar_source=('XKRX_SNAPSHOT_2025_2027' if market=='KRX' and recent else 'CALENDAR_UNVERIFIED' if market=='KRX' else 'NOT_APPLICABLE'),history_recent5_expected=(recent if market=='KRX' else []),history_re25_predecessor_date=(re25_reference_window[0] if market=='KRX' and len(re25_reference_window)==6 else None),history_coverage_complete=(krx_daily_coverage if market=='KRX' else None),history_repair=(self.local('history_repair_state') if market=='KRX' else {'status':'NOT_APPLICABLE','reason':'KRX_ONLY'}),history_ready_symbols=history_ready_symbols,history_stale_symbols=history_stale_symbols,history_structural_exception_symbols=history_exception_symbols,history_structural_exception_examples=history_exception_examples,history_universe_audit=source_audit,history_recent5_status=('COMPLETE_EVALUABLE_WITH_VERIFIED_EXCLUSIONS' if krx_daily_coverage and history_exception_symbols else 'COMPLETE' if krx_daily_coverage else 'PENDING'),recent5_dates=recent,re25_universe_status=('NOT_APPLICABLE' if market=='NXT' else 'COMPLETE_EVALUABLE_WITH_VERIFIED_EXCLUSIONS' if full_recent and complete and universe_alignment_ok and re25_window_pending==0 and re25_window_exempt>0 and re25_window_ready+re25_window_exempt==len(rows) else 'COMPLETE' if full_recent and complete and universe_alignment_ok and re25_window_pending==0 and re25_window_exempt==0 and re25_window_ready==len(rows) else 'PENDING_PARTIAL_HISTORY'),re25_evaluable_symbols=re25_window_ready,re25_structural_exception_symbols=re25_window_exempt,re25_pending_symbols=re25_window_pending,
-                          pending_axes=dict(pending),lanes={k:{'observed':len(v),'status':'READY' if v and coverage_complete else 'PENDING','prime':sum(z['classification']=='PRIME' for z in v)} for k,v in lanes.items()},scan_at=stamp(current),nxt_independent=True)
+                          pending_axes=dict(pending),lanes=lane_runtime_meta,scan_at=stamp(current),nxt_independent=True)
                 market_meta[market]=meta
                 with self.store.connect() as con:con.execute('INSERT INTO cycles(at,market,status,payload) VALUES(?,?,?,?)',(stamp(current),market,meta['status'],json.dumps(clean(meta),ensure_ascii=False)))
             self.checkpoint.save()

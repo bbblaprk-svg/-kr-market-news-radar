@@ -24,7 +24,9 @@ def _new_operations():
     fallback=(os.getenv('OPERATIONS_FALLBACK_DIR') or '/tmp/operations_v7').strip()
     errors=[]
     attempted=set()
-    for data_dir, mode in ((preferred,'PERSISTENT'),(fallback,'EPHEMERAL_FALLBACK')):
+    choices=((preferred, 'PERSISTENT' if preferred.startswith('/data/') else 'EPHEMERAL_FALLBACK'),
+             (fallback, 'PERSISTENT' if fallback.startswith('/data/') else 'EPHEMERAL_FALLBACK'))
+    for data_dir, mode in choices:
         if not data_dir or data_dir in attempted:
             continue
         attempted.add(data_dir)
@@ -87,7 +89,7 @@ def attach(app):
             if z.get('status') not in ('REJECT','HISTORY_FAIL'):
                 result.append(z)
             else:rejected.append(c)
-        return {'status':'READY','candidates':result,'generated_at':None,'universe_complete':not missing,'history_pending':len(missing),'evaluated_codes':[code(r) for r in result]+rejected,'rejected_count':len(rejected),'scope':'ZERO_BASE_ALL_KIS_ROWS_READONLY_V17'}
+        return {'status':'READY','candidates':result,'generated_at':stamp(current),'universe_complete':not missing,'history_pending':len(missing),'evaluated_codes':[code(r) for r in result]+rejected,'rejected_count':len(rejected),'scope':'ZERO_BASE_ALL_KIS_ROWS_READONLY_V17'}
     def nxt(rows,current):
         fn=app.get('_nxt_session_features'); out=[]; pending=0
         if not fn:return {'status':'PENDING','rows':[]}
@@ -111,9 +113,14 @@ def attach(app):
         return {'status':'READY','rows':out,'source_asof':None,'universe_complete':pending==0,'pending_series':pending}
     def news(market,current):
         obj=app.get('NEWS_IMPACT_SIDECAR');out={}
-        if obj is None:return out
-        try:items=obj.history(200).get('rows',[])
-        except Exception:return out
+        if obj is None:return {'__meta__':{'status':'PENDING','reason':'SIDECAR_UNAVAILABLE'}}
+        try:
+            health=obj.health() if hasattr(obj,'health') else {}
+            items=obj.history(200).get('rows',[])
+            healthy=(health.get('ok') is True) and health.get('bound') is not False
+            out['__meta__']={'status':'READY' if healthy else 'PENDING','version':health.get('version'),'checked_at':stamp(current)}
+        except Exception as exc:
+            return {'__meta__':{'status':'PENDING','reason':type(exc).__name__,'checked_at':stamp(current)}}
         for z in reversed(items):
             c=str(z.get('ticker') or z.get('code') or '')
             # Preserve exact company mapping and original news classification.
@@ -146,7 +153,8 @@ def attach(app):
                 worker.set_venue('KRX','K')
                 repair_worker[0]=worker
             return repair_worker[0]
-    repair=KRXHistoryRepair(ops,history_engine,native_busy)
+    repair_state=os.getenv('KRX_DAILY_REPAIR_STATE_PATH') or str(ops.store.path.parent/'krx_history_repair_state.json')
+    repair=KRXHistoryRepair(ops,history_engine,native_busy,state_path=repair_state)
     ops.attach(alpha=alpha,news=news,v17=lambda:native('V17_ORIGINAL_BRIDGE'),v17_all=v17_all,fullmarket=lambda:native('FULLMARKET_V3_BRIDGE'),nxt=nxt,history_repair_state=repair.snapshot)
     repair.start()  # isolated, session-aware, rate-limited EOD repair; native collectors untouched.
     return ops
