@@ -12250,6 +12250,26 @@ class LSProgramTrendLedger:
             return {'allowed':False,'status':'PENDING','reason':hint,'now_kst':_iso()}
         if now.weekday() >= 5:
             return {'allowed':False,'status':'PENDING','reason':'NON_TRADING_DAY','now_kst':_iso()}
+        # 2026-11-19 CSAT delayed-open override. One-day only; normal schedule resumes 2026-11-20.
+        if now.date().isoformat() == '2026-11-19':
+            sec = now.hour*3600 + now.minute*60 + now.second
+            if market == 'KRX':
+                start_sec, end_sec = 10*3600, 16*3600+30*60
+                if sec < start_sec:
+                    return {'allowed':False,'status':'PENDING','reason':'WAITING_SESSION','session_start_hhmm':'1000','now_kst':_iso()}
+                if sec >= end_sec:
+                    return {'allowed':False,'status':'PENDING','reason':'SESSION_CLOSED','session_end_hhmm':'1630','now_kst':_iso()}
+                return {'allowed':True,'status':'ACTIVE','reason':'IN_SESSION','session_start_minute':600,'now_minute':sec/60.0,'now_kst':_iso()}
+            if market == 'NXT':
+                main_start, main_end = 10*3600+30, 16*3600+20*60
+                after_start, after_end = 16*3600+40*60, 20*3600+5*60
+                if sec < main_start:
+                    return {'allowed':False,'status':'PENDING','reason':'WAITING_SESSION','session_start_hhmm':'100030','now_kst':_iso()}
+                if main_end <= sec < after_start:
+                    return {'allowed':False,'status':'PENDING','reason':'SESSION_BREAK','session_resume_hhmm':'1640','now_kst':_iso()}
+                if sec >= after_end:
+                    return {'allowed':False,'status':'PENDING','reason':'SESSION_CLOSED','session_end_hhmm':'2005','now_kst':_iso()}
+                return {'allowed':True,'status':'ACTIVE','reason':'IN_SESSION','session_start_minute':600.5,'now_minute':sec/60.0,'now_kst':_iso()}
         start_s, end_s = ((self.nxt_start,self.nxt_end) if market == 'NXT' else (self.krx_start,self.krx_end))
         start = self._hm_min(start_s, '0800' if market == 'NXT' else '0900')
         end = self._hm_min(end_s, '2005' if market == 'NXT' else '1540')
