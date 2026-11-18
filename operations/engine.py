@@ -10,7 +10,7 @@ from .trading_calendar import recent_sessions, last_closed_session, is_snapshot_
 from .universe_audit import classify_window, universe_membership_audit
 from .candidate_integrity import verified_scope, data_hold, native_nxt_minute_proven
 
-VERSION = 'KRX_NXT_OPERATIONS_V61_RUNTIME_SAFE'
+VERSION = 'KRX_NXT_OPERATIONS_V611_RENDER_SAFE'
 KST = timezone(timedelta(hours=9))
 LANES = ('NXT_POST_ACCEL_LANE', 'V17_ACTION_PRE', 'ASYMMETRIC_RS', 'CAPITAL_HANDOFF', 'RE_EXPLOSION_25')
 VIEW_LANES = LANES + ('RS_HANDOFF',)
@@ -558,13 +558,12 @@ class Store:
     """Append-only event ledger and sampled signal outcomes, separate from upstream files."""
     def __init__(self,path):
         self.path=Path(path); self.path.parent.mkdir(parents=True,exist_ok=True)
-        # Configure journaling once at startup. Re-running journal_mode for every
-        # dashboard read can contend with scan/state writer threads.
+        # Render persistent disks may reject WAL journal files (disk I/O error).
+        # Keep SQLite on its filesystem-default journal mode and only set a
+        # connection-local busy timeout so startup can never fail on WAL setup.
         c=sqlite3.connect(self.path,timeout=15)
         try:
             c.execute('PRAGMA busy_timeout=15000')
-            c.execute('PRAGMA journal_mode=WAL')
-            c.execute('PRAGMA synchronous=NORMAL')
             c.executescript('''
             CREATE TABLE IF NOT EXISTS candidates(key TEXT PRIMARY KEY,market TEXT,lane TEXT,code TEXT,active INTEGER,payload TEXT,first_at TEXT,last_at TEXT,occurrences INTEGER,signal_id TEXT);
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT,market TEXT,lane TEXT,code TEXT,name TEXT,event TEXT,reason TEXT,payload TEXT);
