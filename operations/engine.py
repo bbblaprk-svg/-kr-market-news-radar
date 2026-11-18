@@ -10,7 +10,7 @@ from .trading_calendar import recent_sessions, last_closed_session, is_snapshot_
 from .universe_audit import classify_window, universe_membership_audit
 from .candidate_integrity import verified_scope, data_hold, native_nxt_minute_proven
 
-VERSION = 'KRX_NXT_OPERATIONS_V8_LANE_SCOPE_SAFE'
+VERSION = 'KRX_NXT_OPERATIONS_V8_1_BUILD_COMPAT_SAFE'
 KST = timezone(timedelta(hours=9))
 LANES = ('NXT_POST_ACCEL_LANE', 'V17_ACTION_PRE', 'ASYMMETRIC_RS', 'CAPITAL_HANDOFF', 'RE_EXPLOSION_25')
 VIEW_LANES = LANES + ('RS_HANDOFF',)
@@ -59,6 +59,31 @@ def code(r):
 def valid_code(value):
     # KRX identifiers may contain letters, e.g. 0120G0; never silently drop them.
     return bool(re.fullmatch(r'[A-Z0-9]{6}', str(value or '')))
+
+def authority_scope_consistent(audit, drift_ratio=0.01, min_large_universe=500):
+    """Convert an exact cross-snapshot audit into a promotion-safety decision.
+
+    Exact membership differences remain visible in authority_audit/source_errors.
+    A tiny drift in a large KRX universe is treated as an audit warning rather
+    than a market-wide trading halt; material differences still fail closed.
+    This never proves a missing symbol: per-symbol presence is checked separately.
+    """
+    if not isinstance(audit, dict):
+        return None
+    if audit.get('membership_matched') is True:
+        return True
+    status=str(audit.get('status') or '')
+    if status!='PENDING_CROSS_SNAPSHOT_MEMBERSHIP_DIFF':
+        return None if status.startswith('PENDING_INVALID') or not status else False
+    live=int(number(audit.get('live_unique')) or 0)
+    latest=int(number(audit.get('latest_unique')) or 0)
+    live_only=int(number(audit.get('live_only_count')) or 0)
+    latest_only=int(number(audit.get('latest_only_count')) or 0)
+    denom=max(live,latest,1)
+    diff=live_only+latest_only
+    if min(live,latest)>=min_large_universe and diff/denom<=drift_ratio:
+        return True
+    return False
 def venue(r):
     v = str(pick(r, 'venue', 'exchange') or '').upper()
     if v in ('KRX', 'NXT'): return v
@@ -506,11 +531,16 @@ def core_gates(row, current):
     # NXT post-acceleration is independent and uses observed NXT minute bars instead.
     if row['lane'] != 'NXT_POST_ACCEL_LANE':
         gates['KRX_DAILY_CURRENT']=tri(row.get('history_current'))
-        # Cross-snapshot *whole-universe* membership is an audit, not a valid
-        # reason to block a symbol that is present in the current KIS authority
-        # rows and has verified current daily history.  Keep the global audit in
-        # market metadata, while the per-symbol gate proves current authority.
-        gates['KRX_AUTHORITY_SYMBOL']=tri(row.get('authority_symbol_present'))
+        # Preserve the legacy universe gate for audit/backward compatibility.
+        # Runtime scan sets authority_universe_consistent to a material-safety
+        # decision (tiny large-universe drift may warn without halting all rows).
+        legacy=tri(row.get('authority_universe_consistent'))
+        gates['KRX_UNIVERSE_MATCH']=legacy
+        # Newer rows carry explicit current-KIS symbol presence.  Older fixtures
+        # and persisted rows fall back to the legacy gate so they do not become
+        # PENDING merely because the field did not exist in earlier versions.
+        symbol=tri(row.get('authority_symbol_present'))
+        gates['KRX_AUTHORITY_SYMBOL']=legacy if symbol is None else symbol
     p,s,t = (number(row.get(k)) for k in ('entry_price','stop_price','target_price'))
     valid = p is not None and s is not None and t is not None and 0<s<p<t
     rr = (t-p)/(p-s) if valid else None
@@ -547,8 +577,8 @@ def core_gates(row, current):
     elif gates.get('NO_CHASE') is False or row.get('fast_new_spike') is True or row.get('re25_already_expanded') is True: expansion_phase='ALREADY_EXPANDED_NO_CHASE'
     elif classification in ('ARMED','PRE_EXPLOSION_ARMED'): expansion_phase='PRE_ENTRY_SETUP'
     else: expansion_phase='PENDING'
-    row.update(classification=classification,expansion_phase=expansion_phase,decision='PENDING' if pending or any(k in fail for k in ('DATA_FRESH','SIGNAL_FRESH','SESSION','NXT_INDEPENDENT_SESSION','KRX_DAILY_CURRENT','KRX_AUTHORITY_SYMBOL')) else classification,
-               data_status='PENDING' if pending or not gates['DATA_FRESH'] or not gates['SIGNAL_FRESH'] or gates.get('KRX_DAILY_CURRENT') is False or gates.get('KRX_AUTHORITY_SYMBOL') is False else 'READY',
+    row.update(classification=classification,expansion_phase=expansion_phase,decision='PENDING' if pending or any(k in fail for k in ('DATA_FRESH','SIGNAL_FRESH','SESSION','NXT_INDEPENDENT_SESSION','KRX_DAILY_CURRENT','KRX_UNIVERSE_MATCH','KRX_AUTHORITY_SYMBOL')) else classification,
+               data_status='PENDING' if pending or not gates['DATA_FRESH'] or not gates['SIGNAL_FRESH'] or gates.get('KRX_DAILY_CURRENT') is False or gates.get('KRX_UNIVERSE_MATCH') is False or gates.get('KRX_AUTHORITY_SYMBOL') is False else 'READY',
                gate_failures=fail, gate_pending=pending,
                promotion_conditions=[k+'=PASS' for k,v in row['gates'].items() if v!='PASS'],
                invalidation_conditions=['MARKET_STATE veto','NO_CHASE','뉴스 차단','손익비 2R 미달','명시된 지지/손절선 이탈'],
@@ -1069,6 +1099,7 @@ class Operations:
                 # Live rows are still scanned Zero-Base even if a historical
                 # universe differs. Differences are reported, not silently dropped.
                 universe_alignment_ok=source_audit.get('membership_matched') is True
+                authority_scope_ok=authority_scope_consistent(source_audit)
                 history_stale_symbols=history_ready_symbols=0
                 history_exception_symbols=0
                 history_exception_examples=[]
@@ -1165,7 +1196,8 @@ class Operations:
                         out=self.base(r,market,s,signal_at,alpha,velocities.get(c,{}),b,current,reference_daily=krx_reference_day)
                         out.update(lane=lane,selection_path=[lane,str(s.get('signal_track') or upstate or 'PENDING')],upstream_state=upstate,lane_confirmed=confirmed)
                         out['history_expected_asof']=expected_daily
-                        out['authority_universe_consistent']=universe_alignment_ok if market=='KRX' else None
+                        out['authority_universe_consistent']=authority_scope_ok if market=='KRX' else None
+                        out['authority_universe_exact_match']=universe_alignment_ok if market=='KRX' else None
                         out['authority_symbol_present']=True if market=='KRX' and c in qmap else (None if market!='KRX' else False)
                         out['history_current']=daily_history_ready if market=='KRX' and expected_daily else None
                         out['history_last_bar_current']=daily_last_current
