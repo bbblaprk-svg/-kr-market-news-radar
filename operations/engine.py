@@ -10,7 +10,7 @@ from .trading_calendar import recent_sessions, last_closed_session, is_snapshot_
 from .universe_audit import classify_window, universe_membership_audit
 from .candidate_integrity import verified_scope, data_hold, native_nxt_minute_proven
 
-VERSION = 'KRX_NXT_OPERATIONS_V8_1_BUILD_COMPAT_SAFE'
+VERSION = 'KRX_NXT_OPERATIONS_V9_STORAGE_GUARDED'
 KST = timezone(timedelta(hours=9))
 LANES = ('NXT_POST_ACCEL_LANE', 'V17_ACTION_PRE', 'ASYMMETRIC_RS', 'CAPITAL_HANDOFF', 'RE_EXPLOSION_25')
 VIEW_LANES = LANES + ('RS_HANDOFF',)
@@ -599,14 +599,23 @@ class Store:
     CREATE TABLE IF NOT EXISTS observations(key TEXT PRIMARY KEY,quote_at TEXT,payload TEXT);
     CREATE TABLE IF NOT EXISTS outcomes(id TEXT PRIMARY KEY,market TEXT,lane TEXT,code TEXT,name TEXT,entry_at TEXT,entry_price REAL,stop REAL,target REAL,last_at TEXT,last_price REAL,mfe REAL,mae REAL,status TEXT,exit_at TEXT,exit_price REAL,exit_reason TEXT);
     CREATE INDEX IF NOT EXISTS events_market_id ON events(market,id);
+    CREATE INDEX IF NOT EXISTS events_at_id ON events(at,id);
+    CREATE INDEX IF NOT EXISTS candidates_active_last ON candidates(active,last_at);
+    CREATE INDEX IF NOT EXISTS outcomes_status_exit ON outcomes(status,exit_at);
     CREATE TABLE IF NOT EXISTS cycles(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT,market TEXT,status TEXT,payload TEXT);
+    CREATE INDEX IF NOT EXISTS cycles_at_id ON cycles(at,id);
     """
     def __init__(self,path):
         self.path=Path(path)
         self.path.parent.mkdir(parents=True,exist_ok=True)
+        self._last_maintenance=0.0
+        self.maintenance_stats={'status':'NOT_RUN'}
+        fresh_db=not self.path.exists()
         c=sqlite3.connect(self.path,timeout=15)
         try:
             c.execute('PRAGMA busy_timeout=15000')
+            if fresh_db:
+                c.execute('PRAGMA auto_vacuum=INCREMENTAL')
             c.executescript(self.SCHEMA)
             c.commit()
             check=c.execute('PRAGMA integrity_check').fetchone()
@@ -624,6 +633,62 @@ class Store:
                 yield c
         finally:
             c.close()
+    @staticmethod
+    def _event_snapshot(row):
+        """Compact event payload: retain decision evidence without duplicating full candidate blobs."""
+        keep=('code','name','market','lane','classification','decision','data_status','price','change_pct',
+              'price_asof','signal_asof','upstream_state','candidate_lifecycle','candidate_miss_count',
+              'gate_failures','gate_pending','rr','entry_price','stop_price','target_price','no_chase',
+              'spike_date','spike_age','re25_setup_state','re25_runtime_state','runtime_lane_state',
+              'runtime_upstream_state','expansion_phase','occurred_at','first_seen_at','last_seen_at')
+        return {k:clean(row.get(k)) for k in keep if k in row}
+
+    @staticmethod
+    def _trim_id_table(c, table, cap):
+        if cap <= 0:return 0
+        row=c.execute(f'SELECT id FROM {table} ORDER BY id DESC LIMIT 1 OFFSET ?', (cap-1,)).fetchone()
+        if not row:return 0
+        before=c.total_changes
+        c.execute(f'DELETE FROM {table} WHERE id < ?', (int(row[0]),))
+        return c.total_changes-before
+
+    def maintenance(self,current=None,force=False):
+        """Bound projection growth; never removes active candidates or tracking outcomes."""
+        current=current or now()
+        interval=max(3600,int(os.getenv('OPERATIONS_MAINTENANCE_INTERVAL_SECONDS','21600')))
+        if not force and time.monotonic()-self._last_maintenance<interval:
+            return dict(self.maintenance_stats)
+        try: events_cap=max(1000,int(os.getenv('OPERATIONS_EVENTS_MAX_ROWS','12000')))
+        except (TypeError,ValueError):events_cap=12000
+        try: cycles_cap=max(500,int(os.getenv('OPERATIONS_CYCLES_MAX_ROWS','4000')))
+        except (TypeError,ValueError):cycles_cap=4000
+        try: retention_days=max(7,int(os.getenv('OPERATIONS_RETENTION_DAYS','30')))
+        except (TypeError,ValueError):retention_days=30
+        try: outcome_days=max(30,int(os.getenv('OPERATIONS_OUTCOME_RETENTION_DAYS','180')))
+        except (TypeError,ValueError):outcome_days=180
+        cutoff=stamp(current-timedelta(days=retention_days))
+        outcome_cutoff=stamp(current-timedelta(days=outcome_days))
+        stats={'status':'READY','at':stamp(current),'events_deleted':0,'cycles_deleted':0,
+               'inactive_candidates_deleted':0,'closed_outcomes_deleted':0}
+        with self.connect() as c:
+            before=c.total_changes;c.execute('DELETE FROM events WHERE at < ?', (cutoff,));stats['events_deleted']+=c.total_changes-before
+            before=c.total_changes;c.execute('DELETE FROM cycles WHERE at < ?', (cutoff,));stats['cycles_deleted']+=c.total_changes-before
+            before=c.total_changes;c.execute('DELETE FROM candidates WHERE active=0 AND last_at < ?', (cutoff,));stats['inactive_candidates_deleted']+=c.total_changes-before
+            before=c.total_changes;c.execute("DELETE FROM outcomes WHERE status!='TRACKING_SIGNAL' AND COALESCE(exit_at,last_at,entry_at) < ?",(outcome_cutoff,));stats['closed_outcomes_deleted']+=c.total_changes-before
+            stats['events_deleted']+=self._trim_id_table(c,'events',events_cap)
+            stats['cycles_deleted']+=self._trim_id_table(c,'cycles',cycles_cap)
+            try:
+                free_pages=int(c.execute('PRAGMA freelist_count').fetchone()[0] or 0)
+                stats['freelist_pages_before']=free_pages
+                if free_pages>0:
+                    c.execute(f'PRAGMA incremental_vacuum({min(free_pages,4096)})')
+            except sqlite3.Error:
+                stats['incremental_vacuum']='UNAVAILABLE'
+        try:stats['db_bytes']=int(self.path.stat().st_size)
+        except OSError:stats['db_bytes']=None
+        self._last_maintenance=time.monotonic();self.maintenance_stats=stats
+        return dict(stats)
+
     def observe(self,market,rows,current):
         out={}
         with self.connect() as c:
@@ -697,7 +762,7 @@ class Store:
                 if event!='HOLD' or (row.get('price_asof')!=prev.get('price_asof') and row.get('data_status')=='READY'):
                     reason='; '.join(row.get('gate_failures',[])+row.get('gate_pending',[])) or 'ALL_REQUIRED_GATES_PASS'
                     c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',
-                              (at,market,lane,row['code'],row['name'],event,reason,json.dumps(clean(row),ensure_ascii=False)))
+                              (at,market,lane,row['code'],row['name'],event,reason,json.dumps(self._event_snapshot(row),ensure_ascii=False)))
                 c.execute('INSERT OR REPLACE INTO candidates VALUES(?,?,?,?,?,?,?,?,?,?)',
                           (key,market,lane,row['code'],1,json.dumps(clean(row),ensure_ascii=False),
                            row['first_seen_at'],at if source_proven or not old else old['last_at'],occ,sid))
@@ -732,7 +797,7 @@ class Store:
                 c.execute('UPDATE candidates SET active=0,last_at=? WHERE key=?',(at,key))
                 c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',
                           (at,market,lane,p['code'],p['name'],'EXIT',
-                           'VERIFIED_CODE_NOT_SELECTED_3_CYCLES',old['payload']))
+                           'VERIFIED_CODE_NOT_SELECTED_3_CYCLES',json.dumps(self._event_snapshot(p),ensure_ascii=False)))
     def track(self,market,quotes,current):
         with self.connect() as c:
             for r in c.execute("SELECT * FROM outcomes WHERE market=? AND status='TRACKING_SIGNAL'",(market,)).fetchall():
@@ -802,7 +867,7 @@ class Store:
             if event:
                 c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',
                           (at,old['market'],old['lane'],old['code'],payload.get('name','UNAVAILABLE'),
-                           event,reason or event,json.dumps(clean(payload),ensure_ascii=False)))
+                           event,reason or event,json.dumps(self._event_snapshot(payload),ensure_ascii=False)))
 
     def records(self,kind,market,limit=500,offset=0,lane=None):
         with self.connect() as c:
@@ -820,7 +885,7 @@ class Store:
         return {'total':total,'rows':records,'offset':offset,'limit':limit}
 
 class Operations:
-    def __init__(self,data_dir='/data/operations_v7',kis_base=None,history_path=None,fetch=get_json):
+    def __init__(self,data_dir='/data/operations_v9',kis_base=None,history_path=None,fetch=get_json):
         self.store=Store(Path(data_dir)/'operations.sqlite3')
         from .persistence import Checkpoint
         self.checkpoint=Checkpoint(self.store);self.checkpoint.restore()
@@ -839,7 +904,7 @@ class Operations:
         if time.monotonic()-float(cached.get('at') or 0.0)<120:
             return cached.get('known') or {}
         out={}
-        for raw in ('/data/results','/data/context_ledger','/data/operations','/data/operations_v7'):
+        for raw in ('/data/results','/data/context_ledger','/data/operations','/data/operations_v9'):
             p=Path(raw); total=0; files=0; truncated=False
             try:
                 if p.is_file():
@@ -862,7 +927,13 @@ class Operations:
         info=dict(self.checkpoint.info())
         info.update(operations_storage_mode=self.storage_mode,
                     operations_database_path=str(self.store.path),
-                    startup_storage_errors=list(self.startup_storage_errors))
+                    startup_storage_errors=list(self.startup_storage_errors),
+                    startup_storage_cleanup=getattr(self,'startup_storage_cleanup',None),
+                    operations_maintenance=dict(getattr(self.store,'maintenance_stats',{}) or {}))
+        try:
+            info['operations_database_bytes']=int(self.store.path.stat().st_size)
+        except OSError:
+            info['operations_database_bytes']=None
         # Cheap, read-only persistent-disk diagnostics.  Never recurse or delete.
         try:
             st=os.statvfs('/data')
@@ -1277,6 +1348,10 @@ class Operations:
                           pending_axes=dict(pending),lanes=lane_runtime_meta,scan_at=stamp(current),nxt_independent=True)
                 market_meta[market]=meta
                 with self.store.connect() as con:con.execute('INSERT INTO cycles(at,market,status,payload) VALUES(?,?,?,?)',(stamp(current),market,meta['status'],json.dumps(clean(meta),ensure_ascii=False)))
+            try:
+                self.store.maintenance(current)
+            except Exception as exc:
+                self.store.maintenance_stats={'status':'PENDING','error':type(exc).__name__,'at':stamp(current)}
             self.checkpoint.save()
             self.last_full_scan_at=current
             self.runtime={'version':VERSION,'scan_at':stamp(current),'candidate_refresh_at':stamp(current),

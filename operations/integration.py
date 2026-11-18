@@ -3,6 +3,7 @@ from .engine import Operations, number, code, dt, stamp, fresh, tri, valid_code
 from .trading_calendar import recent_sessions
 from pathlib import Path
 import json, hashlib, threading, os, sqlite3
+from .storage_maintenance import bootstrap_storage, start_periodic_storage_maintenance
 
 class _OperationsUnavailable:
     """Last-resort shell: keep the parent web service alive if Operations cannot start."""
@@ -20,12 +21,18 @@ class _OperationsUnavailable:
 
 def _new_operations():
     """Create Operations without allowing SQLite/storage failure to kill the parent web process."""
-    preferred=(os.getenv('OPERATIONS_DATA_DIR') or '/data/operations_v7').strip()
-    fallback=(os.getenv('OPERATIONS_FALLBACK_DIR') or '/tmp/operations_v7').strip()
+    preferred=(os.getenv('OPERATIONS_DATA_DIR') or '/data/operations_v9').strip()
+    fallback=(os.getenv('OPERATIONS_FALLBACK_DIR') or '/tmp/operations_v9').strip()
     errors=[]
     attempted=set()
-    choices=((preferred, 'PERSISTENT' if preferred.startswith('/data/') else 'EPHEMERAL_FALLBACK'),
-             (fallback, 'PERSISTENT' if fallback.startswith('/data/') else 'EPHEMERAL_FALLBACK'))
+    mount=Path(os.getenv('STORAGE_MOUNT_PATH','/data')).resolve()
+    def mode_for(raw):
+        try:
+            Path(raw).resolve().relative_to(mount)
+            return 'PERSISTENT'
+        except ValueError:
+            return 'EPHEMERAL_FALLBACK'
+    choices=((preferred, mode_for(preferred)), (fallback, mode_for(fallback)))
     for data_dir, mode in choices:
         if not data_dir or data_dir in attempted:
             continue
@@ -42,9 +49,21 @@ def _new_operations():
     return _OperationsUnavailable(errors)
 
 def attach(app):
+    # Run guarded storage recovery before creating the new persistent projection.
+    # Exact retired directories are removed only when no configured active path uses them.
+    try:
+        storage_bootstrap=bootstrap_storage()
+    except Exception as exc:
+        storage_bootstrap={'status':'PENDING','error':type(exc).__name__}
     ops=_new_operations()
     if isinstance(ops,_OperationsUnavailable):
+        ops.runtime['startup_storage_cleanup']=storage_bootstrap
         return ops
+    ops.startup_storage_cleanup=storage_bootstrap
+    try:
+        ops.storage_maintenance_thread=start_periodic_storage_maintenance()
+    except Exception:
+        ops.storage_maintenance_thread=None
     def alpha(market):
         # Read the venue's native snapshot. No switching of the collector's current venue.
         return app['load_latest_for_venue'](market) or {}
