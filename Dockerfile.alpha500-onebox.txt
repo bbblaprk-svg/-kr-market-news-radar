@@ -196,6 +196,17 @@ def market_session_now(now: Optional[datetime] = None) -> Dict[str, Any]:
     weekday = now.weekday() < 5
     if not weekday:
         return {"session": "CLOSED", "venue": "NXT", "exchgubun": "N", "scan_allowed": False}
+    # One-day CSAT schedule override. 2026-11-19 only; normal routing resumes automatically next day.
+    if now.date().isoformat() == "2026-11-19":
+        if hm < 10 * 60:
+            return {"session": "CSAT_WAITING", "venue": "KRX", "exchgubun": "K", "scan_allowed": False}
+        if 10 * 60 <= hm < 16 * 60 + 30:
+            return {"session": "KRX_REGULAR", "venue": "KRX", "exchgubun": "K", "scan_allowed": True}
+        if 16 * 60 + 30 <= hm < 16 * 60 + 40:
+            return {"session": "CSAT_TRANSITION", "venue": "NXT", "exchgubun": "N", "scan_allowed": False}
+        if 16 * 60 + 40 <= hm < 20 * 60:
+            return {"session": "NXT_AFTER", "venue": "NXT", "exchgubun": "N", "scan_allowed": True}
+        return {"session": "WAITING_NXT", "venue": "NXT", "exchgubun": "N", "scan_allowed": False}
     if 8 * 60 <= hm < 8 * 60 + 50:
         return {"session": "NXT_PRE", "venue": "NXT", "exchgubun": "N", "scan_allowed": True}
     if 8 * 60 + 50 <= hm < 9 * 60:
