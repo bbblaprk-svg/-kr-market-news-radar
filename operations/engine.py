@@ -10,7 +10,7 @@ from .trading_calendar import recent_sessions, last_closed_session, is_snapshot_
 from .universe_audit import classify_window, universe_membership_audit
 from .candidate_integrity import verified_scope, data_hold, native_nxt_minute_proven
 
-VERSION = 'KRX_NXT_OPERATIONS_V611_RENDER_SAFE'
+VERSION = 'KRX_NXT_OPERATIONS_V7_CLEAN_BOOTSAFE'
 KST = timezone(timedelta(hours=9))
 LANES = ('NXT_POST_ACCEL_LANE', 'V17_ACTION_PRE', 'ASYMMETRIC_RS', 'CAPITAL_HANDOFF', 'RE_EXPLOSION_25')
 VIEW_LANES = LANES + ('RS_HANDOFF',)
@@ -555,23 +555,32 @@ def core_gates(row, current):
     return row
 
 class Store:
-    """Append-only event ledger and sampled signal outcomes, separate from upstream files."""
+    """Append-only event ledger isolated from broker-owned source databases.
+
+    V7 deliberately does not force WAL or touch any legacy operations DB.
+    The caller selects a fresh data directory. SQLite stays on its default
+    rollback journal so Render filesystem quirks cannot fail startup merely
+    because a WAL/SHM sidecar cannot be created.
+    """
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS candidates(key TEXT PRIMARY KEY,market TEXT,lane TEXT,code TEXT,active INTEGER,payload TEXT,first_at TEXT,last_at TEXT,occurrences INTEGER,signal_id TEXT);
+    CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT,market TEXT,lane TEXT,code TEXT,name TEXT,event TEXT,reason TEXT,payload TEXT);
+    CREATE TABLE IF NOT EXISTS observations(key TEXT PRIMARY KEY,quote_at TEXT,payload TEXT);
+    CREATE TABLE IF NOT EXISTS outcomes(id TEXT PRIMARY KEY,market TEXT,lane TEXT,code TEXT,name TEXT,entry_at TEXT,entry_price REAL,stop REAL,target REAL,last_at TEXT,last_price REAL,mfe REAL,mae REAL,status TEXT,exit_at TEXT,exit_price REAL,exit_reason TEXT);
+    CREATE INDEX IF NOT EXISTS events_market_id ON events(market,id);
+    CREATE TABLE IF NOT EXISTS cycles(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT,market TEXT,status TEXT,payload TEXT);
+    """
     def __init__(self,path):
-        self.path=Path(path); self.path.parent.mkdir(parents=True,exist_ok=True)
-        # Render persistent disks may reject WAL journal files (disk I/O error).
-        # Keep SQLite on its filesystem-default journal mode and only set a
-        # connection-local busy timeout so startup can never fail on WAL setup.
+        self.path=Path(path)
+        self.path.parent.mkdir(parents=True,exist_ok=True)
         c=sqlite3.connect(self.path,timeout=15)
         try:
             c.execute('PRAGMA busy_timeout=15000')
-            c.executescript('''
-            CREATE TABLE IF NOT EXISTS candidates(key TEXT PRIMARY KEY,market TEXT,lane TEXT,code TEXT,active INTEGER,payload TEXT,first_at TEXT,last_at TEXT,occurrences INTEGER,signal_id TEXT);
-            CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT,market TEXT,lane TEXT,code TEXT,name TEXT,event TEXT,reason TEXT,payload TEXT);
-            CREATE TABLE IF NOT EXISTS observations(key TEXT PRIMARY KEY,quote_at TEXT,payload TEXT);
-            CREATE TABLE IF NOT EXISTS outcomes(id TEXT PRIMARY KEY,market TEXT,lane TEXT,code TEXT,name TEXT,entry_at TEXT,entry_price REAL,stop REAL,target REAL,last_at TEXT,last_price REAL,mfe REAL,mae REAL,status TEXT,exit_at TEXT,exit_price REAL,exit_reason TEXT);
-            CREATE INDEX IF NOT EXISTS events_market_id ON events(market,id);
-            CREATE TABLE IF NOT EXISTS cycles(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT,market TEXT,status TEXT,payload TEXT);
-            ''')
+            c.executescript(self.SCHEMA)
+            c.commit()
+            check=c.execute('PRAGMA integrity_check').fetchone()
+            if not check or check[0] != 'ok':
+                raise sqlite3.DatabaseError('OPERATIONS_DB_INTEGRITY_CHECK_FAILED')
         finally:
             c.close()
     @contextmanager
@@ -780,7 +789,7 @@ class Store:
         return {'total':total,'rows':records,'offset':offset,'limit':limit}
 
 class Operations:
-    def __init__(self,data_dir='/data/operations',kis_base=None,history_path=None,fetch=get_json):
+    def __init__(self,data_dir='/data/operations_v7',kis_base=None,history_path=None,fetch=get_json):
         self.store=Store(Path(data_dir)/'operations.sqlite3')
         from .persistence import Checkpoint
         self.checkpoint=Checkpoint(self.store);self.checkpoint.restore()
@@ -791,6 +800,14 @@ class Operations:
         self.state_refresh_seconds=max(20,int(os.getenv('OPERATIONS_STATE_REFRESH_SECONDS','30')))
         self.last_full_scan_at=None;self.last_state_refresh_at=None
         self.authority_audit={}  # KIS live vs immutable READY snapshot: per-market, per-call
+        self.storage_mode='PERSISTENT' if str(Path(data_dir)).startswith('/data/') else 'EPHEMERAL_FALLBACK'
+        self.startup_storage_errors=[]
+    def storage_info(self):
+        info=dict(self.checkpoint.info())
+        info.update(operations_storage_mode=self.storage_mode,
+                    operations_database_path=str(self.store.path),
+                    startup_storage_errors=list(self.startup_storage_errors))
+        return info
     def attach(self,**providers): self.providers=providers
     def local(self,name,*args):
         try:return self.providers[name](*args) if name in self.providers else {}
@@ -1165,7 +1182,7 @@ class Operations:
                           'candidate_refresh_seconds':self.candidate_refresh_seconds,
                           'state_refresh_at':stamp(self.last_state_refresh_at) if self.last_state_refresh_at else None,
                           'state_refresh_seconds':self.state_refresh_seconds,
-                          'markets':clean(market_meta),'storage':self.checkpoint.info(),
+                          'markets':clean(market_meta),'storage':self.storage_info(),
                           'status':'READY' if all(v['status']=='READY' for v in market_meta.values()) else 'PENDING'}
             return self.runtime
         finally:
@@ -1205,7 +1222,7 @@ class Operations:
         try:limit=max(20,min(10000,int((q.get('limit') or ['500'])[0])));offset=max(0,int((q.get('offset') or ['0'])[0]))
         except ValueError:return 400,{'error':'invalid pagination'}
         kind=u.path.rsplit('/',1)[-1]
-        if kind=='status':return 200,clean(self.runtime or {'status':'PENDING','storage':self.checkpoint.info(),'version':VERSION})
+        if kind=='status':return 200,clean(self.runtime or {'status':'PENDING','storage':self.storage_info(),'version':VERSION})
         if kind=='board':
             data=self.store.board(m,limit,offset,lane)
             rows=data['rows']
@@ -1220,6 +1237,6 @@ class Operations:
                               'state_refresh_stale_quotes':self.runtime.get('state_refresh_stale_quotes'),
                               'runtime_error':self.runtime.get('error'),'runtime_error_at':self.runtime.get('error_at'),
                               'runtime_error_context':self.runtime.get('error_context'),
-                              'storage':self.checkpoint.info(),'version':VERSION})
+                              'storage':self.storage_info(),'version':VERSION})
         if kind in ('events','outcomes'):return 200,clean(self.store.records(kind,m,limit,offset,lane))
         return 404,{'error':'not found'}

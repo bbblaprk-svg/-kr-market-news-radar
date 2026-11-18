@@ -2,10 +2,47 @@
 from .engine import Operations, number, code, dt, stamp, fresh, tri, valid_code
 from .trading_calendar import recent_sessions
 from pathlib import Path
-import json, hashlib, threading
+import json, hashlib, threading, os, sqlite3
+
+class _OperationsUnavailable:
+    """Last-resort shell: keep the parent web service alive if Operations cannot start."""
+    def __init__(self, errors):
+        self.errors=list(errors)
+        self.runtime={'status':'PENDING','error':'OPERATIONS_STARTUP_UNAVAILABLE','startup_storage_errors':self.errors}
+        self.thread=None
+        self.stop=threading.Event()
+    def attach(self, **providers):
+        return self
+    def start(self):
+        return None
+    def api(self, raw_path):
+        return 503, {'status':'PENDING','error':'OPERATIONS_STARTUP_UNAVAILABLE','startup_storage_errors':self.errors}
+
+def _new_operations():
+    """Create Operations without allowing SQLite/storage failure to kill the parent web process."""
+    preferred=(os.getenv('OPERATIONS_DATA_DIR') or '/data/operations_v7').strip()
+    fallback=(os.getenv('OPERATIONS_FALLBACK_DIR') or '/tmp/operations_v7').strip()
+    errors=[]
+    attempted=set()
+    for data_dir, mode in ((preferred,'PERSISTENT'),(fallback,'EPHEMERAL_FALLBACK')):
+        if not data_dir or data_dir in attempted:
+            continue
+        attempted.add(data_dir)
+        try:
+            ops=Operations(data_dir=data_dir)
+            ops.storage_mode=mode
+            ops.startup_storage_errors=list(errors)
+            return ops
+        except (sqlite3.Error,OSError) as exc:
+            errors.append(f'{mode}:{type(exc).__name__}:{exc}')
+        except Exception as exc:
+            errors.append(f'{mode}:{type(exc).__name__}')
+    return _OperationsUnavailable(errors)
 
 def attach(app):
-    ops=Operations()
+    ops=_new_operations()
+    if isinstance(ops,_OperationsUnavailable):
+        return ops
     def alpha(market):
         # Read the venue's native snapshot. No switching of the collector's current venue.
         return app['load_latest_for_venue'](market) or {}
