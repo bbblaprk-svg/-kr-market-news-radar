@@ -84,8 +84,9 @@ def attach(app):
             at=z.get('published_at') or z.get('published_at_kst')
             if not fresh(at,current,86400):continue
             state=z.get('state');meta=z.get('metadata') or {}
-            gate=state if state in ('PRICED_IN','SELL_THE_NEWS','NEGATIVE_CONFIRMED') else meta.get('news_gate')
-            if gate not in ('PRICED_IN','SELL_THE_NEWS','NEGATIVE_CONFIRMED','PASS','CLEAR','POSITIVE_CONFIRMED'):continue
+            supported=('NEGATIVE_CONFIRMED','OVERHANG','POSITIVE_NEWS_FAILED','PRICED_IN','SELL_THE_NEWS','NEGATIVE_ABSORBED','PASS','CLEAR','POSITIVE_CONFIRMED')
+            gate=state if state in supported else meta.get('news_gate')
+            if gate not in supported:continue
             out[c]={'news_gate':gate,'news_published_at':at,'news_source':z.get('url') or z.get('source')}
         return out
     from .history_repair import KRXHistoryRepair

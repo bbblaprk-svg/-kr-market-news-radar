@@ -10,11 +10,13 @@ from .trading_calendar import recent_sessions, last_closed_session, is_snapshot_
 from .universe_audit import classify_window, universe_membership_audit
 from .candidate_integrity import verified_scope, data_hold, native_nxt_minute_proven
 
-VERSION = 'KRX_NXT_OPERATIONS_V5_EVIDENCE_LEDGER'
+VERSION = 'KRX_NXT_OPERATIONS_V61_RUNTIME_SAFE'
 KST = timezone(timedelta(hours=9))
 LANES = ('NXT_POST_ACCEL_LANE', 'V17_ACTION_PRE', 'ASYMMETRIC_RS', 'CAPITAL_HANDOFF', 'RE_EXPLOSION_25')
+VIEW_LANES = LANES + ('RS_HANDOFF',)
 VETO = {'RISK_OFF_ACCEL', 'PROGRAM_SELL_ACCEL', 'BREADTH_COLLAPSE'}
-NEWS_BLOCK = {'PRICED_IN', 'SELL_THE_NEWS', 'NEGATIVE_CONFIRMED'}
+NEWS_BLOCK = {'PRICED_IN', 'SELL_THE_NEWS', 'NEGATIVE_CONFIRMED', 'OVERHANG', 'POSITIVE_NEWS_FAILED'}
+NEWS_PASS = {'PASS', 'CLEAR', 'POSITIVE_CONFIRMED', 'NEGATIVE_ABSORBED'}
 RANK = {'PRIME': 0, 'ARMED': 1, 'PRE_EXPLOSION_ARMED': 2, 'WATCH': 3, 'REJECT': 4}
 MISSING = ('UNAVAILABLE', 'PENDING', '', None)
 
@@ -491,7 +493,7 @@ def core_gates(row, current):
     """All required gates must pass. Unknown is never a successful observation."""
     gates={}
     gates['MARKET_STATE']=False if row.get('market_state') in VETO else (True if row.get('market_state') in ('NORMAL','RISK_ON','NEUTRAL') else None)
-    gates['NEWS']=False if row.get('news_gate') in NEWS_BLOCK else (True if row.get('news_gate') in ('PASS','CLEAR','POSITIVE_CONFIRMED') else None)
+    gates['NEWS']=False if row.get('news_gate') in NEWS_BLOCK else (True if row.get('news_gate') in NEWS_PASS else None)
     gates['NO_CHASE']=None if number(row.get('change_pct')) is None else number(row['change_pct'])<=5
     if row.get('no_chase') is True: gates['NO_CHASE']=False
     if row.get('news_gate')=='PRICED_IN': gates['NO_CHASE']=False
@@ -539,7 +541,12 @@ def core_gates(row, current):
     elif gates['LANE_SETUP'] is True and gates['DATA_FRESH'] and gates['SIGNAL_FRESH'] and gates['SESSION'] and not pending and set(fail)<= {'ENTRY_CONFIRM'}:
         classification='ARMED'
     else: classification='WATCH'
-    row.update(classification=classification,decision='PENDING' if pending or any(k in fail for k in ('DATA_FRESH','SIGNAL_FRESH','SESSION','NXT_INDEPENDENT_SESSION','KRX_DAILY_CURRENT','KRX_UNIVERSE_MATCH')) else classification,
+    if classification=='PRIME': expansion_phase='ENTRY_CONFIRMED'
+    elif row.get('re25_runtime_state')=='REARMED': expansion_phase='REARMED_ENTRY_WINDOW'
+    elif gates.get('NO_CHASE') is False or row.get('fast_new_spike') is True or row.get('re25_already_expanded') is True: expansion_phase='ALREADY_EXPANDED_NO_CHASE'
+    elif classification in ('ARMED','PRE_EXPLOSION_ARMED'): expansion_phase='PRE_ENTRY_SETUP'
+    else: expansion_phase='PENDING'
+    row.update(classification=classification,expansion_phase=expansion_phase,decision='PENDING' if pending or any(k in fail for k in ('DATA_FRESH','SIGNAL_FRESH','SESSION','NXT_INDEPENDENT_SESSION','KRX_DAILY_CURRENT','KRX_UNIVERSE_MATCH')) else classification,
                data_status='PENDING' if pending or not gates['DATA_FRESH'] or not gates['SIGNAL_FRESH'] or gates.get('KRX_DAILY_CURRENT') is False or ('KRX_UNIVERSE_MATCH' in gates and gates['KRX_UNIVERSE_MATCH'] is not True) else 'READY',
                gate_failures=fail, gate_pending=pending,
                promotion_conditions=[k+'=PASS' for k,v in row['gates'].items() if v!='PASS'],
@@ -551,7 +558,13 @@ class Store:
     """Append-only event ledger and sampled signal outcomes, separate from upstream files."""
     def __init__(self,path):
         self.path=Path(path); self.path.parent.mkdir(parents=True,exist_ok=True)
-        with self.connect() as c:
+        # Configure journaling once at startup. Re-running journal_mode for every
+        # dashboard read can contend with scan/state writer threads.
+        c=sqlite3.connect(self.path,timeout=15)
+        try:
+            c.execute('PRAGMA busy_timeout=15000')
+            c.execute('PRAGMA journal_mode=WAL')
+            c.execute('PRAGMA synchronous=NORMAL')
             c.executescript('''
             CREATE TABLE IF NOT EXISTS candidates(key TEXT PRIMARY KEY,market TEXT,lane TEXT,code TEXT,active INTEGER,payload TEXT,first_at TEXT,last_at TEXT,occurrences INTEGER,signal_id TEXT);
             CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT,market TEXT,lane TEXT,code TEXT,name TEXT,event TEXT,reason TEXT,payload TEXT);
@@ -560,12 +573,14 @@ class Store:
             CREATE INDEX IF NOT EXISTS events_market_id ON events(market,id);
             CREATE TABLE IF NOT EXISTS cycles(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT,market TEXT,status TEXT,payload TEXT);
             ''')
+        finally:
+            c.close()
     @contextmanager
     def connect(self):
-        c=sqlite3.connect(self.path,timeout=5)
+        c=sqlite3.connect(self.path,timeout=15)
         try:
             c.row_factory=sqlite3.Row
-            c.execute('PRAGMA journal_mode=WAL')
+            c.execute('PRAGMA busy_timeout=15000')
             with c:
                 yield c
         finally:
@@ -693,7 +708,9 @@ class Store:
         """Bounded dashboard read. RE25 event-only rows stay in ledger, not buy board."""
         limit=max(20,min(300,int(limit)))
         where='market=? AND active=1';params=[market]
-        if lane:
+        if lane=='RS_HANDOFF':
+            where+=' AND lane IN (?,?)';params.extend(['ASYMMETRIC_RS','CAPITAL_HANDOFF'])
+        elif lane:
             where+=' AND lane=?';params.append(lane)
         re25_only=(lane=='RE_EXPLOSION_25')
         with self.connect() as c:
@@ -752,7 +769,10 @@ class Store:
         with self.connect() as c:
             where='market=?';params=[market]
             if kind=='candidates':where+=' AND active=1'
-            if lane:where+=' AND lane=?';params.append(lane)
+            if lane=='RS_HANDOFF':
+                where+=' AND lane IN (?,?)';params.extend(['ASYMMETRIC_RS','CAPITAL_HANDOFF'])
+            elif lane:
+                where+=' AND lane=?';params.append(lane)
             total=c.execute(f'SELECT COUNT(*) FROM {kind} WHERE {where}',params).fetchone()[0]
             order='id DESC' if kind in ('events','cycles') else ('entry_at DESC' if kind=='outcomes' else 'last_at DESC')
             records=[dict(r) for r in c.execute(f'SELECT * FROM {kind} WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?',params+[limit,offset])]
@@ -1168,16 +1188,21 @@ class Operations:
                         self.refresh_candidate_states()
                         next_state=time.monotonic()+self.state_refresh_seconds
                 except Exception as exc:
-                    self.runtime={'status':'PENDING','error':type(exc).__name__,'at':stamp(),
-                                  'candidate_refresh_seconds':self.candidate_refresh_seconds,
-                                  'state_refresh_seconds':self.state_refresh_seconds}
+                    # Preserve the last good market/scan payload. A transient
+                    # SQLite/provider fault must not erase candidate metadata.
+                    previous=dict(self.runtime or {})
+                    previous.update(status='PENDING',error=type(exc).__name__,error_at=stamp(),
+                                    error_context=('FULL_SCAN' if mono>=next_full else 'STATE_REFRESH'),
+                                    candidate_refresh_seconds=self.candidate_refresh_seconds,
+                                    state_refresh_seconds=self.state_refresh_seconds)
+                    self.runtime=previous
                 self.stop.wait(2)
         self.thread=threading.Thread(target=loop,daemon=True,name='operations-readonly');self.thread.start()
     def api(self,raw_path):
         u=urlparse(raw_path);q=parse_qs(u.query);m=(q.get('market') or ['KRX'])[0]
         if m not in ('KRX','NXT'):return 400,{'error':'market must be KRX or NXT'}
         lane=(q.get('lane') or [None])[0]
-        if lane and lane not in LANES:return 400,{'error':'invalid lane'}
+        if lane and lane not in VIEW_LANES:return 400,{'error':'invalid lane'}
         try:limit=max(20,min(10000,int((q.get('limit') or ['500'])[0])));offset=max(0,int((q.get('offset') or ['0'])[0]))
         except ValueError:return 400,{'error':'invalid pagination'}
         kind=u.path.rsplit('/',1)[-1]
@@ -1194,6 +1219,8 @@ class Operations:
                               'state_refresh_seconds':self.runtime.get('state_refresh_seconds',self.state_refresh_seconds),
                               'state_refresh_counts':self.runtime.get('state_refresh_counts',{}),
                               'state_refresh_stale_quotes':self.runtime.get('state_refresh_stale_quotes'),
+                              'runtime_error':self.runtime.get('error'),'runtime_error_at':self.runtime.get('error_at'),
+                              'runtime_error_context':self.runtime.get('error_context'),
                               'storage':self.checkpoint.info(),'version':VERSION})
         if kind in ('events','outcomes'):return 200,clean(self.store.records(kind,m,limit,offset,lane))
         return 404,{'error':'not found'}
