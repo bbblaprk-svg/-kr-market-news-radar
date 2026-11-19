@@ -59,8 +59,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     VOLUME_DIRECTION_ENABLED=true \
     VOLUME_DIRECTION_TOP_N=20 \
     VOLUME_DIRECTION_HISTORY_MAX=200 \
-    VOLUME_DIRECTION_HISTORY_PATH=/data/results/가격거래량_발생기록_200.json \
-    VOLUME_DIRECTION_STATE_PATH=/data/results/가격거래량_상태복원.json \
+    VOLUME_DIRECTION_HISTORY_PATH=/data/critical_state/가격거래량_발생기록_200.json \
+    VOLUME_DIRECTION_STATE_PATH=/data/critical_state/가격거래량_상태복원.json \
     VOLUME_DIRECTION_STATE_BARS=40 \
     VOLUME_DIRECTION_STATE_SAVE_SECONDS=60 \
     VOLUME_DIRECTION_MIN_BARS=9 \
@@ -114,6 +114,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     SAVE_FULL_CSV=false \
     ALPHA500_DATA_DIR=/data \
     RESULT_DIR=/data/results \
+    CRITICAL_STATE_DIR=/data/critical_state \
+    NXT_EOD_HOLD_PATH=/data/critical_state/nxt_eod_hold.json \
+    INDEPENDENT_LEADER_STATE_DIR=/data/critical_state/independent_leader \
     COMMON_GATE_INDEPENDENT_ENABLED=true \
     COMMON_GATE_POLL_SECONDS=15 \
     COMMON_GATE_STALE_SECONDS=900 \
@@ -123,7 +126,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 RUN pip install --no-cache-dir "numpy>=1.26" "pandas>=2.1" "requests>=2.31" "websocket-client>=1.8" "psycopg[binary]>=3.2"
-RUN mkdir -p /data/results
+RUN mkdir -p /data/results /data/critical_state /data/critical_state/independent_leader
 
 # embedded: 오백종목_섹터에너지_알파하이킨아시_통합_V1_0.py
 COPY <<'ALPHA500_E89588D5222C' /app/오백종목_섹터에너지_알파하이킨아시_통합_V1_0.py
@@ -3294,6 +3297,40 @@ MASTER = os.getenv("UNIVERSE_MASTER", "섹터마스터_500종목_V3.csv")
 RESULT_DIR = Path(os.getenv("RESULT_DIR", "/data/results"))
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("RESULT_DIR", str(RESULT_DIR))
+# CRITICAL_STATE_PERSISTENCE_V1: bounded continuity state only; regenerable results remain in RESULT_DIR.
+CRITICAL_STATE_DIR = Path(os.getenv("CRITICAL_STATE_DIR", "/data/critical_state"))
+CRITICAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _critical_state_migrate_once():
+    """Copy legacy persistent state to the bounded critical-state directory once."""
+    pairs = [
+        (Path("/data/fullmarket_v3_state.json"), Path(os.getenv("V3_STATE_FILE", str(CRITICAL_STATE_DIR / "fullmarket_v3_state.json")))),
+        (Path("/data/results/가격거래량_발생기록_200.json"), Path(os.getenv("VOLUME_DIRECTION_HISTORY_PATH", str(CRITICAL_STATE_DIR / "가격거래량_발생기록_200.json")))),
+        (Path("/data/results/가격거래량_상태복원.json"), Path(os.getenv("VOLUME_DIRECTION_STATE_PATH", str(CRITICAL_STATE_DIR / "가격거래량_상태복원.json")))),
+        (Path("/data/results/NXT_V5_SESSION_STATE.json.gz"), Path(os.getenv("NXT_V51_SESSION_STATE_PATH", str(CRITICAL_STATE_DIR / "NXT_V5_SESSION_STATE.json.gz")))),
+        (Path("/data/results/nxt_eod_hold.json"), Path(os.getenv("NXT_EOD_HOLD_PATH", str(CRITICAL_STATE_DIR / "nxt_eod_hold.json")))),
+    ]
+    leader_dir = Path(os.getenv("INDEPENDENT_LEADER_STATE_DIR", str(CRITICAL_STATE_DIR / "independent_leader")))
+    for venue in ("KRX", "NXT"):
+        pairs.extend([
+            (Path(f"/data/results/독립선도주_발생기록_{venue}_200.json"), leader_dir / f"독립선도주_발생기록_{venue}_200.json"),
+            (Path(f"/data/results/독립선도주_상태_{venue}.json"), leader_dir / f"독립선도주_상태_{venue}.json"),
+        ])
+    migrated = []
+    for src, dst in pairs:
+        try:
+            if dst.exists() or not src.exists() or src.resolve() == dst.resolve():
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dst.with_name(dst.name + ".migrate.tmp")
+            tmp.write_bytes(src.read_bytes())
+            tmp.replace(dst)
+            migrated.append({"from": str(src), "to": str(dst), "bytes": dst.stat().st_size})
+        except Exception:
+            continue
+    return migrated
+
+CRITICAL_STATE_MIGRATED = _critical_state_migrate_once()
 os.environ.setdefault("ALPHA500_DATA_DIR", "/data")
 os.environ.setdefault("SCAN_PROVIDER", "ls")
 os.environ.setdefault("DEEP_PROVIDER", "ls")
@@ -3367,7 +3404,7 @@ STATE = {
     "preclose_last_error": None,
     "nxt_eod_hold_at": None,
     "nxt_eod_hold_trade_date": None,
-    "nxt_eod_hold_status": "LOCAL_BEST_EFFORT",
+    "nxt_eod_hold_status": "PERSISTENT_DISK",
     "lazy_history_status": "STARTING",
     "lazy_history_last_symbol": None,
     "lazy_history_last_error": None,
@@ -5030,7 +5067,9 @@ def _preclose_path(venue):
 
 
 def _nxt_eod_hold_path():
-    return RESULT_DIR / "nxt_eod_hold.json"
+    p = Path(os.getenv("NXT_EOD_HOLD_PATH", str(CRITICAL_STATE_DIR / "nxt_eod_hold.json")))
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 def _read_nxt_eod_hold():
@@ -5050,7 +5089,7 @@ def _read_nxt_eod_hold():
 def save_nxt_eod_hold():
     """마지막 NXT 판정을 익일 첫 정상 NXT 판정 전까지 HOLD한다.
 
-    /data가 비영속인 Render Free 재시작까지는 보장할 수 없으므로 상태에 LOCAL_BEST_EFFORT를 명시한다.
+    /data 영구 디스크의 bounded critical-state 파일로 저장하므로 재배포/재시작 후에도 복원한다.
     """
     global NXT_EOD_HOLD
     summary = load_latest_for_venue("NXT")
@@ -5060,7 +5099,7 @@ def save_nxt_eod_hold():
         "captured_at_kst": now_kst_iso(),
         "trade_date": str(summary.get("timestamp_kst") or now_kst_iso())[:10],
         "venue": "NXT",
-        "persistence": "LOCAL_BEST_EFFORT",
+        "persistence": "PERSISTENT_DISK",
         "summary": summary,
         "close_bet_nxt": _read_close_bet("NXT"),
     }
@@ -5252,12 +5291,18 @@ def _independent_leader_table(summary, limit=10):
     return rows[:max(1,int(limit))]
 
 
+def _independent_leader_state_dir():
+    p = Path(os.getenv("INDEPENDENT_LEADER_STATE_DIR", str(CRITICAL_STATE_DIR / "independent_leader")))
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def _independent_leader_history_path(venue):
-    return RESULT_DIR / f"독립선도주_발생기록_{str(venue or 'KRX').upper()}_200.json"
+    return _independent_leader_state_dir() / f"독립선도주_발생기록_{str(venue or 'KRX').upper()}_200.json"
 
 
 def _independent_leader_state_path(venue):
-    return RESULT_DIR / f"독립선도주_상태_{str(venue or 'KRX').upper()}.json"
+    return _independent_leader_state_dir() / f"독립선도주_상태_{str(venue or 'KRX').upper()}.json"
 
 
 def _leader_read_json(path, default):
@@ -6405,8 +6450,10 @@ def state_copy():
     d["close_bet_score_role"] = "RANK_ONLY" if _hard_close else "BUY_THRESHOLD"
     d["preclose_rescan_enabled"] = os.getenv("PRECLOSE_RESCAN_ENABLED", "true").strip().lower() in {"1","true","yes","y","on"}
     d["nxt_eod_hold_enabled"] = os.getenv("NXT_EOD_HOLD_ENABLED", "true").strip().lower() in {"1","true","yes","y","on"}
-    d["nxt_eod_persistence"] = "LOCAL_BEST_EFFORT"
-    d["nxt_eod_persistence_warning"] = "Render ephemeral filesystem restart/spin-down may remove local HOLD unless persistent storage is configured"
+    d["nxt_eod_persistence"] = "PERSISTENT_DISK"
+    d["nxt_eod_persistence_warning"] = None
+    d["critical_state_dir"] = str(CRITICAL_STATE_DIR)
+    d["critical_state_migrated_count"] = len(CRITICAL_STATE_MIGRATED)
     d["now_kst"] = now_kst_iso()
     live = market_session_now()
     d["expected_venue"] = live.get("venue")
@@ -22910,7 +22957,7 @@ ENV FULLMARKET_V3_ENABLED=true \
     V3_KIS_BASE=https://quant-signal-v3-7-51-clean2.onrender.com \
     V3_LS_BASE=https://kr-market-news-radar.onrender.com \
     V3_HISTORY_DB=/data/alpha500_bars.sqlite3 \
-    V3_STATE_FILE=/data/fullmarket_v3_state.json \
+    V3_STATE_FILE=/data/critical_state/fullmarket_v3_state.json \
     V3_OUTPUT_DIR=/data/results/fullmarket_v3
 
 COPY <<'FULLMARKET_V3_MAIN_PY' /app/ALPHA_FULLMARKET_SELECT_THEN_ENTRY_V3_1.py
@@ -30130,7 +30177,7 @@ ENV NXT_V51_ENABLED=true \
     VOLUME_DIRECTION_MAX_BARS=800 \
     NXT_V51_SESSION_STATE_BARS=800 \
     NXT_V51_SESSION_STATE_SAVE_SECONDS=90 \
-    NXT_V51_SESSION_STATE_PATH=/data/results/NXT_V5_SESSION_STATE.json.gz
+    NXT_V51_SESSION_STATE_PATH=/data/critical_state/NXT_V5_SESSION_STATE.json.gz
 
 COPY <<'NXT_V51_BRIDGE_PATCH_EOF' /tmp/apply_nxt_v51_bridge.py
 #!/usr/bin/env python3
@@ -31714,6 +31761,7 @@ RUN python -m py_compile /tmp/apply_nxt_v522_runtime_correction.py /tmp/nxt_v522
 
 # NXT_V5_2_3_CAP700_THRESHOLD_PATCH
 
+# CRITICAL_STATE_PERSISTENCE_V1_BUILD_MARKER
 # OPERATIONS_PROJECTION_V1: additive same-service dashboard; all earlier collector layers unchanged.
 COPY operations /app/operations
 RUN python /app/operations/install.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
