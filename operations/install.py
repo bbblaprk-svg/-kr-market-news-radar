@@ -8,7 +8,7 @@ def patch(path):
     if MARK in s:return
     anchor='\nclass Handler(BaseHTTPRequestHandler):\n'
     if s.count(anchor)!=1:raise RuntimeError('Handler anchor mismatch')
-    s=s.replace(anchor,'\n# '+MARK+'\nfrom operations.integration import attach as _operations_attach\nOPERATIONS = _operations_attach(globals())\n'+anchor,1)
+    s=s.replace(anchor,'\n# '+MARK+'\nfrom operations.runtime_hotfix_v10 import apply as _operations_runtime_hotfix_v10\n_operations_runtime_hotfix_v10()\nfrom operations.integration import attach as _operations_attach\nOPERATIONS = _operations_attach(globals())\n'+anchor,1)
     anchor='    def do_GET(self):\n        path = urlparse(self.path).path\n'
     if s.count(anchor)!=1:raise RuntimeError('GET anchor mismatch')
     routes='''        # OPERATIONS_PROJECTION_V1_ROUTES: same process, no collector mutation.
