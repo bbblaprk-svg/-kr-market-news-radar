@@ -599,10 +599,58 @@ def _install_hvtb(e):
         sign_turn = bool(px is not None and cx is not None and px <= 0 < cx)
         rs_turn = bool(explicit or sign_turn)
 
+        # ORIGINAL HVTB evidence adapter.  The selector itself consumes
+        # TRANSFER / ABSORPTION / ARMED booleans; do not collapse those
+        # concepts into one parent-lane flag.  Each axis is derived from
+        # observable evidence and OR-combined exactly as the original design.
         pos = range_pos(hi, lo, cl)
-        absorption = bool(pos is not None and pos >= 0.60 and cur is not None and cur > 0)
-        tr = transfer(fmrow)
-        ar = armed(fmrow)
+        op = e.pick(r, "open_price", "open") if (live or quote_bridged) else ((bars[-1] if bars else {}).get("open"))
+
+        # Previous completed daily reference for higher-low / volume re-inflow.
+        # When the latest KIS quote bridges an LS one-session lag, bars[-1] is
+        # the previous session.  Otherwise bars[-2] is the previous session.
+        prev_bar = {}
+        if bars:
+            if live or quote_bridged:
+                prev_bar = bars[-1]
+            elif len(bars) >= 2:
+                prev_bar = bars[-2]
+        prev_low = n(prev_bar.get("low"))
+        prev_vol = n(prev_bar.get("volume"))
+        cur_vol = n(e.pick(r, "volume")) if (live or quote_bridged) else n((bars[-1] if bars else {}).get("volume"))
+        volume_reinflow_ratio = (cur_vol / prev_vol) if (cur_vol is not None and prev_vol and prev_vol > 0) else None
+
+        high_range_close = bool(pos is not None and pos >= 0.60 and cur is not None and cur > 0)
+        close_recovery = bool(
+            pos is not None and pos >= 0.50 and cur is not None and cur > 0
+            and n(cl) is not None and n(op) is not None and n(cl) >= n(op)
+        )
+        higher_low = bool(n(lo) is not None and prev_low is not None and n(lo) >= prev_low)
+        supply_absorption = bool(
+            volume_reinflow_ratio is not None and volume_reinflow_ratio >= 1.20
+            and cur is not None and cur > 0 and pos is not None and pos >= 0.50
+        )
+        absorption_evidence = {
+            "close_recovery": close_recovery,
+            "high_range_close": high_range_close,
+            "higher_low": higher_low,
+            "supply_absorption": supply_absorption,
+        }
+        absorption = any(absorption_evidence.values())
+
+        parent_handoff = transfer(fmrow)
+        volume_reinflow = bool(volume_reinflow_ratio is not None and volume_reinflow_ratio >= 1.20 and cur is not None and cur > 0)
+        flow_improving = bool(
+            (aux or {}).get("flow_reversal") is True
+            or (aux or {}).get("capital_handoff_confirmed") is True
+        )
+        transfer_evidence = {
+            "capital_handoff": parent_handoff,
+            "volume_reinflow": volume_reinflow,
+            "flow_improving": flow_improving,
+        }
+        tr = any(transfer_evidence.values())
+        ar = bool(tr and absorption)
 
         # Original hard veto is generic. Only explicit, confirmed inputs are used.
         gate = str((newsrow or {}).get("news_gate") or "").upper()
@@ -649,7 +697,10 @@ def _install_hvtb(e):
             "market_cap_krw": cap_100m * 100_000_000 if cap_100m is not None else None,
             "market_state": r.get("market_state") or "NORMAL",
             "transfer_detected": tr,
+            "transfer_evidence": transfer_evidence,
+            "volume_reinflow_ratio": volume_reinflow_ratio,
             "absorption_confirmed": absorption,
+            "absorption_evidence": absorption_evidence,
             "armed_structure": ar,
             "overhang_veto": overhang_veto,
             "overhang_reasons": veto_reasons,
@@ -706,10 +757,13 @@ def _install_hvtb(e):
         mcur, mprev = market_proxy(rows, hist, live, expected)
         qmap = {e.code(r): r for r in rows}
         pool, evaluated = [], set()
-        for c, fmrow in fmrows.items():
-            r = qmap.get(c)
-            if not r:
+        # Zero-Base HVTB selection: evaluate the KIS authority universe itself.
+        # FULLMARKET/CAPITAL_HANDOFF is evidence, not an input-universe gate.
+        for r in rows:
+            c = e.code(r)
+            if not e.valid_code(c):
                 continue
+            fmrow = fmrows.get(c, {})
             cap = n(r.get("market_cap_100m"))
             if cap is not None and cap < 700:
                 continue
@@ -768,7 +822,7 @@ def _install_hvtb(e):
                 if k.startswith("hvtb_") or k in (
                     "transfer_detected", "absorption_confirmed", "armed_structure", "rs_turn", "rs_turn_explicit",
                     "rs_prev_excess_pct", "rs_current_excess_pct", "market_proxy_prev_pct", "market_proxy_current_pct",
-                    "range_position", "focus_priority", "base_priority", "fresh_catalyst", "catalyst_score", "overhang_veto", "overhang_reasons", "rs_turn_proxy", "selector_version", "history_current_for_hvtb", "history_quote_bridge", "history_reference_date", "bos_level", "retest_low",
+                    "range_position", "focus_priority", "base_priority", "fresh_catalyst", "catalyst_score", "overhang_veto", "overhang_reasons", "rs_turn_proxy", "selector_version", "history_current_for_hvtb", "history_quote_bridge", "history_reference_date", "transfer_evidence", "volume_reinflow_ratio", "absorption_evidence", "bos_level", "retest_low",
                 ):
                     base[k] = v
             # ACTION evidence is produced by LS t8412 and must survive base(),
@@ -782,19 +836,22 @@ def _install_hvtb(e):
             base = e.core_gates(base, current)
             base["unavailable_fields"] = [k for k in ("vwap", "rvol", "execution_strength", "rs5", "rs20", "foreign_net", "institution_net", "program_net", "entry_price", "stop_price", "target_price") if base.get(k) is None]
             outrows.append(base)
-        proven = evaluated if fm_fresh else set()
+        # Every evaluated code came from the current KIS authority universe.
+        # A stale/missing FULLMARKET sidecar must not make the independent HVTB
+        # lane disappear; it only removes one TRANSFER evidence source.
+        proven = set(evaluated)
         ops.store.reconcile("KRX", LANE, outrows, proven, current)
         if qmap:
             ops.store.track("KRX", qmap, current)
         lane_meta = {
             "observed": len(outrows),
-            "status": "READY" if fm_fresh else "PENDING",
+            "status": "READY" if rows else "PENDING",
             "prime": sum(z.get("classification") == "PRIME" for z in outrows),
             "focus": sum(z.get("hvtb_state") == "HVTB_FOCUS" for z in outrows),
             "action": sum(z.get("hvtb_action_state") == "ACTION" for z in outrows),
             "evaluated_scope": len(proven),
-            "universe_complete": False,
-            "source": "HVTB_V1_6_ORIGINAL_CLASSIFY_FOCUS + KIS_AUTHORITY + FULLMARKET_HANDOFF + LS_T8412_TOP_FOCUS",
+            "universe_complete": bool(rows),
+            "source": "HVTB_V1_6_ORIGINAL_CLASSIFY_FOCUS + KIS_ZERO_BASE_AUTHORITY + OPTIONAL_FULLMARKET_HANDOFF + LS_T8412_TOP_FOCUS",
         }
         markets = (ops.runtime or {}).setdefault("markets", {})
         krx = markets.setdefault("KRX", {})
