@@ -485,64 +485,205 @@ def _install_hvtb(e):
             return {}, False, obj if isinstance(obj, dict) else {}
         return {e.code(z): z for z in obj.get("candidates", []) or [] if isinstance(z, dict) and e.valid_code(e.code(z))}, True, obj
 
-    def market_proxy(rows, hist, live):
+    # ------------------------------------------------------------------
+    # ORIGINAL HVTB V1.6 SELECTION ENGINE
+    # Source of truth: HVTB_V1_6.py::classify_focus()
+    # This is generic. No stock name/code is hard-coded.
+    # ------------------------------------------------------------------
+    BLOCK_MARKET_STATES = {"RISK_OFF_ACCEL", "PROGRAM_SELL_ACCEL", "BREADTH_COLLAPSE"}
+
+    def classify_focus_original(ctx):
+        """Exact decision order of the original HVTB V1.6 selector."""
+        if not ctx.get("common_stock", True):
+            return "REJECT", "NOT_COMMON_STOCK", None
+
+        cap_krw = n(ctx.get("market_cap_krw"))
+        if cap_krw is None:
+            return "PENDING", "MARKET_CAP_UNAVAILABLE", None
+        if cap_krw < 70_000_000_000:
+            return "REJECT", "MARKET_CAP_BELOW_MINIMUM", None
+
+        market_state = str(ctx.get("market_state") or "NORMAL").upper()
+        if market_state in BLOCK_MARKET_STATES:
+            return "MARKET_BLOCK", market_state, None
+
+        if not ctx.get("transfer_detected"):
+            return "WATCH", "NO_TRANSFER", None
+        if not ctx.get("absorption_confirmed"):
+            return "WATCH", "TRANSFER_WITHOUT_ABSORPTION", None
+        if not ctx.get("armed_structure"):
+            return "WATCH", "NOT_ARMED", None
+
+        if ctx.get("overhang_veto"):
+            reasons = [str(x) for x in (ctx.get("overhang_reasons") or []) if str(x)]
+            reason = "OVERHANG_VETO" + ((":" + "|".join(reasons)) if reasons else "")
+            return "VETO_REJECT", reason, None
+
+        if not ctx.get("rs_turn"):
+            return "ARMED", "WAIT_RS_TURN", None
+
+        base_priority = n(ctx.get("base_priority")) or 0.0
+        catalyst_bonus = 0.0
+        if ctx.get("fresh_catalyst"):
+            catalyst_bonus = max(0.0, n(ctx.get("catalyst_score")) or 0.0)
+        return "HVTB_FOCUS", "RS_TURN_AND_VETO_CLEAR", base_priority + catalyst_bonus
+
+    def quote_bridge_return(r, bars, expected, live):
+        """Use KIS authority quote as the latest closed/current bar when LS daily lags.
+
+        This changes only the data adapter, not HVTB selection rules. It prevents an
+        LS one-session lag from suppressing the original selector when KIS already
+        has the authoritative latest price/OHLC.
+        """
+        last = str((bars[-1].get("date") if bars else "") or "")[:10] or None
+        hist_current = bool(expected and last == expected)
+        if live:
+            cur = n(r.get("change_pct"))
+            if cur is None and bars:
+                prev_close = n(bars[-1].get("close"))
+                price = n(e.pick(r, "price", "close"))
+                if prev_close and price is not None:
+                    cur = (price / prev_close - 1.0) * 100.0
+            prev = bar_ret(bars, -1)
+            return cur, prev, False, last
+
+        if hist_current:
+            return bar_ret(bars, -1), bar_ret(bars, -2), True, last
+
+        # Pre-open/closed session with LS one day behind: KIS current quote is the
+        # latest closed-session authority. Bridge it against the last LS close.
+        prev_close = n(bars[-1].get("close")) if bars else None
+        price = n(e.pick(r, "price", "close"))
+        cur = (price / prev_close - 1.0) * 100.0 if prev_close and price is not None else None
+        prev = bar_ret(bars, -1)
+        bridged = bool(cur is not None and expected and last and last < str(expected))
+        return cur, prev, bridged, last
+
+    def market_proxy(rows, hist, live, expected):
         cur, prev = [], []
         for r in rows:
             b = hist.get(e.code(r), [])
-            a = n(r.get("change_pct")) if live else bar_ret(b, -1)
-            p = bar_ret(b, -1) if live else bar_ret(b, -2)
+            a, p, _, _ = quote_bridge_return(r, b, expected, live)
             if a is not None:
                 cur.append(a)
             if p is not None:
                 prev.append(p)
         return (median(cur) if cur else None), (median(prev) if prev else None)
 
-    def upper(r, bars, fmrow, aux, live, mcur, mprev, expected):
-        last = str((bars[-1].get("date") if bars else "") or "")[:10] or None
-        cur = n(r.get("change_pct")) if live else bar_ret(bars, -1)
-        prev = bar_ret(bars, -1) if live else bar_ret(bars, -2)
-        if live:
-            hi, lo, cl = e.pick(r, "high_price", "high"), e.pick(r, "low_price", "low"), e.pick(r, "price", "close")
+    def upper(r, bars, fmrow, aux, newsrow, live, mcur, mprev, expected):
+        cur, prev, quote_bridged, last = quote_bridge_return(r, bars, expected, live)
+
+        # Latest OHLC: KIS authority first when live or when bridging a lagged LS
+        # daily series; otherwise use the current LS daily bar.
+        if live or quote_bridged:
+            hi = e.pick(r, "high_price", "high")
+            lo = e.pick(r, "low_price", "low")
+            cl = e.pick(r, "price", "close")
+            # Some pre-open quote routes do not populate day high/low. In that
+            # case absorption remains unconfirmed rather than being invented.
         else:
             z = bars[-1] if bars else {}
             hi, lo, cl = z.get("high"), z.get("low"), z.get("close")
+
         cx = cur - mcur if cur is not None and mcur is not None else None
         px = prev - mprev if prev is not None and mprev is not None else None
+
         aux_fresh = e.fresh(e.pick(aux, "source_timestamp", "timestamp_kst", "price_asof"), e.now(), 1200)
         rs5, rs20 = n(aux.get("rs5")), n(aux.get("rs20"))
-        explicit = bool(aux_fresh and (aux.get("asym_rs_class") in ("SUPER", "STRONG") or (rs5 is not None and rs20 is not None and rs5 > 0 and rs20 > 0)))
-        rs_turn = bool(explicit or (px is not None and cx is not None and px <= 0 < cx))
+        explicit = bool(
+            aux_fresh and (
+                aux.get("asym_rs_class") in ("SUPER", "STRONG")
+                or (rs5 is not None and rs20 is not None and rs5 > 0 and rs20 > 0)
+            )
+        )
+        sign_turn = bool(px is not None and cx is not None and px <= 0 < cx)
+        rs_turn = bool(explicit or sign_turn)
+
         pos = range_pos(hi, lo, cl)
-        absorb = bool(pos is not None and pos >= 0.60 and cur is not None and cur > 0)
-        tr, ar = transfer(fmrow), armed(fmrow)
-        hist_ok = bool(expected and last == expected)
-        state, reason = "WATCH", "UPPER_STRUCTURE_INCOMPLETE"
-        if not hist_ok:
-            state, reason = "HISTORY_PENDING", "LS_DAILY_NOT_CURRENT"
-        elif tr and absorb and ar and rs_turn:
-            state, reason = "HVTB_FOCUS", "TRANSFER_ABSORPTION_ARMED_RS_TURN"
-        elif tr and ar:
-            state, reason = "ARMED", "WAIT_RS_TURN"
-        elif tr:
-            state, reason = "WATCH", "TRANSFER_ONLY"
+        absorption = bool(pos is not None and pos >= 0.60 and cur is not None and cur > 0)
+        tr = transfer(fmrow)
+        ar = armed(fmrow)
+
+        # Original hard veto is generic. Only explicit, confirmed inputs are used.
+        gate = str((newsrow or {}).get("news_gate") or "").upper()
+        veto_reasons = []
+        if gate in e.NEWS_BLOCK:
+            veto_reasons.append(gate)
+        for key, label in (
+            ("large_cb_bw_eb", "LARGE_CB_BW_EB"),
+            ("large_rights_offering", "LARGE_RIGHTS_OFFERING"),
+            ("negative_clinical_event", "NEGATIVE_CLINICAL_EVENT"),
+            ("regulatory_failure", "REGULATORY_FAILURE"),
+            ("material_major_holder_sale", "MAJOR_HOLDER_SALE"),
+            ("accounting_or_audit_problem", "ACCOUNTING_AUDIT_PROBLEM"),
+        ):
+            if (fmrow or {}).get(key) is True or (aux or {}).get(key) is True or (newsrow or {}).get(key) is True:
+                veto_reasons.append(label)
+        overhang_veto = bool(veto_reasons)
+
+        fresh_catalyst = bool(
+            (fmrow or {}).get("fresh_catalyst") is True
+            or (aux or {}).get("fresh_catalyst") is True
+            or (newsrow or {}).get("fresh_catalyst") is True
+        )
+        catalyst_score = n((newsrow or {}).get("catalyst_score"))
+        if catalyst_score is None:
+            catalyst_score = n((aux or {}).get("catalyst_score"))
+        if catalyst_score is None:
+            catalyst_score = n((fmrow or {}).get("catalyst_score"))
+        catalyst_score = catalyst_score or 0.0
+
         breadth = n(aux.get("sector_breadth")) if aux_fresh else None
-        score = (cx or 0.0) + max(0.0, (cx - px) if cx is not None and px is not None else 0.0) + (2.0 * pos if pos is not None else 0.0) + (breadth or 0.0)
+        base_priority = (
+            (cx or 0.0)
+            + max(0.0, (cx - px) if cx is not None and px is not None else 0.0)
+            + (2.0 * pos if pos is not None else 0.0)
+            + (breadth or 0.0)
+        )
+
+        common_flag = r.get("common_stock_confirmed")
+        common_stock = False if common_flag is False else True
+        cap_100m = n(r.get("market_cap_100m"))
+        ctx = {
+            "common_stock": common_stock,
+            "market_cap_krw": cap_100m * 100_000_000 if cap_100m is not None else None,
+            "market_state": r.get("market_state") or "NORMAL",
+            "transfer_detected": tr,
+            "absorption_confirmed": absorption,
+            "armed_structure": ar,
+            "overhang_veto": overhang_veto,
+            "overhang_reasons": veto_reasons,
+            "rs_turn": rs_turn,
+            "fresh_catalyst": fresh_catalyst,
+            "catalyst_score": catalyst_score,
+            "base_priority": base_priority,
+        }
+        state, reason, priority = classify_focus_original(ctx)
+
         return {
             "hvtb_state": state,
             "hvtb_reason": reason,
             "transfer_detected": tr,
-            "absorption_confirmed": absorb,
+            "absorption_confirmed": absorption,
             "armed_structure": ar,
+            "overhang_veto": overhang_veto,
+            "overhang_reasons": veto_reasons,
             "rs_turn": rs_turn,
             "rs_turn_explicit": explicit,
+            "rs_turn_proxy": bool(sign_turn and not explicit),
             "rs_prev_excess_pct": px,
             "rs_current_excess_pct": cx,
             "market_proxy_prev_pct": mprev,
             "market_proxy_current_pct": mcur,
             "range_position": pos,
-            "focus_priority": score,
-            "history_current_for_hvtb": hist_ok,
+            "fresh_catalyst": fresh_catalyst,
+            "catalyst_score": catalyst_score,
+            "base_priority": base_priority,
+            "focus_priority": priority,
+            "history_current_for_hvtb": bool(expected and last == expected),
+            "history_quote_bridge": quote_bridged,
             "history_reference_date": last,
+            "selector_version": "HVTB_V1_6_ORIGINAL_CLASSIFY_FOCUS",
         }
 
     def run_lane(ops, current, allow_action=True):
@@ -562,7 +703,7 @@ def _install_hvtb(e):
         news = ops.local("news", "KRX", current)
         news_meta = news.get("__meta__", {}) if isinstance(news, dict) else {}
         live = e.session_open_for_market("KRX", current, None) is True
-        mcur, mprev = market_proxy(rows, hist, live)
+        mcur, mprev = market_proxy(rows, hist, live, expected)
         qmap = {e.code(r): r for r in rows}
         pool, evaluated = [], set()
         for c, fmrow in fmrows.items():
@@ -573,7 +714,7 @@ def _install_hvtb(e):
             if cap is not None and cap < 700:
                 continue
             bars = hist.get(c, [])
-            z = upper(r, bars, fmrow, amap.get(c, {}), live, mcur, mprev, expected)
+            z = upper(r, bars, fmrow, amap.get(c, {}), (news.get(c) if isinstance(news, dict) else {}), live, mcur, mprev, expected)
             z.update(code=c, name=r.get("name"), market="KRX", price=n(r.get("price")), change_pct=n(r.get("change_pct")), market_cap_100m=cap)
             evaluated.add(c)
             pool.append(z)
@@ -627,7 +768,7 @@ def _install_hvtb(e):
                 if k.startswith("hvtb_") or k in (
                     "transfer_detected", "absorption_confirmed", "armed_structure", "rs_turn", "rs_turn_explicit",
                     "rs_prev_excess_pct", "rs_current_excess_pct", "market_proxy_prev_pct", "market_proxy_current_pct",
-                    "range_position", "focus_priority", "history_current_for_hvtb", "history_reference_date", "bos_level", "retest_low",
+                    "range_position", "focus_priority", "base_priority", "fresh_catalyst", "catalyst_score", "overhang_veto", "overhang_reasons", "rs_turn_proxy", "selector_version", "history_current_for_hvtb", "history_quote_bridge", "history_reference_date", "bos_level", "retest_low",
                 ):
                     base[k] = v
             # ACTION evidence is produced by LS t8412 and must survive base(),
@@ -653,7 +794,7 @@ def _install_hvtb(e):
             "action": sum(z.get("hvtb_action_state") == "ACTION" for z in outrows),
             "evaluated_scope": len(proven),
             "universe_complete": False,
-            "source": "FULLMARKET_HANDOFF + LS_DAILY + LS_T8412_TOP_FOCUS",
+            "source": "HVTB_V1_6_ORIGINAL_CLASSIFY_FOCUS + KIS_AUTHORITY + FULLMARKET_HANDOFF + LS_T8412_TOP_FOCUS",
         }
         markets = (ops.runtime or {}).setdefault("markets", {})
         krx = markets.setdefault("KRX", {})
@@ -697,19 +838,55 @@ def _install_hvtb(e):
         return result
 
     e.Operations.refresh_candidate_states = refresh_hvtb
-    e.HVTB_V16_VERSION = "HVTB_V1_6_LS_READONLY_HOTFIX"
+    e.HVTB_V16_VERSION = "HVTB_V1_6_ORIGINAL_CLASSIFY_FOCUS_LS_RUNTIME"
 
 
 def _hvtb_selftest():
-    class Dummy:
-        pass
-    # Pure rules used by the patch: range location and relative-strength turn.
-    hi, lo, cl = 110.0, 90.0, 108.0
-    pos = (cl - lo) / (hi - lo)
-    assert abs(pos - 0.9) < 1e-9
-    prev_excess, current_excess = -1.0, 2.0
-    assert prev_excess <= 0 < current_excess
-    return {"ok": True, "version": "HVTB_V1_6_LS_READONLY_HOTFIX"}
+    # Generic rule self-test. No company names/codes are embedded.
+    def classify(ctx):
+        if not ctx.get("common_stock", True):
+            return "REJECT"
+        if ctx.get("market_cap_krw") is None:
+            return "PENDING"
+        if ctx["market_cap_krw"] < 70_000_000_000:
+            return "REJECT"
+        if ctx.get("market_state") in {"RISK_OFF_ACCEL", "PROGRAM_SELL_ACCEL", "BREADTH_COLLAPSE"}:
+            return "MARKET_BLOCK"
+        if not ctx.get("transfer_detected"):
+            return "WATCH"
+        if not ctx.get("absorption_confirmed"):
+            return "WATCH"
+        if not ctx.get("armed_structure"):
+            return "WATCH"
+        if ctx.get("overhang_veto"):
+            return "VETO_REJECT"
+        if not ctx.get("rs_turn"):
+            return "ARMED"
+        return "HVTB_FOCUS"
+
+    base = {
+        "common_stock": True,
+        "market_cap_krw": 100_000_000_000,
+        "market_state": "NORMAL",
+        "transfer_detected": True,
+        "absorption_confirmed": True,
+        "armed_structure": True,
+        "overhang_veto": False,
+        "rs_turn": True,
+        "fresh_catalyst": False,
+    }
+    assert classify(base) == "HVTB_FOCUS"  # Catalyst is not mandatory.
+    veto = dict(base, overhang_veto=True)
+    assert classify(veto) == "VETO_REJECT"
+    armed_only = dict(base, rs_turn=False)
+    assert classify(armed_only) == "ARMED"
+    small = dict(base, market_cap_krw=69_900_000_000)
+    assert classify(small) == "REJECT"
+    return {
+        "ok": True,
+        "version": "HVTB_V1_6_ORIGINAL_CLASSIFY_FOCUS_LS_RUNTIME",
+        "tests": ["catalyst_not_mandatory", "overhang_hard_veto", "armed_not_buy", "cap_700eok"],
+    }
 
 
 __all__ = ["apply"]
