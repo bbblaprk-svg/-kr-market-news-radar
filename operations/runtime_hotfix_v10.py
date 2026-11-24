@@ -205,6 +205,213 @@ def apply() -> None:
 # HVTB V1.6 LS READ-ONLY RUNTIME LANE
 # ---------------------------------------------------------------------------
 
+
+def _hvtb_live_signal(x, daily, price, current, *, max_age=10):
+    """Pure live evaluator. Conservative 5m start-label convention; no future bars."""
+    from datetime import timedelta
+    import math
+    def wait(reason, state="ACTION_WAIT", **kw):
+        return dict(hvtb_action_state=state, hvtb_action_reason=reason, **kw)
+    def num(v):
+        try:
+            v=float(v)
+            return v if math.isfinite(v) else None
+        except (ValueError, TypeError):
+            return None
+    if x is None or x.empty:
+        return wait("NO_5M", ls_5m_status="PENDING")
+    x=x.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    x=x[x.timestamp.map(lambda t: t.date()==current.date() and t<=current)]
+    if x.empty:
+        return wait("WRONG_SESSION", ls_5m_status="PENDING")
+    for _, bar in x.iterrows():
+        o,h,l,c,v=[num(bar[k]) for k in ("open","high","low","close","volume")]
+        if None in (o,h,l,c,v) or min(o,h,l,c)<=0 or h<max(o,c,l) or l>min(o,c) or v<0:
+            return wait("INVALID_OHLCV")
+    last=x.iloc[-1]
+    price=num(price)
+    if (current-last.timestamp-timedelta(minutes=5)).total_seconds()>420:
+        return wait("STALE_LS_5M", ls_5m_status="PENDING")
+    if price is None or price<=0 or abs(float(last.close)/price-1)>0.005:
+        return wait("KIS_LS_PRICE_MISMATCH", "PRICE_PENDING", ls_crosscheck=False)
+    x=x[x.timestamp.map(lambda t: t+timedelta(minutes=5)<=current)].reset_index(drop=True)
+    if len(x)<4:
+        return wait("INSUFFICIENT_COMPLETED_5M")
+    if (current-x.iloc[-1].timestamp-timedelta(minutes=5)).total_seconds()>420:
+        return wait("STALE_COMPLETED_5M", ls_5m_status="PENDING")
+    # A missing bar breaks the sequence; use only the most recent contiguous run.
+    gaps=x.timestamp.diff().dt.total_seconds().fillna(300)
+    breaks=x.index[gaps!=300]
+    if len(breaks): x=x.iloc[breaks[-1]:].reset_index(drop=True)
+    if len(x)<4: return wait("NONCONTIGUOUS_5M")
+    candidate=None
+    # Early ORB uses existing 5m provider only; no unverified 1m/3m API.
+    if x.iloc[0].timestamp.hour==9 and x.iloc[0].timestamp.minute==0:
+        orb=float(x.iloc[:2].high.max())
+        for j in range(3,min(len(x),7)):
+            b,r=x.iloc[j-1],x.iloc[j]
+            atr=num(r.atr5); vw=num(r.vwap); rv=num(b.reaccel)
+            if not atr or not vw or not rv: continue
+            if b.close>orb and b.close>b.open and rv>=1.2 and r.low>=orb*.9965 and r.low<=orb*1.0035 and r.close>max(b.close,orb,vw) and r.close>r.open:
+                candidate=dict(signal_asof=r.timestamp,stop_price=float(r.low)-.2*atr,target_price=None,bos_level=orb,retest_low=float(r.low),hvtb_signal_close=float(r.close),hvtb_entry_path="EARLY_ORB_5M")
+    phase=0; start=0; level=low=None; hold=0
+    for i in range(3,len(x)):
+        r,p=x.iloc[i],x.iloc[i-1]
+        atr=num(r.atr5); vw=num(r.vwap); rv=num(r.reaccel)
+        if not atr or not vw: continue
+        if candidate is not None and r.timestamp>candidate["signal_asof"]:
+            if r.low<=candidate["stop_price"] or r.close<vw or r.close<candidate["bos_level"]*(1-0.0035):
+                candidate=None; phase=0
+            elif (r.timestamp-candidate["signal_asof"]).total_seconds()>max_age*60:
+                candidate=None; phase=0
+        if phase and (i-start>8 or r.close<vw*0.996 or (level is not None and r.close<level*0.985)):
+            phase=0; level=low=None; hold=0
+        if phase==0:
+            if rv is not None and 1.2<=rv<=2.5 and r.close>r.open:
+                phase=1; start=i; level=low=None; hold=0
+            else: continue
+        if phase==1:
+            if r.close>=vw and (r.low>=vw*0.996 or p.close<p.vwap or r.low<vw): phase=2
+            else: continue
+        if phase==2:
+            structure=float(x.iloc[i-3:i].high.max())
+            if r.close>structure: level=structure; phase=3
+            continue
+        band=min(max(level*0.0035,atr*0.35),level*0.015)
+        if phase==3:
+            if r.low<=level+band and r.low>=level-band and r.close>=max(vw,level-band) and r.low>p.low:
+                low=float(r.low); hold=1; phase=4
+            continue
+        if phase==4:
+            if r.low<low or r.close<max(vw,level-band):
+                phase=0; level=low=None; hold=0; continue
+            hold+=1
+            med=num(r.base5)
+            if hold>=2 and r.close>r.open and r.close>p.high and med and .8*med<=r.volume<=2.5*med:
+                stop=low-.2*atr
+                highs=[num(z.get("high")) for z in daily[-20:]]
+                # Nearest observed overhead high, not most distant optimistic target.
+                targets=[h for h in highs if h is not None and h>float(r.close)]
+                if candidate is None or r.timestamp>=candidate["signal_asof"]:
+                    candidate=dict(signal_asof=r.timestamp, stop_price=stop, target_price=min(targets) if targets else None, bos_level=level, retest_low=low, hvtb_signal_close=float(r.close), hvtb_entry_path="BOS_RETEST_5M")
+                phase=0; level=low=None; hold=0
+    if candidate is None: return wait("NO_CURRENT_VALID_SEQUENCE")
+    sig=candidate["signal_asof"]; age=(current-sig-timedelta(minutes=5)).total_seconds()/60
+    stop=candidate["stop_price"]
+    highs=[num(z.get("high")) for z in daily[-20:]]
+    highs=[h for h in highs if h is not None and h>0]
+    targets=[h for h in highs if h>candidate["hvtb_signal_close"]]
+    target=min(targets) if targets else None
+    target_source="HVTB_NEAREST_20D_HIGH"
+    # Measured opening/rolling box projection, capped by 2 daily ATR proxy.
+    if target is None and len(highs)>=20:
+        ranges=[(num(z.get("high")),num(z.get("low"))) for z in daily[-20:]]
+        ranges=[h-l for h,l in ranges if h is not None and l is not None and h>l>0]
+        prior=x[x.timestamp<sig].tail(6)
+        if len(ranges)>=14 and len(prior)>=3:
+            height=float(prior.high.max()-prior.low.min())
+            if height>0:
+                target=candidate["bos_level"]+min(height,2*sum(ranges)/len(ranges))
+                target_source="HVTB_PROJECTED_BOX_UNVALIDATED"
+    candidate["target_price"]=target
+    vw=float(x.iloc[-1].vwap)
+    out=dict(candidate, entry_price=price, vwap=vw, ls_price=float(last.close), ls_asof=last.timestamp, ls_crosscheck=True, hvtb_signal_age_minutes=age, ls_5m_status="READY")
+    if age<0 or age>max_age: return wait("SIGNAL_EXPIRED", "EXPIRED", **out)
+    if stop<=0 or price<=stop or float(last.low)<=stop or price<vw or price<candidate["bos_level"]*.9965:
+        return wait("LIVE_STRUCTURE_INVALID", "CANCEL", **out)
+    if price/candidate["hvtb_signal_close"]-1>.015:
+        return wait("LIVE_PRICE_EXTENSION_GT_1P5", "NO_CHASE", **out)
+    risk=(price-stop)/price; rr=(target-price)/(price-stop) if target is not None else None
+    out.update(hvtb_rr=rr, hvtb_live_risk_pct=risk*100)
+    if risk>.06 or rr is None or rr<2: return wait("LIVE_RISK_OR_RR_FAILED", "NO_CHASE", **out)
+    if target_source=="HVTB_PROJECTED_BOX_UNVALIDATED":
+        return wait("PROJECTED_TARGET_REQUIRES_VALIDATION", "ACTION_WAIT", **out, target_source=target_source)
+    return wait("FRESH_RETEST_REVERSAL_LIVE_RR", "ACTION", **out, vwap_hold=True, price_hold=True, box_reclaim_hold=True, stop_source="HVTB_RETEST_LOW_ATR_BUFFER", target_source=target_source)
+
+
+def _hvtb_quality(z, bars, price, change):
+    """Independent discovery on observed data; daily OHLCV is a proxy, not investor flow."""
+    import math
+    from statistics import median
+    def num(v):
+        try:
+            v=float(v); return v if math.isfinite(v) else None
+        except (TypeError, ValueError): return None
+    price=num(price); change=num(change)
+    if price is not None and price<=0: price=None
+    a=z.get("absorption_evidence",{}); t=z.get("transfer_evidence",{})
+    flow=bool(z.get("hvtb_quality_flow_fresh") and t.get("flow_improving"))
+    cx=num(z.get("rs_current_excess_pct")); px=num(z.get("rs_prev_excess_pct"))
+    rs_delta=cx-px if cx is not None and px is not None else None
+    rs_up=rs_delta is not None and rs_delta>0 and cx>0
+    valid=[]
+    for b in bars[-21:]:
+        h,l,c,v=map(num,(b.get("high"),b.get("low"),b.get("close"),b.get("volume")))
+        if None in (h,l,c,v) or not h>=c>=l>0 or v<=0:
+            valid=[]; continue
+        valid.append((h,l,c,v))
+    compression=None; accumulation=False; dd=None; ret5=None; ret20=None; extension=None; room=None
+    if price and len(valid)>=10:
+        widths=[(h-l)/c for h,l,c,v in valid]; vols=[v for h,l,c,v in valid]
+        compression=median(widths[-3:])<=.8*median(widths[-10:-3]) and median(vols[-3:])<=median(vols[-10:-3])
+        dd=price/max(h for h,l,c,v in valid[-20:])-1
+        ret5=price/valid[-5][2]-1
+        ret20=price/valid[-20][2]-1 if len(valid)>=20 else None
+        atr=median([max(h-l,abs(h-valid[i-1][2]),abs(l-valid[i-1][2])) for i,(h,l,c,v) in enumerate(valid) if i>0][-14:])
+        extension=(price-median([c for h,l,c,v in valid[-10:]]))/atr if atr>0 else None
+        overhead=[h for h,l,c,v in valid if h>price]
+        room=(min(overhead)/price-1)*100 if overhead else None
+        # Multi-session directional volume proxy: do not label as foreign/institutional buying.
+        up=sum(valid[i][3] for i in range(len(valid)-9,len(valid)) if valid[i][2]>valid[i-1][2])
+        down=sum(valid[i][3] for i in range(len(valid)-9,len(valid)) if valid[i][2]<valid[i-1][2])
+        accumulation=up>1.3*down and up>0 and sum(valid[i][2]>valid[i-1][2] for i in range(len(valid)-9,len(valid)))>=4
+        # Avoid calling repeated high-volume rejection accumulation.
+        recent=valid[-5:]
+        rejection=sum(h>l and (c-l)/(h-l)<.35 for h,l,c,v in recent)
+        accumulation=accumulation and rejection<3 and valid[-1][2]>=median([c for h,l,c,v in recent])
+    defend=bool(a.get("higher_low") and (a.get("close_recovery") or a.get("high_range_close")))
+    paths=[]
+    if accumulation and compression is True and rs_up: paths.append("ACCUMULATION_PROXY")
+    if flow and rs_up and (a.get("close_recovery") or a.get("high_range_close")) and dd is not None and dd<=-.12: paths.append("REVERSAL")
+    if len(valid)>=10 and flow and rs_up and z.get("hvtb_fresh_catalyst_verified") and (a.get("close_recovery") or a.get("high_range_close")): paths.append("CATALYST_ACCEL")
+    if flow and rs_up and defend and accumulation: paths.append("FLOW_RS_CONTINUATION_PROXY")
+    priority=2*bool(paths)+2*accumulation+2*(compression is True)+2*flow+min(3,max(0,rs_delta or 0))+min(3,room or 0)
+    priority-=max(0,(change or 0)-3)+20*max(0,(ret5 or 0)-.12)+10*max(0,(ret20 or 0)-.25)+max(0,(extension or 0)-2)
+    return dict(hvtb_paths=paths,hvtb_v16_priority=z.get("focus_priority"),hvtb_v17_priority=priority,hvtb_independent_evidence=bool(paths),hvtb_compression=compression,hvtb_room_pct=room,hvtb_ret5=ret5,hvtb_ret20=ret20,hvtb_atr_extension=extension,hvtb_accumulation_proxy=accumulation,hvtb_flow_fresh_flag=flow,hvtb_same_time_rvol=None,hvtb_same_time_rvol_status="UNAVAILABLE_NO_HISTORICAL_INTRADAY",hvtb_flow_basis="FRESH_FLAG_PROXY" if flow else "UNCONFIRMED",hvtb_profile_status="UNAVAILABLE_NO_PRICE_VOLUME_PROFILE")
+
+
+def _hvtb_merge_pool(pool, limit):
+    """Alternate original and challenger ranks without mixing uncalibrated scores."""
+    def rank(z, key):
+        v=z.get(key)
+        return float(v) if isinstance(v,(int,float)) and v==v else -1e99
+    original=sorted((z for z in pool if z.get("hvtb_v16_state")=="HVTB_FOCUS" and z.get("hvtb_state")=="HVTB_FOCUS"), key=lambda z:rank(z,"focus_priority"), reverse=True)
+    challenger=sorted((z for z in pool if z.get("hvtb_paths") and z.get("hvtb_state")=="HVTB_FOCUS"),key=lambda z:rank(z,"hvtb_v17_priority"),reverse=True)
+    rest=sorted(pool,key=lambda z:rank(z,"hvtb_v17_priority"),reverse=True)
+    result=[]; seen=set()
+    def add(z):
+        if z["code"] not in seen and len(result)<limit:
+            seen.add(z["code"]); result.append(z)
+    for i in range(max(len(original),len(challenger))):
+        if i<len(original): add(original[i])
+        if i<len(challenger): add(challenger[i])
+        if len(result)>=limit: break
+    for z in rest: add(z)
+    return result
+
+
+def _hvtb_closed_bars(bars, expected):
+    """Local HVTB-only cutoff; never mutate shared history."""
+    if not expected: return []
+    cutoff=str(expected)[:10]
+    by_date={}
+    for b in bars or []:
+        if not isinstance(b,dict): continue
+        day=str(b.get("date") or "")[:10]
+        if len(day)==10 and day<=cutoff: by_date[day]=b
+    return [by_date[d] for d in sorted(by_date)]
+
+
 def _install_hvtb(e):
     """Attach HVTB as an isolated read-only lane without editing native engines.
 
@@ -297,8 +504,9 @@ def _install_hvtb(e):
             cache = {}
             ops._hvtb_minute_cache = cache
         key = ccode(symbol)
+        cache_key = (current.date().isoformat(), key)
         mono = time.monotonic()
-        hit = cache.get(key)
+        hit = cache.get(cache_key)
         ttl = max(60, int(os.getenv("HVTB_V16_MINUTE_CACHE_SECONDS", "120")))
         if hit and mono - hit[0] <= ttl:
             return hit[1].copy()
@@ -337,24 +545,28 @@ def _install_hvtb(e):
             if not 540 <= hm <= 930:
                 continue
             op, hi, lo, cl = [n(z.get(k)) for k in ("open", "high", "low", "close")]
-            vol = max(0.0, n(z.get("jdiff_vol", z.get("volume"))) or 0.0)
+            vol = n(z.get("jdiff_vol", z.get("volume")))
+            if vol is None or vol < 0:
+                continue
             if all(x is not None and x > 0 for x in (op, hi, lo, cl)):
                 data.append({"timestamp": ts, "open": op, "high": hi, "low": lo, "close": cl, "volume": vol})
         df = pd.DataFrame(data)
         if not df.empty:
             df = df.drop_duplicates("timestamp", keep="last").sort_values("timestamp").reset_index(drop=True)
-        cache[key] = (mono, df.copy())
+        if len(cache) >= 64:
+            cache.pop(next(iter(cache)))
+        cache[cache_key] = (mono, df.copy())
         return df
 
     def prepare5(df):
         x = df.copy().sort_values("timestamp").reset_index(drop=True)
         pc = x["close"].shift(1)
         tr = pd.concat([x["high"] - x["low"], (x["high"] - pc).abs(), (x["low"] - pc).abs()], axis=1).max(axis=1)
-        x["atr5"] = tr.rolling(14, min_periods=7).mean()
+        x["atr5"] = tr.rolling(14, min_periods=3).mean()
         typical = (x["high"] + x["low"] + x["close"]) / 3.0
         x["vwap"] = (typical * x["volume"]).cumsum() / x["volume"].cumsum().replace(0, float("nan"))
         x["med5"] = x["volume"].rolling(5, min_periods=3).median()
-        x["base5"] = x["volume"].shift(1).rolling(5, min_periods=3).median()
+        x["base5"] = x["volume"].shift(1).rolling(5, min_periods=2).median()
         x["reaccel"] = x["volume"] / x["base5"].replace(0, float("nan"))
         x["bull"] = x["close"] > x["open"]
         return x
@@ -362,111 +574,15 @@ def _install_hvtb(e):
     def action(ops, symbol, daily, kis_price, current):
         try:
             df = minute5(ops, symbol, current)
+            if df is None or df.empty:
+                return {"hvtb_action_state":"ACTION_WAIT", "hvtb_action_reason":"NO_5M"}
+            df = df[df.timestamp.map(lambda t: t.date()==current.date() and t<=current)]
+            out = _hvtb_live_signal(prepare5(df), daily, kis_price, current)
+            for k in ("signal_asof", "ls_asof"):
+                if k in out: out[k]=e.stamp(out[k].to_pydatetime() if hasattr(out[k], "to_pydatetime") else out[k])
+            return out
         except Exception as exc:
-            return {
-                "hvtb_action_state": "ACTION_WAIT",
-                "hvtb_action_reason": "LS_5M_UNAVAILABLE",
-                "ls_5m_status": "PENDING",
-                "ls_5m_error": type(exc).__name__,
-            }
-        if df is None or len(df) < 10:
-            return {"hvtb_action_state": "ACTION_WAIT", "hvtb_action_reason": "INSUFFICIENT_5M", "ls_5m_status": "NO_DATA"}
-        x = prepare5(df)
-        reacc = vw = bos = retest = False
-        level = retest_low = None
-        bos_i = None
-        hold = 0
-        for i in range(5, len(x) - 1):
-            r, p = x.iloc[i], x.iloc[i - 1]
-            rv = n(r.get("reaccel"))
-            if not reacc:
-                if rv is not None and 1.20 <= rv <= 2.50:
-                    reacc = True
-                else:
-                    continue
-            vhold = r["close"] >= r["vwap"] and r["low"] >= r["vwap"] * 0.996
-            vreclaim = (p["close"] < p["vwap"] <= r["close"]) or (r["low"] < r["vwap"] <= r["close"])
-            if not vw:
-                if vhold or vreclaim:
-                    vw = True
-                else:
-                    continue
-            structure = float(x.iloc[i - 3 : i]["high"].max())
-            if not bos:
-                if r["close"] > structure:
-                    bos, level, bos_i, hold = True, structure, i, 0
-                else:
-                    continue
-                continue
-            if i <= bos_i:
-                continue
-            atr = n(r.get("atr5")) or 0.0
-            band = min(max(level * 0.0035, atr * 0.35), level * 0.015)
-            if not retest:
-                valid_retest = r["low"] <= level + band and r["high"] >= level - band and r["low"] > p["low"] and r["close"] >= r["vwap"]
-                if valid_retest:
-                    retest, retest_low, hold = True, float(min(r["low"], p["low"])), 0
-                else:
-                    continue
-            hold = hold + 1 if r["close"] >= level - band and r["close"] >= r["vwap"] else 0
-            if hold < 2:
-                continue
-            med5 = n(r.get("med5"))
-            vol_ok = med5 is not None and med5 > 0 and 0.80 * med5 <= r["volume"] <= 2.50 * med5
-            if not (r["bull"] and r["close"] > p["high"] and vol_ok):
-                continue
-            nxt = x.iloc[i + 1]
-            entry = float(nxt["open"])
-            if entry / float(r["close"]) - 1.0 > 0.015:
-                return {"hvtb_action_state": "NO_CHASE", "hvtb_action_reason": "NEXT_5M_GAP_GT_1P5", "bos_level": level, "retest_low": retest_low, "ls_5m_status": "READY"}
-            stop = retest_low - 0.20 * atr
-            if stop <= 0 or stop >= entry:
-                return {"hvtb_action_state": "ACTION_WAIT", "hvtb_action_reason": "INVALID_STOP", "ls_5m_status": "READY"}
-            risk = (entry - stop) / entry
-            if risk > 0.06:
-                return {"hvtb_action_state": "RISK_TOO_LARGE", "hvtb_action_reason": "STRUCTURAL_RISK_GT_6PCT", "entry_price": entry, "stop_price": stop, "ls_5m_status": "READY"}
-            highs = [n(z.get("high")) for z in (daily or [])[-20:]]
-            observed = [h for h in highs if h is not None and h > entry]
-            target = max(observed) if observed else None
-            rr = (target - entry) / (entry - stop) if target is not None else None
-            if rr is None or rr < 2.0:
-                return {"hvtb_action_state": "NO_CHASE", "hvtb_action_reason": "OBSERVED_TARGET_RR_LT_2", "entry_price": entry, "stop_price": stop, "target_price": target, "hvtb_rr": rr, "ls_5m_status": "READY"}
-            last = float(x.iloc[-1]["close"])
-            cross = abs(last / kis_price - 1.0) <= 0.005 if kis_price else None
-            last_ts, sig_ts = x.iloc[-1]["timestamp"], r["timestamp"]
-            return {
-                "hvtb_action_state": "ACTION",
-                "hvtb_action_reason": "REACCEL_VWAP_BOS_RETEST_HOLD_REVERSAL",
-                "entry_price": entry,
-                "stop_price": stop,
-                "target_price": target,
-                "stop_source": "HVTB_RETEST_LOW_ATR_BUFFER",
-                "target_source": "HVTB_OBSERVED_20D_HIGH",
-                "hvtb_rr": rr,
-                "vwap": float(r["vwap"]),
-                "vwap_hold": True,
-                "price_hold": True,
-                "box_reclaim_hold": True,
-                "bos_level": level,
-                "retest_low": retest_low,
-                "ls_price": last,
-                "ls_asof": e.stamp(last_ts.to_pydatetime() if hasattr(last_ts, "to_pydatetime") else last_ts),
-                "ls_crosscheck": cross,
-                "signal_asof": e.stamp(sig_ts.to_pydatetime() if hasattr(sig_ts, "to_pydatetime") else sig_ts),
-                "ls_5m_status": "READY",
-            }
-        return {
-            "hvtb_action_state": "ACTION_WAIT",
-            "hvtb_action_reason": "SEQUENCE_INCOMPLETE",
-            "hvtb_volume_reaccel_seen": reacc,
-            "hvtb_vwap_seen": vw,
-            "hvtb_bos_seen": bos,
-            "hvtb_retest_seen": retest,
-            "hvtb_hold_count": hold,
-            "bos_level": level,
-            "retest_low": retest_low,
-            "ls_5m_status": "READY",
-        }
+            return {"hvtb_action_state":"ACTION_WAIT", "hvtb_action_reason":"LS_5M_UNAVAILABLE", "ls_5m_error":type(exc).__name__}
 
     def alpha_map(ops):
         obj = ops.local("alpha", "KRX")
@@ -562,7 +678,7 @@ def _install_hvtb(e):
     def market_proxy(rows, hist, live, expected):
         cur, prev = [], []
         for r in rows:
-            b = hist.get(e.code(r), [])
+            b = _hvtb_closed_bars(hist.get(e.code(r), []), expected)
             a, p, _, _ = quote_bridge_return(r, b, expected, live)
             if a is not None:
                 cur.append(a)
@@ -570,7 +686,7 @@ def _install_hvtb(e):
                 prev.append(p)
         return (median(cur) if cur else None), (median(prev) if prev else None)
 
-    def upper(r, bars, fmrow, aux, newsrow, live, mcur, mprev, expected):
+    def upper(r, bars, fmrow, aux, newsrow, live, mcur, mprev, expected, current):
         cur, prev, quote_bridged, last = quote_bridge_return(r, bars, expected, live)
 
         # Latest OHLC: KIS authority first when live or when bridging a lagged LS
@@ -588,7 +704,7 @@ def _install_hvtb(e):
         cx = cur - mcur if cur is not None and mcur is not None else None
         px = prev - mprev if prev is not None and mprev is not None else None
 
-        aux_fresh = e.fresh(e.pick(aux, "source_timestamp", "timestamp_kst", "price_asof"), e.now(), 1200)
+        aux_fresh = e.fresh(e.pick(aux, "source_timestamp", "timestamp_kst", "price_asof"), current, 1200)
         rs5, rs20 = n(aux.get("rs5")), n(aux.get("rs20"))
         explicit = bool(
             aux_fresh and (
@@ -640,10 +756,10 @@ def _install_hvtb(e):
 
         parent_handoff = transfer(fmrow)
         volume_reinflow = bool(volume_reinflow_ratio is not None and volume_reinflow_ratio >= 1.20 and cur is not None and cur > 0)
-        flow_improving = bool(
+        flow_improving = bool(aux_fresh and (
             (aux or {}).get("flow_reversal") is True
             or (aux or {}).get("capital_handoff_confirmed") is True
-        )
+        ))
         transfer_evidence = {
             "capital_handoff": parent_handoff,
             "volume_reinflow": volume_reinflow,
@@ -735,6 +851,11 @@ def _install_hvtb(e):
             "history_quote_bridge": quote_bridged,
             "history_reference_date": last,
             "selector_version": "HVTB_V1_6_ORIGINAL_CLASSIFY_FOCUS",
+            "transfer_evidence": transfer_evidence,
+            "absorption_evidence": absorption_evidence,
+            "volume_reinflow_ratio": volume_reinflow_ratio,
+            "hvtb_quality_flow_fresh": aux_fresh,
+            "hvtb_fresh_catalyst_verified": bool(aux_fresh and aux.get("fresh_catalyst") is True),
         }
 
     def run_lane(ops, current, allow_action=True):
@@ -767,36 +888,51 @@ def _install_hvtb(e):
             cap = n(r.get("market_cap_100m"))
             if cap is not None and cap < 700:
                 continue
-            bars = hist.get(c, [])
-            z = upper(r, bars, fmrow, amap.get(c, {}), (news.get(c) if isinstance(news, dict) else {}), live, mcur, mprev, expected)
+            bars = _hvtb_closed_bars(hist.get(c, []), expected)
+            z = upper(r, bars, fmrow, amap.get(c, {}), (news.get(c) if isinstance(news, dict) else {}), live, mcur, mprev, expected, current)
             z.update(code=c, name=r.get("name"), market="KRX", price=n(r.get("price")), change_pct=n(r.get("change_pct")), market_cap_100m=cap)
+            z.update(_hvtb_quality(z, bars, z.get("price"), z.get("change_pct")))
+            z["hvtb_v16_state"] = z.get("hvtb_state")
+            if (z.get("hvtb_paths") and z.get("hvtb_state") in {"WATCH", "ARMED"}
+                and cap is not None and cap >= 700 and r.get("common_stock_confirmed") is True
+                and not z.get("overhang_veto") and z.get("history_current_for_hvtb")
+                and str(r.get("market_state") or "").upper() not in BLOCK_MARKET_STATES):
+                z.update(hvtb_state="HVTB_FOCUS", hvtb_reason="INDEPENDENT_DISCOVERY")
             evaluated.add(c)
             pool.append(z)
-        pool.sort(key=lambda z: (z.get("hvtb_state") == "HVTB_FOCUS", z.get("focus_priority") or -999.0), reverse=True)
-        pool = pool[: max(3, min(30, int(os.getenv("HVTB_V16_MAX_FOCUS", "12"))))]
-        if live and allow_action:
-            max_action = max(1, min(5, int(os.getenv("HVTB_V16_MAX_LS_ACTION", "5"))))
-            count = 0
-            for z in pool:
-                if z.get("hvtb_state") != "HVTB_FOCUS" or count >= max_action:
-                    continue
-                count += 1
-                z.update(action(ops, z["code"], hist.get(z["code"], []), z.get("price"), current))
-        else:
-            for z in pool:
-                if z.get("hvtb_state") == "HVTB_FOCUS":
-                    z.update(hvtb_action_state="PREOPEN_FOCUS" if not live else "ACTION_WAIT", hvtb_action_reason="WAIT_LIVE_5M" if not live else "WAIT_NEXT_ACTION_REFRESH")
+        original_count=sum(z.get("hvtb_v16_state")=="HVTB_FOCUS" for z in pool)
+        challenger_count=sum(bool(z.get("hvtb_paths")) and z.get("hvtb_state")=="HVTB_FOCUS" for z in pool)
+        added_count=sum(z.get("hvtb_reason")=="INDEPENDENT_DISCOVERY" for z in pool)
+        pool = _hvtb_merge_pool(pool, max(3, min(30, int(os.getenv("HVTB_V16_MAX_FOCUS", "12")))))
+        max_action = max(1, min(12, int(os.getenv("HVTB_V16_MAX_LS_ACTION", "8"))))
+        action_count = count = 0
         outrows = []
         audit = ops.authority_audit.get("KRX", {})
         authority_ok = e.authority_scope_consistent(audit)
         for z in pool:
             c = z["code"]
             r = qmap[c]
+            if z.get("hvtb_state") == "HVTB_FOCUS":
+                if not live or not allow_action:
+                    z.update(hvtb_action_state="PREOPEN_FOCUS" if not live else "ACTION_WAIT", hvtb_action_reason="WAIT_LIVE_5M")
+                elif z.get("overhang_veto") or r.get("common_stock_confirmed") is not True or not authority_ok or not r.get("market_state") or str(r.get("market_state")).upper() in BLOCK_MARKET_STATES:
+                    z.update(hvtb_action_state="ACTION_WAIT", hvtb_action_reason="PREQUERY_RISK_GATE")
+                elif action_count >= 3 or count >= max_action:
+                    z.update(hvtb_action_state="ACTION_WAIT", hvtb_action_reason="BOUNDED_SCAN_BUDGET")
+                elif not e.fresh(r.get("price_asof"), current) or not z.get("history_current_for_hvtb"):
+                    z.update(hvtb_action_state="ACTION_WAIT", hvtb_action_reason="STALE_AUTHORITY_OR_DAILY")
+                else:
+                    count += 1
+                    z.update(action(ops, c, _hvtb_closed_bars(hist.get(c, []), expected), z.get("price"), current))
+            z["hvtb_discovery_origin"] = ("BOTH" if z.get("hvtb_v16_state")=="HVTB_FOCUS" and z.get("hvtb_paths") else "ORIGINAL" if z.get("hvtb_v16_state")=="HVTB_FOCUS" else "CHALLENGER" if z.get("hvtb_reason")=="INDEPENDENT_DISCOVERY" else "WATCH")
             signal = dict(z)
             signal["signal_track"] = "ACTION" if z.get("hvtb_action_state") == "ACTION" else z.get("hvtb_state")
             signal["lane_confirmed"] = z.get("hvtb_state") == "HVTB_FOCUS"
-            if isinstance(news, dict) and c in news:
-                signal.update(news[c])
+            if isinstance(news, dict) and isinstance(news.get(c), dict):
+                # News may add context, never overwrite entry or discovery results.
+                for nk,nv in news[c].items():
+                    if nk.startswith("news_") or nk in {"fresh_catalyst", "catalyst_score"}:
+                        signal[nk]=nv
             elif news_meta.get("status") == "READY":
                 signal.setdefault("news_gate", "CLEAR")
                 signal.setdefault("news_source", "NEWS_IMPACT_SIDECAR_NO_BLOCKING_EVENT")
@@ -804,8 +940,12 @@ def _install_hvtb(e):
                 signal["hvtb_state"] = "VETO_REJECT"
                 signal["hvtb_reason"] = "OVERHANG_OR_NEGATIVE_NEWS_VETO"
                 signal["lane_confirmed"] = False
+            if signal.get("hvtb_action_state") == "ACTION":
+                market_state = str(r.get("market_state") or "").upper()
+                if not authority_ok or not e.session_open_for_market("KRX", current, r.get("session_open")) or not market_state or market_state in BLOCK_MARKET_STATES or signal.get("news_gate") != "CLEAR" or signal.get("overhang_veto") or r.get("common_stock_confirmed") is not True:
+                    signal.update(hvtb_action_state="ACTION_WAIT", hvtb_action_reason="AUTHORITY_MARKET_NEWS_OR_SECURITY_GATE", signal_track="HVTB_FOCUS")
             signal_at = signal.get("signal_asof") or e.stamp(current)
-            base = ops.base(r, "KRX", signal, signal_at, amap, {}, hist.get(c, []), current, reference_daily=expected)
+            base = ops.base(r, "KRX", signal, signal_at, amap, {}, _hvtb_closed_bars(hist.get(c, []), expected), current, reference_daily=expected)
             base.update(
                 lane=LANE,
                 selection_path=[LANE, str(signal.get("signal_track") or "PENDING")],
@@ -834,7 +974,13 @@ def _install_hvtb(e):
                     base[k] = signal[k]
             base["runtime_lane_state"] = signal.get("hvtb_action_state") or signal.get("hvtb_state") or "WATCH"
             base = e.core_gates(base, current)
+            if base.get("hvtb_action_state")=="ACTION" and base.get("classification")!="PRIME":
+                base.update(hvtb_action_state="ACTION_WAIT",hvtb_action_reason="COMMON_GATE_NOT_PRIME",runtime_lane_state="ACTION_WAIT",signal_track="HVTB_FOCUS",selection_path=[LANE,"HVTB_FOCUS"])
+            if base.get("hvtb_action_state") != "ACTION":
+                if base.get("classification") == "PRIME": base["classification"] = "WATCH"
             base["unavailable_fields"] = [k for k in ("vwap", "rvol", "execution_strength", "rs5", "rs20", "foreign_net", "institution_net", "program_net", "entry_price", "stop_price", "target_price") if base.get(k) is None]
+            if base.get("hvtb_action_state") == "ACTION" and base.get("classification") == "PRIME":
+                action_count += 1
             outrows.append(base)
         # Every evaluated code came from the current KIS authority universe.
         # A stale/missing FULLMARKET sidecar must not make the independent HVTB
@@ -845,13 +991,17 @@ def _install_hvtb(e):
             ops.store.track("KRX", qmap, current)
         lane_meta = {
             "observed": len(outrows),
-            "status": "READY" if rows else "PENDING",
+            "status": "READY" if rows and authority_ok else "PENDING",
             "prime": sum(z.get("classification") == "PRIME" for z in outrows),
             "focus": sum(z.get("hvtb_state") == "HVTB_FOCUS" for z in outrows),
             "action": sum(z.get("hvtb_action_state") == "ACTION" for z in outrows),
             "evaluated_scope": len(proven),
-            "universe_complete": bool(rows),
-            "source": "HVTB_V1_6_ORIGINAL_CLASSIFY_FOCUS + KIS_ZERO_BASE_AUTHORITY + OPTIONAL_FULLMARKET_HANDOFF + LS_T8412_TOP_FOCUS",
+            "original_focus_count": original_count,
+            "challenger_focus_count": challenger_count,
+            "incremental_focus_count": added_count,
+            "ls_queries_budget_used": count,
+            "universe_complete": bool(rows and authority_ok),
+            "source": "HVTB_ORIGINAL_PLUS_CHALLENGER + KIS_ZERO_BASE_AUTHORITY + LS_T8412_BOUNDED",
         }
         markets = (ops.runtime or {}).setdefault("markets", {})
         krx = markets.setdefault("KRX", {})
@@ -895,7 +1045,7 @@ def _install_hvtb(e):
         return result
 
     e.Operations.refresh_candidate_states = refresh_hvtb
-    e.HVTB_V16_VERSION = "HVTB_V1_6_ORIGINAL_CLASSIFY_FOCUS_LS_RUNTIME"
+    e.HVTB_V16_VERSION = "HVTB_FINAL_PARALLEL_DISCOVERY_LIVE_GUARD"
 
 
 def _hvtb_selftest():
@@ -941,7 +1091,7 @@ def _hvtb_selftest():
     assert classify(small) == "REJECT"
     return {
         "ok": True,
-        "version": "HVTB_V1_6_ORIGINAL_CLASSIFY_FOCUS_LS_RUNTIME",
+        "version": "HVTB_FINAL_PARALLEL_DISCOVERY_LIVE_GUARD",
         "tests": ["catalyst_not_mandatory", "overhang_hard_veto", "armed_not_buy", "cap_700eok"],
     }
 
