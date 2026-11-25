@@ -4,6 +4,11 @@ Collector functions untouched. Also installs the independent US_PRE_NXT_SYNC sid
 from pathlib import Path
 import sys
 
+try:
+    from .apply_limit_attack_live_v1 import patch_all as _limit_attack_patch_all
+except ImportError:
+    from apply_limit_attack_live_v1 import patch_all as _limit_attack_patch_all
+
 MARK='OPERATIONS_PROJECTION_V1'
 SYNC_MARK='US_PRE_NXT_SYNC_V1_HOOK'
 
@@ -56,18 +61,8 @@ def patch(path):
 
     anchor='    def do_GET(self):\n        path = urlparse(self.path).path\n'
     if s.count(anchor)!=1:raise RuntimeError('GET anchor mismatch')
-    routes='''        # OPERATIONS_PROJECTION_V1_ROUTES: same process, no collector mutation.
-        if path in {"/", "/operations"}:
-            return self._html(200, __import__('pathlib').Path('/app/operations/dashboard.html').read_text(encoding='utf-8'))
-        if path == "/legacy":
-            return self._dashboard()
-        if path.startswith("/api/operations/"):
-            try:
-                status, payload = OPERATIONS.api(self.path)
-                return self._json(status, payload)
-            except Exception as exc:
-                return self._json(503, {"status":"PENDING", "error":type(exc).__name__})
-'''
+    routes='        # OPERATIONS_PROJECTION_V1_ROUTES: same process, no collector mutation.\n        if path in {"/", "/operations"}:\n            return self._html(200, __import__(\'pathlib\').Path(\'/app/operations/dashboard.html\').read_text(encoding=\'utf-8\'))\n        if path == "/legacy":\n            return self._dashboard()\n        if path.startswith("/api/operations/"):\n            try:\n                status, payload = OPERATIONS.api(self.path)\n                return self._json(status, payload)\n            except Exception as exc:\n                return self._json(503, {"status":"PENDING", "error":type(exc).__name__})\n'
+
     s=s.replace(anchor,anchor+routes,1)
 
     anchor='    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)\n'
@@ -76,4 +71,8 @@ def patch(path):
     compile(s,str(p),'exec'); p.write_text(s,encoding='utf-8')
 
 
-if __name__=='__main__':patch(sys.argv[1])
+if __name__=='__main__':
+    # Patch only the copied /app/operations projection. If any anchor changed,
+    # fail the Docker build rather than deploying a partially wired lane.
+    _limit_attack_patch_all(Path(__file__).resolve().parent)
+    patch(sys.argv[1])
