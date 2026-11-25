@@ -28,9 +28,10 @@ from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 KST = timezone(timedelta(hours=9))
-VERSION = "US_PRE_NXT_SYNC_V1_1"
+VERSION = "US_PRE_NXT_SYNC_V1_2"
 
 # Direct anchors are intentionally sparse. These are cross-market transmission
 # anchors, not general theme recommendations.
@@ -72,6 +73,21 @@ DIRECT_MAP = {
     "RTX": ["012450", "079550", "272210", "214430"],
     "TSLA": ["373220", "006400", "247540", "066970", "005380"],
     "RIVN": ["373220", "006400", "247540", "066970"],
+}
+
+DIRECT_THEME = {
+    "MU":"SEMICONDUCTOR","NVDA":"SEMICONDUCTOR","AMD":"SEMICONDUCTOR",
+    "LRCX":"SEMICONDUCTOR","AMAT":"SEMICONDUCTOR","ASML":"SEMICONDUCTOR","TSM":"SEMICONDUCTOR",
+    "AVGO":"SEMICONDUCTOR","MRVL":"SEMICONDUCTOR","CRDO":"SEMICONDUCTOR",
+    "LITE":"OPTICAL_NETWORK","CIEN":"OPTICAL_NETWORK","ANET":"OPTICAL_NETWORK",
+    "PANW":"CYBERSECURITY","CRWD":"CYBERSECURITY","ZS":"CYBERSECURITY",
+    "OKLO":"NUCLEAR","SMR":"NUCLEAR","CCJ":"NUCLEAR","LEU":"NUCLEAR",
+    "FSLR":"SOLAR","ENPH":"SOLAR","SEDG":"SOLAR",
+    "BE":"HYDROGEN_FUELCELL","PLUG":"HYDROGEN_FUELCELL","FCEL":"HYDROGEN_FUELCELL",
+    "GEV":"POWER_GRID","ETN":"POWER_GRID","VRT":"DATA_CENTER_COOLING",
+    "RKLB":"SPACE","ASTS":"SPACE","LUNR":"SPACE",
+    "LMT":"DEFENSE","NOC":"DEFENSE","RTX":"DEFENSE",
+    "TSLA":"BATTERY_EV","RIVN":"BATTERY_EV",
 }
 
 # Cluster members come from the user's 2026-11-25 Korean synchronization map.
@@ -190,15 +206,29 @@ class USPremarketSource:
         self.http_get = http_get or _default_http
         self.json_url = os.getenv("US_PRE_JSON_URL", "").strip()
         self.html_url = os.getenv("US_PRE_HTML_URL", "https://chartexchange.com/screener/pre-market-gainers/").strip()
+        self.fallback_url = os.getenv("US_PRE_FALLBACK_URL", "https://stockanalysis.com/markets/premarket/gainers/").strip()
 
     def fetch(self):
         if self.json_url:
             raw = self.http_get(self.json_url)
             obj = json.loads(raw)
             rows = obj.get("rows", obj if isinstance(obj, list) else [])
-            return self._normalize(rows), "US_PRE_JSON_URL"
-        raw = self.http_get(self.html_url)
-        return self._parse_html(raw), "CHARTEXCHANGE_PREMARKET_GAINERS"
+            out = self._normalize(rows)
+            if not out:
+                raise ValueError("US_PRE_JSON_EMPTY")
+            return out, "US_PRE_JSON_URL"
+        errors=[]
+        for url,label in ((self.html_url,"CHARTEXCHANGE_PREMARKET_GAINERS"),(self.fallback_url,"STOCKANALYSIS_PREMARKET_GAINERS")):
+            if not url:
+                continue
+            try:
+                out=self._parse_html(self.http_get(url))
+                if out:
+                    return out,label
+                errors.append(label+":PARSE_EMPTY")
+            except Exception as exc:
+                errors.append(label+":"+type(exc).__name__)
+        raise RuntimeError("US_PRE_SOURCES_UNAVAILABLE:"+"|".join(errors))
 
     def _normalize(self, rows):
         out = []
@@ -223,48 +253,50 @@ class USPremarketSource:
         return out
 
     def _parse_html(self, raw):
-        p = _TableParser()
-        p.feed(raw)
-        rows = p.rows
-        header = None
-        out = []
+        p = _TableParser(); p.feed(raw); rows=p.rows
+        header=None; index={}; out=[]
         for row in rows:
-            low = [x.lower() for x in row]
-            if header is None and any("symbol" == x or "symbol" in x for x in low) and any("pre-market" in x or "premarket" in x for x in low):
-                header = low
+            low=[re.sub(r"[^a-z0-9%]+"," ",x.lower()).strip() for x in row]
+            if header is None and any("symbol" in x for x in low) and any(("pre market" in x or "premkt" in x or "% change" in x) for x in low):
+                header=low
+                for i,x in enumerate(low):
+                    if "symbol" in x and "symbol" not in index:index["symbol"]=i
+                    elif (("pre market" in x and "%" in x) or "% change" in x):index.setdefault("pct",i)
+                    elif ("premkt price" in x or ("pre market" in x and "price" in x)):index.setdefault("price",i)
+                    elif x=="price":index.setdefault("price",i)
+                    elif ("pre volume" in x or ("pre" in x and "volume" in x)):index.setdefault("volume",i)
+                    elif x=="volume":index.setdefault("volume",i)
+                    elif ("market cap" in x or "marketcap" in x):index.setdefault("market_cap",i)
+                    elif ("company name" in x or x=="name"):index.setdefault("name",i)
+                    elif "industry" in x:index.setdefault("industry",i)
+                    elif "exchange" in x:index.setdefault("exchange",i)
+                    elif ("equity" in x and "type" in x):index.setdefault("equity_type",i)
                 continue
-            if not header or len(row) < 5:
+            if header is None or "symbol" not in index or "pct" not in index:
                 continue
-            # ChartExchange expected: #, Symbol, Price, Pre-market %, MarketCap,
-            # Volume, Name, ..., Exchange, EquityType, Industry
-            ticker = row[1].upper().strip() if len(row) > 1 else ""
-            if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", ticker):
-                continue
-            pct = num(row[3] if len(row) > 3 else None)
-            if pct is None:
+            def cell(key):
+                i=index.get(key); return row[i] if i is not None and i<len(row) else None
+            ticker=str(cell("symbol") or "").upper().strip()
+            pct=num(cell("pct"))
+            if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}",ticker) or pct is None:
                 continue
             out.append({
-                "ticker": ticker,
-                "name": row[6] if len(row) > 6 else ticker,
-                "pre_price": num(row[2] if len(row) > 2 else None),
-                "pre_pct": pct,
-                "market_cap": parse_human_number(row[4] if len(row) > 4 else None),
-                "pre_volume": parse_human_number(row[5] if len(row) > 5 else None),
-                "exchange": row[-3] if len(row) >= 3 else "",
-                "equity_type": row[-2] if len(row) >= 2 else "",
-                "industry": row[-1] if row else "",
+                "ticker":ticker,"name":str(cell("name") or ticker),
+                "pre_price":num(cell("price")),"pre_pct":pct,
+                "market_cap":parse_human_number(cell("market_cap")),
+                "pre_volume":parse_human_number(cell("volume")),
+                "exchange":str(cell("exchange") or ""),
+                "equity_type":str(cell("equity_type") or ""),
+                "industry":str(cell("industry") or ""),
             })
         return out
 
 
 def theme_for(row):
     ticker = str(row.get("ticker") or "").upper()
-    if ticker in DIRECT_MAP:
-        # Direct ticker may still receive its industry theme, but direct mapping
-        # remains the activation authority.
-        direct = True
-    else:
-        direct = False
+    direct = ticker in DIRECT_MAP
+    if direct and ticker in DIRECT_THEME:
+        return DIRECT_THEME[ticker], True
     text = (str(row.get("industry") or "") + " " + str(row.get("name") or "")).lower()
     for theme, keys in THEME_RULES:
         if any(k in text for k in keys):
@@ -349,11 +381,19 @@ class SyncSidecar:
         self._last_log_bucket = None
         self._last_cleanup = None
 
+    def window_start_kst(self, current):
+        local=current.astimezone(KST)
+        ny=local.astimezone(ZoneInfo("America/New_York"))
+        pre_ny=ny.replace(hour=4,minute=0,second=0,microsecond=0)
+        return pre_ny.astimezone(KST)
+
     def in_window(self, current):
-        if current.weekday() >= 5:
+        local=current.astimezone(KST)
+        if local.weekday() >= 5:
             return False
-        hm = current.hour * 60 + current.minute
-        return 18 * 60 <= hm < 20 * 60
+        start=self.window_start_kst(local)
+        end=local.replace(hour=20,minute=0,second=0,microsecond=0)
+        return start <= local < end
 
     def _eligible_us(self, rows):
         out = []
@@ -438,9 +478,15 @@ class SyncSidecar:
                     price = num(q.get("price")); ch = num(q.get("change_pct") if q.get("change_pct") is not None else q.get("change_rate"))
                     if not price or price <= 0:
                         continue
-                    state = "PRICED_IN" if ch is not None and ch >= self.cfg.kr_no_chase_pct else "SYNC_LAG"
+                    gap = (t["max_pct"] - ch) if ch is not None and t.get("max_pct") is not None else None
+                    if ch is not None and ch >= self.cfg.kr_no_chase_pct:
+                        state = "PRICED_IN"
+                    elif gap is not None and gap < self.cfg.lag_gap_pct:
+                        state = "ALREADY_CAUGHT"
+                    else:
+                        state = "SYNC_LAG"
                     c.execute("INSERT OR IGNORE INTO tracks(event_id,code,name,baseline_at,baseline_price,baseline_change_pct,last_at,last_price,last_ret,max_ret,min_ret,state,hit_json,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                              (event_id, code, q.get("name") or code, stamp(current), price, ch, stamp(current), price, 0.0, 0.0, 0.0, state, "{}", json.dumps({"mapping_mode": t["mapping_mode"]}, ensure_ascii=False)))
+                              (event_id, code, q.get("name") or code, stamp(current), price, ch, stamp(current), price, 0.0, 0.0, 0.0, state, "{}", json.dumps({"mapping_mode": t["mapping_mode"],"initial_lag_gap_pct":gap}, ensure_ascii=False)))
             else:
                 c.execute("UPDATE events SET trigger_pct=?,mean_pct=?,confirm_count=?,mapping_mode=?,source=?,last_at=?,payload=? WHERE event_id=?",
                           (t["max_pct"], t["mean_pct"], t["confirm_count"], t["mapping_mode"], source_name, stamp(current), json.dumps(payload, ensure_ascii=False), event_id))
@@ -481,8 +527,13 @@ class SyncSidecar:
                     state = tr["state"]
                     up05 = hits.get("up_0_5"); down05 = hits.get("down_0_5")
                     up10 = hits.get("up_1_0")
+                    initial_gap = None
+                    if t and tr["baseline_change_pct"] is not None and t.get("max_pct") is not None:
+                        initial_gap = t["max_pct"] - tr["baseline_change_pct"]
                     if tr["baseline_change_pct"] is not None and tr["baseline_change_pct"] >= self.cfg.kr_no_chase_pct:
                         state = "PRICED_IN"
+                    elif initial_gap is not None and initial_gap < self.cfg.lag_gap_pct:
+                        state = "ALREADY_CAUGHT"
                     elif up10 and (not down05 or up10 < down05):
                         state = "SYNC_CONFIRMED"
                     elif down05 and (not up05 or down05 < up05):
@@ -490,8 +541,6 @@ class SyncSidecar:
                     elif expired and not up05:
                         state = "NO_RESPONSE"
                     elif t:
-                        # A still-strong US theme with a Korea stock that has not
-                        # yet moved 0.5% is the actual lag window under study.
                         state = "SYNC_LAG" if ret < 0.5 else "EARLY_RESPONSE"
                     payload = json.loads(tr["payload"] or "{}")
                     if t:
@@ -540,6 +589,7 @@ class SyncSidecar:
         fresh = [r for r in nxt_rows if self._fresh_nxt_row(r, current)]
         return {
             "status":"READY","version":VERSION,"at":stamp(current),"source":source_name,
+            "window_start_kst":stamp(self.window_start_kst(current)),
             "raw_rows":len(raw),"eligible_top":len(eligible),"active_themes":len(themes),
             "fresh_nxt_rows":len(fresh),
             "top_us":[{k:r.get(k) for k in ("ticker","name","pre_pct","pre_price","pre_volume","market_cap","industry","theme","direct","speculative_microcap")} for r in eligible[:10]],
@@ -549,7 +599,7 @@ class SyncSidecar:
     def cycle(self, current=None):
         current = current or now_kst()
         if not self.in_window(current):
-            self.last = {"status": "IDLE", "version": VERSION, "reason": "OUTSIDE_18_20_KST",
+            self.last = {"status": "IDLE", "version": VERSION, "reason": "OUTSIDE_US_PRE_NXT_OVERLAP",
                          "at": stamp(current), "last_ready": self.last_ready}
             return self.last
         try:
@@ -615,7 +665,7 @@ class SyncSidecar:
         self.thread = threading.Thread(target=loop, daemon=True, name="us-pre-nxt-sync")
         self.thread.start()
         logging.getLogger(__name__).info(
-            "US_PRE_NXT_SYNC_STARTED version=%s window=18:00-20:00KST poll=%ss",
+            "US_PRE_NXT_SYNC_STARTED version=%s window=DYNAMIC_17_OR_18_TO_20_KST poll=%ss",
             VERSION, self.cfg.poll_seconds)
 
     def api(self, raw_path):
@@ -633,7 +683,7 @@ class SyncSidecar:
                 return 503, {"status":"PENDING","version":VERSION,"error":type(exc).__name__,"detail":str(exc)[:180]}
         if kind in ("us-pre-nxt-sync", "status"):
             return 200, dict(self.last, last_ready=self.last_ready, policy={
-                "window_kst":"18:00-20:00", "min_pct":self.cfg.min_pct,
+                "window_kst":"DYNAMIC_17_OR_18_TO_20", "min_pct":self.cfg.min_pct,
                 "direct_min_pct":self.cfg.direct_min_pct, "sector_confirm_count":self.cfg.sector_count,
                 "sector_mean_pct":self.cfg.sector_mean_pct, "kr_no_chase_pct":self.cfg.kr_no_chase_pct,
                 "lag_gap_pct":self.cfg.lag_gap_pct, "thresholds":THRESHOLDS,
@@ -699,4 +749,4 @@ def install(engine_module):
     return {"ok":True,"version":VERSION,"direct_anchors":len(DIRECT_MAP),"themes":len(THEME_KR)}
 
 
-__all__ = ["install", "SyncSidecar", "USPremarketSource", "theme_for", "VERSION"]
+__all__ = ["install", "SyncSidecar", "USPremarketSource", "theme_for", "DIRECT_THEME", "VERSION"]
