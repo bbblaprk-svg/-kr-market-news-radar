@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import math
 import os
 import re
@@ -29,7 +30,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 KST = timezone(timedelta(hours=9))
-VERSION = "US_PRE_NXT_SYNC_V1_0"
+VERSION = "US_PRE_NXT_SYNC_V1_1"
 
 # Direct anchors are intentionally sparse. These are cross-market transmission
 # anchors, not general theme recommendations.
@@ -277,7 +278,11 @@ class Config:
     direct_min_pct: float = float(os.getenv("US_PRE_DIRECT_MIN_PCT", "7"))
     sector_count: int = int(os.getenv("US_PRE_SECTOR_CONFIRM_COUNT", "2"))
     sector_mean_pct: float = float(os.getenv("US_PRE_SECTOR_MEAN_PCT", "5"))
-    min_market_cap: float = float(os.getenv("US_PRE_MIN_MCAP_USD", "200000000"))
+    # Do not hard-drop microcaps before the experiment: the hypothesis starts
+    # from large percentage movers. Low-cap names are tagged speculative and
+    # need stronger breadth instead of being erased.
+    min_market_cap: float = float(os.getenv("US_PRE_MIN_MCAP_USD", "0"))
+    speculative_cap: float = float(os.getenv("US_PRE_SPECULATIVE_MCAP_USD", "200000000"))
     min_volume: float = float(os.getenv("US_PRE_MIN_VOLUME", "50000"))
     top_n: int = int(os.getenv("US_PRE_TOP_N", "30"))
     poll_seconds: int = int(os.getenv("US_PRE_POLL_SECONDS", "60"))
@@ -339,7 +344,9 @@ class SyncSidecar:
         self.stop = threading.Event()
         self.thread = None
         self.last = {"status": "PENDING", "version": VERSION, "reason": "NOT_RUN"}
+        self.last_ready = None
         self._last_raw_store = None
+        self._last_log_bucket = None
         self._last_cleanup = None
 
     def in_window(self, current):
@@ -362,7 +369,9 @@ class SyncSidecar:
             if any(x in typ for x in ("etf", "warrant", "preferred", "unit")):
                 continue
             theme, direct = theme_for(r)
-            z = dict(r, theme=theme, direct=direct)
+            z = dict(r, theme=theme, direct=direct,
+                     speculative_microcap=(cap is not None and cap < self.cfg.speculative_cap),
+                     market_cap_unknown=(cap is None))
             out.append(z)
         out.sort(key=lambda x: num(x.get("pre_pct")) or -999, reverse=True)
         return out[:max(5, self.cfg.top_n)]
@@ -377,7 +386,12 @@ class SyncSidecar:
         for theme, xs in grouped.items():
             pcts = [num(x.get("pre_pct")) for x in xs if num(x.get("pre_pct")) is not None]
             direct_x = [x for x in xs if x.get("direct") and (num(x.get("pre_pct")) or 0) >= self.cfg.direct_min_pct]
-            sector_ok = len(xs) >= self.cfg.sector_count and (sum(pcts) / len(pcts) if pcts else -999) >= self.cfg.sector_mean_pct
+            quality_count = sum(1 for x in xs if not x.get("speculative_microcap"))
+            sector_ok = (
+                len(xs) >= self.cfg.sector_count
+                and (sum(pcts) / len(pcts) if pcts else -999) >= self.cfg.sector_mean_pct
+                and (quality_count >= 1 or len(xs) >= max(3, self.cfg.sector_count + 1))
+            )
             if not direct_x and not sector_ok:
                 continue
             codes = []
@@ -485,17 +499,66 @@ class SyncSidecar:
                     c.execute("UPDATE tracks SET last_at=?,last_price=?,last_ret=?,max_ret=?,min_ret=?,state=?,hit_json=?,payload=? WHERE event_id=? AND code=?",
                               (stamp(current), price, ret, mx, mn, state, json.dumps(hits, ensure_ascii=False), json.dumps(payload, ensure_ascii=False), ev["event_id"], tr["code"]))
 
+    @staticmethod
+    def _parse_time(v):
+        if not v:
+            return None
+        try:
+            x = str(v).strip().replace("Z", "+00:00")
+            d = datetime.fromisoformat(x)
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=KST)
+            return d.astimezone(KST)
+        except (ValueError, TypeError):
+            return None
+
+    def _fresh_nxt_row(self, row, current, max_age_seconds=180):
+        if not isinstance(row, dict):
+            return False
+        if str(row.get("quality") or row.get("quote_quality") or "").upper() in ("STALE","EXPIRED","REST_STALE"):
+            return False
+        at = None
+        for k in ("price_asof","source_timestamp","timestamp_kst","nxt_last_at","trade_timestamp"):
+            at = self._parse_time(row.get(k))
+            if at:
+                break
+        if at is None:
+            return False
+        age = (current - at).total_seconds()
+        return -30 <= age <= max_age_seconds
+
+    def probe(self, current=None):
+        """Read-only source/route probe. Never creates events or tracks."""
+        current = current or now_kst()
+        raw, source_name = self.source.fetch()
+        eligible = self._eligible_us(raw)
+        themes = self._themes(eligible)
+        try:
+            nxt_rows = self.ops.live_rows_only("NXT")
+        except Exception:
+            nxt_rows = []
+        fresh = [r for r in nxt_rows if self._fresh_nxt_row(r, current)]
+        return {
+            "status":"READY","version":VERSION,"at":stamp(current),"source":source_name,
+            "raw_rows":len(raw),"eligible_top":len(eligible),"active_themes":len(themes),
+            "fresh_nxt_rows":len(fresh),
+            "top_us":[{k:r.get(k) for k in ("ticker","name","pre_pct","pre_price","pre_volume","market_cap","industry","theme","direct","speculative_microcap")} for r in eligible[:10]],
+            "themes":[{k:v for k,v in t.items() if k!="rows"} for t in themes],
+        }
+
     def cycle(self, current=None):
         current = current or now_kst()
         if not self.in_window(current):
-            self.last = {"status": "IDLE", "version": VERSION, "reason": "OUTSIDE_18_20_KST", "at": stamp(current)}
+            self.last = {"status": "IDLE", "version": VERSION, "reason": "OUTSIDE_18_20_KST",
+                         "at": stamp(current), "last_ready": self.last_ready}
             return self.last
         try:
             raw, source_name = self.source.fetch()
             eligible = self._eligible_us(raw)
             themes = self._themes(eligible)
             nxt_rows = self.ops.live_rows_only("NXT")
-            qmap = {str(r.get("code") or r.get("symbol") or ""): r for r in nxt_rows if isinstance(r, dict)}
+            qmap = {str(r.get("code") or r.get("symbol") or ""): r for r in nxt_rows
+                    if isinstance(r, dict) and self._fresh_nxt_row(r, current)}
             # Persist the top raw evidence at 5-minute cadence, not every poll.
             bucket = current.replace(second=0, microsecond=0, minute=(current.minute // 5) * 5)
             if self._last_raw_store != bucket:
@@ -504,6 +567,14 @@ class SyncSidecar:
                         c.execute("INSERT INTO source_snapshots(at,ticker,theme,pre_pct,pre_price,pre_volume,market_cap,name,industry,source) VALUES(?,?,?,?,?,?,?,?,?,?)",
                                   (stamp(current), r["ticker"], r.get("theme"), r.get("pre_pct"), r.get("pre_price"), r.get("pre_volume"), r.get("market_cap"), r.get("name"), r.get("industry"), source_name))
                 self._last_raw_store = bucket
+            if not qmap:
+                self.last = {
+                    "status":"PENDING","version":VERSION,"at":stamp(current),
+                    "reason":"NXT_LIVE_ROWS_STALE_OR_EMPTY","source":source_name,
+                    "us_rows":len(raw),"eligible_top":len(eligible),"active_themes":len(themes),
+                    "nxt_rows":len(nxt_rows),"fresh_nxt_rows":0,
+                }
+                return self.last
             for t in themes:
                 if t["codes"]:
                     self._create_or_refresh_event(current, t, source_name, qmap)
@@ -516,8 +587,14 @@ class SyncSidecar:
                 "status": "READY", "version": VERSION, "at": stamp(current), "source": source_name,
                 "us_rows": len(raw), "eligible_top": len(eligible), "active_themes": len(themes),
                 "themes": [{k:v for k,v in t.items() if k != "rows"} for t in themes],
-                "nxt_rows": len(nxt_rows),
+                "nxt_rows": len(nxt_rows), "fresh_nxt_rows": len(qmap),
             }
+            self.last_ready = dict(self.last)
+            if self._last_log_bucket != bucket:
+                logging.getLogger(__name__).info(
+                    "US_PRE_NXT_SYNC_CYCLE status=READY source=%s eligible=%s themes=%s fresh_nxt=%s",
+                    source_name, len(eligible), len(themes), len(qmap))
+                self._last_log_bucket = bucket
         except Exception as exc:
             self.last = {"status": "PENDING", "version": VERSION, "at": stamp(current), "error": type(exc).__name__, "detail": str(exc)[:180]}
         return self.last
@@ -537,6 +614,9 @@ class SyncSidecar:
                 self.stop.wait(max(30, wait))
         self.thread = threading.Thread(target=loop, daemon=True, name="us-pre-nxt-sync")
         self.thread.start()
+        logging.getLogger(__name__).info(
+            "US_PRE_NXT_SYNC_STARTED version=%s window=18:00-20:00KST poll=%ss",
+            VERSION, self.cfg.poll_seconds)
 
     def api(self, raw_path):
         u = urlparse(raw_path); q = parse_qs(u.query)
@@ -546,8 +626,13 @@ class SyncSidecar:
             limit = max(1, min(500, int((q.get("limit") or ["100"])[0])))
         except ValueError:
             return 400, {"error":"invalid limit"}
+        if kind == "probe":
+            try:
+                return 200, self.probe()
+            except Exception as exc:
+                return 503, {"status":"PENDING","version":VERSION,"error":type(exc).__name__,"detail":str(exc)[:180]}
         if kind in ("us-pre-nxt-sync", "status"):
-            return 200, dict(self.last, policy={
+            return 200, dict(self.last, last_ready=self.last_ready, policy={
                 "window_kst":"18:00-20:00", "min_pct":self.cfg.min_pct,
                 "direct_min_pct":self.cfg.direct_min_pct, "sector_confirm_count":self.cfg.sector_count,
                 "sector_mean_pct":self.cfg.sector_mean_pct, "kr_no_chase_pct":self.cfg.kr_no_chase_pct,
@@ -568,7 +653,8 @@ class SyncSidecar:
             if kind == "summary":
                 states = {r[0]:r[1] for r in c.execute("SELECT state,COUNT(*) FROM tracks GROUP BY state").fetchall()}
                 n = c.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-                return 200, {"status":"READY","events":n,"states":states,"version":VERSION}
+                snaps = c.execute("SELECT COUNT(*) FROM source_snapshots").fetchone()[0]
+                return 200, {"status":"READY","events":n,"source_snapshots":snaps,"states":states,"version":VERSION}
         return 404, {"error":"not found"}
 
 
