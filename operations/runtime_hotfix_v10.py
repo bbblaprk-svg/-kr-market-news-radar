@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 from datetime import time as dtime
 
-REPAIR_VERSION = "OPS_V14_LANE_REPAIR_20261124"
+REPAIR_VERSION = "OPS_V15_CANDIDATE_LIFECYCLE_20261125"
 
 _APPLIED = False
 
@@ -176,7 +176,7 @@ def _hvtb_project_row(row, meta, current, fresh, session_open):
     return row
 
 
-def _hvtb_patch_dashboard(html):
+def _hvtb_patch_dashboard_v14(html):
     """Exact anchors from deployed operations/dashboard.html; fail before writing if layout differs."""
     marker = "HVTB_OPERATIONS_UI_20261124"
     if marker in html:
@@ -206,6 +206,35 @@ def _hvtb_patch_dashboard(html):
     return html
 
 
+def _hvtb_patch_dashboard(html):
+    html=_hvtb_patch_dashboard_v14(html)
+    if 'OPS_V15_POOL_UI' in html:return html
+    edits=[
+        ("let shown=[],latestScan={},hvtbMeta={}; // HVTB_OPERATIONS_UI_20261124", "let shown=[],latestScan={},hvtbMeta={},monitorRows=[],poolMeta={}; // HVTB_OPERATIONS_UI_20261124 OPS_V15_POOL_UI"),
+        ("수신 후보 전체 보기", "보류·재무장·사건 기록 함께 보기"),
+        ("후보 풀은 10분 단위로만 교체합니다. COMPRESSION_ARMED와 RED_NO_CHASE 재무장 감시 종목은 풀을 유지하고, 그 사이에는 30초 상태 확인으로 RED_NO_CHASE → REARM_WATCH → REARMED만 갱신합니다. 승격 2회 확인, 강등 3회 실패 또는 지지 즉시 이탈을 적용합니다.", "집중후보는 현재 거래일의 검증된 선정 결과만 표시합니다. RED_NO_CHASE·REARM_WATCH·DATA_HOLD·신규/만료 사건은 별도 감시 기록입니다. 10분 재선정·30초 상태 확인, 승격 2회·강등 3회 확인 및 지지 이탈 기준은 유지합니다."),
+        ("직전 화면은 ", "마지막 정상 수신은 "),
+        (" 수신 자료입니다.", "입니다. 현재 집중후보는 표시하지 않습니다."),
+        ("function emptyStateMessage(){", "function emptyStateMessage(){\n if(!['events','outcomes','news'].includes(tab)&&!$('allRows').checked&&poolMeta.focus===0)return '<strong>현재 확인된 집중후보 0건</strong><div class=\"cellnote\">보류·재무장·사건 '+esc(poolMeta.monitor??0)+'건은 별도 감시 기록에 보존됩니다. '+(poolMeta.pending?'원장 검증 대기 · 신규 후보 미확정':'현재 집중후보 조건 미충족')+'</div>';"),
+        ("board.filter(r=>tab==='news'||", "(board.concat($('allRows').checked||search?monitorRows:[])).filter(r=>tab==='news'||"),
+        ("if(!['news','events','outcomes'].includes(tab)&&!$('allRows').checked&&!search)source=source.filter(r=>!['EXCLUDED_SECURITY','EVENT_ONLY'].includes(r.live_board_state)&&(tab==='RE_EXPLOSION_25'||r.live_board_state!=='NO_CHASE'));", "if(!['news','events','outcomes'].includes(tab)&&!$('allRows').checked&&!search)source=source.filter(r=>r.candidate_pool_group==='FOCUS');"),
+        ("$('rowCount').textContent=shown.length+' / '+source.length+'건';", "$('rowCount').textContent=shown.length+' / '+source.length+'건';if(!['events','outcomes','news'].includes(tab)&&poolMeta.focus!==undefined)$('rowCount').textContent+=' · 집중 '+poolMeta.focus+' / 감시 '+poolMeta.monitor;"),
+        ("'종목 클릭 → 승격 조건·무효화·데이터 검증 상세';", "'집중후보 '+(poolMeta.focus??'미확인')+'건 · 별도 감시 '+(poolMeta.monitor??'미확인')+'건 · 종목 클릭 → 검증 상세';"),
+        ("tab==='RE_EXPLOSION_25'?badge(r.re25_runtime_state||r.re25_setup_state)", "tab==='RE_EXPLOSION_25'?badge(r.candidate_pool_group==='MONITOR'?(r.live_board_state||'PENDING'):(r.re25_runtime_state||r.re25_setup_state))"),
+        ("esc(r.expansion_phase||'PENDING')", "esc(r.candidate_pool_group==='MONITOR'?('별도 감시 · '+(r.live_board_state||'PENDING')):(r.expansion_phase||'PENDING'))"),
+        ("esc((r.selection_path||[]).join(' → '))+(tab==='HVTB_V1_6'?", "esc((r.selection_path||[]).join(' → '))+'<div class=\"cellnote\">선정 검증 '+when(r.selection_verified_at||r.candidate_seen_at)+'</div>'+(tab==='HVTB_V1_6'?"),
+        ("(k==='board'?laneArg:'')", "(k==='board'?laneArg+(t==='news'?'&view=all':''):'')"),
+        ("board=b.value.rows||[];lastGood=Date.now();", "board=b.value.rows||[];monitorRows=b.value.monitor_rows||[];poolMeta={focus:b.value.focus_total,monitor:b.value.monitor_total,pending:b.value.status!=='READY'};lastGood=Date.now();"),
+        ("latestScan={};board=[];events=[];", "latestScan={};board=[];monitorRows=[];poolMeta={};events=[];"),
+        ("tab=t.dataset.tab;loaded=200;board=[];render();", "tab=t.dataset.tab;loaded=200;board=[];monitorRows=[];poolMeta={};render();"),
+        ("catch(e){if(id!==requestId)return;$('connection')", "catch(e){if(id!==requestId)return;board=[];monitorRows=[];poolMeta={pending:true};render();$('connection')"),
+    ]
+    for old,new in edits:
+        if html.count(old)!=1:raise ValueError('V15_POOL_UI_ANCHOR_MISMATCH: '+old[:75])
+        html=html.replace(old,new,1)
+    return html
+
+
 def _hvtb_install_dashboard():
     from pathlib import Path
     from tempfile import NamedTemporaryFile
@@ -225,6 +254,307 @@ def _hvtb_install_dashboard():
         if tmp is not None and tmp.exists():
             tmp.unlink()
     return "READY_HVTB_TAB"
+
+
+# ---------------------------------------------------------------------------
+# V15 candidate registry: selection evidence, quote updates and audit retention
+# are distinct clocks. No broker path or database schema is changed.
+# ---------------------------------------------------------------------------
+
+def _candidate_evidence_current(row, current, e, refresh_seconds=600):
+    """Only a confirmed discovery can lease a live slot; a quote cannot renew it."""
+    if row.get('candidate_lifecycle') != 'CONFIRMED_THIS_CYCLE' or row.get('candidate_stale') is True:
+        return False
+    misses=_finite_number(row.get('candidate_miss_count'))
+    if misses is not None and misses != 0:
+        return False
+    seen=e.dt(row.get('candidate_seen_at'))
+    ttl=max(600,2*max(300,int(refresh_seconds))+180)
+    return bool(seen and seen.date()==current.date() and e.fresh(row.get('candidate_seen_at'),current,ttl))
+
+
+def _re25_calendar_age(row,current,e):
+    """Five completed KRX sessions, plus current-day event (never a second wave).
+
+    A yesterday spike is age 1 on today's trading day, not a new event.
+    Return (age, status); do not derive age from the persisted observation.
+    """
+    day=e.trade_date(row.get('spike_date'))
+    last=e.last_closed_session(current)
+    dates=e.recent_sessions(last,5) if last else None
+    if not day or not dates or len(dates)!=5:
+        return None,'CALENDAR_PENDING'
+    today=current.date().isoformat()
+    if day==today and day>last:
+        # Calendar proof, not request time, establishes a current trading day.
+        if e.is_snapshot_session(today) is True:return 0,'CURRENT_EVENT'
+        return None,'CALENDAR_PENDING'
+    if day not in dates:
+        return None,'EXPIRED_EVENT' if day<dates[0] else 'CALENDAR_PENDING'
+    age=len(dates)-1-dates.index(day)
+    if today>last and e.is_snapshot_session(today) is True:age+=1
+    return age,'CURRENT_EVENT' if age==0 else 'IN_WINDOW'
+
+
+def _candidate_pool(row,current,e,refresh_seconds=600,*,require_quote=True):
+    """Independent membership and trading status, not a change to stored history.
+
+    FOCUS: fresh selected structure. MONITOR: blocked / pending / rearm / audit.
+    refresh=True is only for recently confirmed current-day structures; archival
+    rows never monopolize the live state-refresh budget.
+    """
+    lane=row.get('lane'); market=row.get('market')
+    proof=_candidate_evidence_current(row,current,e,refresh_seconds)
+    age=None; event_status=None
+    if lane=='RE_EXPLOSION_25':
+        age,event_status=_re25_calendar_age(row,current,e)
+        if market!='KRX' or event_status=='EXPIRED_EVENT':return 'MONITOR','EXPIRED_EVENT',False,age
+        pct=_finite_number(row.get('spike_high_pct'))
+        if event_status=='CURRENT_EVENT' or row.get('re25_event_only') is True or row.get('fast_new_spike') is True or (pct is not None and pct<25):
+            return 'MONITOR','EVENT_ONLY',False,age
+        if event_status!='IN_WINDOW' or pct is None:return 'MONITOR','EVENT_PROOF_PENDING',False,age
+    cap=_finite_number(row.get('market_cap_100m'))
+    if _explicit_exclusion(row.get('name')) or row.get('common_stock_confirmed') is False or (cap is not None and not 700<=cap<=_cap_ceiling()):
+        return 'MONITOR','EXCLUDED_SECURITY',False,age
+    if not proof:
+        return 'MONITOR','DATA_HOLD' if row.get('candidate_lifecycle') in ('DATA_HOLD','HIDDEN_STALE') else 'SELECTION_RECONFIRM_PENDING',False,age
+    # Price refresh never repairs a missing completed KRX history window.
+    if lane!='NXT_POST_ACCEL_LANE' and market=='KRX':
+        last=e.last_closed_session(current)
+        if not last or row.get('history_current') is not True or e.trade_date(row.get('history_asof'))!=last:
+            return 'MONITOR','DAILY_RECONFIRM_PENDING',False,age
+    if lane=='NXT_POST_ACCEL_LANE':
+        hm=current.hour*60+current.minute
+        if market!='NXT' or not ((1000 if current.date().isoformat()==e.SPECIAL_SESSION_DATE else 940)<=hm<1200) or not e.session_open_for_market('NXT',current,None):
+            return 'MONITOR','OUTSIDE_LANE_SESSION',False,age
+    if cap is None or row.get('common_stock_confirmed') is not True:
+        return 'MONITOR','IDENTITY_OR_CAP_PENDING',True,age
+    if require_quote and (not e.fresh(row.get('price_asof'),current) or row.get('quote_quality') in ('STALE','EXPIRED','REST_STALE') or row.get('runtime_quote_grade')=='STALE'):
+        return 'MONITOR','QUOTE_RECONFIRM_PENDING',True,age
+    if lane=='RE_EXPLOSION_25':
+        state=row.get('re25_runtime_state') or row.get('re25_setup_state')
+        if state=='INVALIDATED':return 'MONITOR','INVALIDATED',False,age
+        if state in ('REARM_WATCH','REARM_TRIGGER_PENDING_AUTH','RED_NO_CHASE') or row.get('re25_setup_state')=='RED_NO_CHASE':
+            # REARMED is still only monitoring if the full current gates / chase
+            # check are not satisfied. Never erase the historical no-chase veto.
+            if state!='REARMED' or _chase_ok(row) is not True or row.get('classification') not in ('PRIME','ARMED','PRE_EXPLOSION_ARMED'):
+                return 'MONITOR','REARM_MONITOR',True,age
+        if state!='REARMED' and (row.get('re25_setup_state')!='COMPRESSION_ARMED' or row.get('re25_daily_setup_confirmed') is not True):
+            return 'MONITOR','RECOMPRESSION_PENDING',False,age
+    chase=_chase_ok(row)
+    if chase is False:return 'MONITOR','NO_CHASE',False,age
+    if chase is not True:return 'MONITOR','CHANGE_PENDING',True,age
+    if row.get('classification')=='REJECT':return 'MONITOR','REJECT',False,age
+    if row.get('classification') not in ('PRIME','ARMED','PRE_EXPLOSION_ARMED','WATCH'):
+        return 'MONITOR','SETUP_PENDING',True,age
+    return 'FOCUS',str(row['classification']),True,age
+
+
+def _registry_iter(store,market,lane=None):
+    """One SQLite read snapshot; no price-updated pagination race or stale limit."""
+    import json
+    where='market=? AND active=1'; args=[market]
+    if lane=='RS_HANDOFF':where+=' AND lane IN (?,?)';args+=['ASYMMETRIC_RS','CAPITAL_HANDOFF']
+    elif lane:where+=' AND lane=?';args.append(lane)
+    with store.connect() as con:
+        cursor=con.execute('SELECT key,payload FROM candidates WHERE '+where+' ORDER BY key',args)
+        for key,raw in cursor:
+            row=json.loads(raw)
+            if isinstance(row,dict):yield key,row
+
+
+def _registry_rank(row,e):
+    """Proof time outranks quote time; current valid setups outrank monitoring."""
+    state=row.get('live_board_state') or row.get('classification')
+    states={'PRIME':0,'ARMED':1,'PRE_EXPLOSION_ARMED':2,'WATCH':3,'REARM_MONITOR':4,'IDENTITY_OR_CAP_PENDING':5,'QUOTE_RECONFIRM_PENDING':6,'DAILY_RECONFIRM_PENDING':7,'DATA_HOLD':8,'SELECTION_RECONFIRM_PENDING':9,'NO_CHASE':10,'REJECT':11,'EVENT_ONLY':12,'EXPIRED_EVENT':13,'EXCLUDED_SECURITY':14}
+    seen=e.dt(row.get('candidate_seen_at'))
+    return (states.get(state,15),-(seen.timestamp() if seen else 0),str(row.get('lane') or ''),str(row.get('code') or ''))
+
+
+def _carry_candidate_runtime(row,prev,current,e,source_proven):
+    """A re-scan/new spike must never inherit old intraday counters or vetoes."""
+    if not prev:return
+    # Only maintain intra-session RE25 hysteresis for the same verified episode.
+    # Native full scans provide fresh state for all other lanes; copying old
+    # runtime flags over it is precisely the old candidate-sticking defect.
+    same_session=_candidate_evidence_current(prev,current,e,600)
+    if (source_proven and same_session and row.get('lane')=='RE_EXPLOSION_25'
+        and row.get('spike_date')==prev.get('spike_date')
+        and row.get('re25_setup_state')==prev.get('re25_setup_state')
+        and row.get('re25_setup_state') in ('COMPRESSION_ARMED','RED_NO_CHASE')
+        and row.get('re25_event_only') is not True
+        and _re25_calendar_age(row,current,e)[1]=='IN_WINDOW'):
+        for k in ('re25_runtime_state','rearm_peak_price','rearm_support_reference','rearm_quiet_confirm_count','rearm_trigger_confirm_count','rearm_fail_count','rearm_watch_started_at','rearm_watch_price','rearm_breakout_level','rearm_watch_volume_velocity','rearm_confirmed_at','rearm_prev_volume','rearm_prev_at','rearm_prev_volume_velocity'):
+            if k in prev:row[k]=prev[k]
+
+
+def _install_candidate_lifecycle(e):
+    """Replace the actual registry/refresh policy, not the broker collection path."""
+    import json
+    from contextvars import ContextVar
+    clock=ContextVar('ops_v15_scan_clock',default=None)
+    original_scan=e.Operations.scan
+    def scan(self,current=None):
+        token=clock.set(current or e.now())
+        try:return original_scan(self,current)
+        finally:clock.reset(token)
+    e.Operations.scan=scan
+    original_refresh=e.Operations.refresh_candidate_states
+    def refresh(self,current=None):
+        token=clock.set(current or e.now())
+        try:return original_refresh(self,current)
+        finally:clock.reset(token)
+    e.Operations.refresh_candidate_states=refresh
+    original_qualify=e.qualify_re25_event
+    def qualify(event,live_row):
+        row=dict(event or {})
+        current=clock.get() or e.now()
+        age,status=_re25_calendar_age(row,current,e)
+        if age is not None:row.update(spike_age=age,fast_new_spike=(age==0))
+        return original_qualify(row,live_row)
+    e.qualify_re25_event=qualify
+
+    def active_payloads(self,market,lane=None,limit=1500):
+        # Full selection scans still inspect the full registry via reconcile.
+        # Only live state-refresh work is leased; current REARM monitor included.
+        now=clock.get() or e.now(); kept=[]
+        for key,row in _registry_iter(self,market,lane):
+            group,state,refresh,age=_candidate_pool(row,now,e,require_quote=False)
+            if refresh:
+                kept.append((_registry_rank(dict(row,live_board_state=state),e),key,row))
+        kept.sort(key=lambda x:x[0])
+        return [(k,r) for _,k,r in kept[:max(0,int(limit))]]
+    e.Store.active_payloads=active_payloads
+
+    def reconcile(self,market,lane,rows,complete,current):
+        # Deployed Store.reconcile semantics retained: only affirmative proof
+        # increments misses or produces EXIT; source outage preserves history.
+        # Runtime state is no longer copied indiscriminately onto a new scan.
+        at=e.stamp(current);max_misses=max(1,int(os.getenv('OPERATIONS_CANDIDATE_MAX_MISSES','3')))
+        with self.connect() as c:
+            previous={r['key']:r for r in c.execute('SELECT * FROM candidates WHERE market=? AND lane=? AND active=1',(market,lane))}
+            seen=set()
+            for row in rows:
+                key=market+':'+lane+':'+row['code'];seen.add(key)
+                old=c.execute('SELECT * FROM candidates WHERE key=?',(key,)).fetchone()
+                prev=json.loads(old['payload']) if old else {}
+                source_proven=(complete is True or (isinstance(complete,(set,frozenset)) and row['code'] in complete))
+                _carry_candidate_runtime(row,prev,current,e,source_proven)
+                if old and not old['active'] and not source_proven:continue
+                if not source_proven:
+                    if row.get('classification')=='PRIME':row['classification']='WATCH'
+                    row['decision']='PENDING';row['data_status']='PENDING'
+                    row['gate_pending']=sorted(set(list(row.get('gate_pending') or [])+['SOURCE_RECONFIRM_PENDING']))
+                row.update(candidate_seen_at=at if source_proven else prev.get('candidate_seen_at'),
+                           candidate_observed_at=at,candidate_miss_count=0 if source_proven else int(prev.get('candidate_miss_count') or 0),
+                           candidate_stale=False if source_proven else (prev.get('candidate_stale') is True),
+                           candidate_last_miss_at=None if source_proven else prev.get('candidate_last_miss_at'),
+                           candidate_lifecycle='CONFIRMED_THIS_CYCLE' if source_proven else 'OBSERVED_UNVERIFIED')
+                # Membership is also enforced before a signal/outcome is persisted.
+                # In particular, a same-episode INVALIDATED state must not become
+                # a new PRIME merely because a fresh daily producer reran.
+                if row.get('classification')=='PRIME' or row.get('decision')=='PRIME':
+                    group,pool_reason,_,_=_candidate_pool(row,current,e)
+                    if group!='FOCUS' or row.get('classification')!='PRIME' or row.get('decision')!='PRIME':
+                        row.update(classification='WATCH',decision='PENDING',data_status='PENDING',entry_phase='집중후보 자격 재검증 대기')
+                        row['gate_pending']=sorted(set(list(row.get('gate_pending') or [])+['CANDIDATE_POOL_RECONFIRM:'+pool_reason]))
+                        if lane=='HVTB_V1_6':row.update(hvtb_action_state='ACTION_WAIT',hvtb_action_reason=pool_reason)
+                state_keys=('classification','decision','upstream_state','gate_failures','gate_pending','spike_date','re25_runtime_state','candidate_stale')
+                changed=any(prev.get(k)!=row.get(k) for k in state_keys)
+                event='NEW' if not old or not old['active'] else ('EXIT' if source_proven and row['classification']=='REJECT' and prev.get('classification')!='REJECT' else 'REENTER' if source_proven and prev.get('candidate_stale') is True else 'CHANGE' if changed else 'HOLD')
+                occ=(old['occurrences'] if old else 0)+(event in ('NEW','REENTER'))
+                row.update(first_seen_at=old['first_at'] if old else at,occurred_at=at if source_proven and (changed or event in ('NEW','REENTER')) else prev.get('occurred_at',at),last_seen_at=at,occurrences=occ)
+                sid=old['signal_id'] if old else None
+                if row['classification']=='PRIME' and (not old or not old['active'] or prev.get('classification')!='PRIME'):
+                    sid=key+':'+at
+                    c.execute('INSERT OR IGNORE INTO outcomes(id,market,lane,code,name,entry_at,entry_price,stop,target,mfe,mae,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(sid,market,lane,row['code'],row['name'],at,row['entry_price'],row['stop_price'],row['target_price'],0,0,'TRACKING_SIGNAL'))
+                row['signal_id']=sid
+                if event!='HOLD' or (row.get('price_asof')!=prev.get('price_asof') and row.get('data_status')=='READY'):
+                    reason='; '.join(row.get('gate_failures',[])+row.get('gate_pending',[])) or 'ALL_REQUIRED_GATES_PASS'
+                    c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',(at,market,lane,row['code'],row['name'],event,reason,json.dumps(self._event_snapshot(row),ensure_ascii=False)))
+                c.execute('INSERT OR REPLACE INTO candidates VALUES(?,?,?,?,?,?,?,?,?,?)',(key,market,lane,row['code'],1,json.dumps(e.clean(row),ensure_ascii=False),row['first_seen_at'],at if source_proven or not old else old['last_at'],occ,sid))
+            for key,old in previous.items():
+                if key in seen:continue
+                p=json.loads(old['payload'])
+                fully_evaluated=complete is True or (isinstance(complete,(set,frozenset)) and old['code'] in complete)
+                if not fully_evaluated:
+                    p=e.data_hold(p,at=at,reason='SOURCE_INCOMPLETE')
+                    c.execute('UPDATE candidates SET payload=? WHERE key=?',(json.dumps(e.clean(p),ensure_ascii=False),key));continue
+                previous_miss_at=e.dt(p.get('candidate_last_miss_at'));scan_at=e.dt(at)
+                distinct=not(previous_miss_at and scan_at and scan_at<=previous_miss_at)
+                missed=min(max_misses,int(p.get('candidate_miss_count') or 0)+(1 if distinct else 0))
+                if missed<max_misses:
+                    p.update(classification='WATCH',decision='PENDING',data_status='PENDING',candidate_miss_count=missed,candidate_stale=False,candidate_last_miss_at=at if distinct else p.get('candidate_last_miss_at'),candidate_lifecycle='VERIFIED_MISS_'+str(missed),gate_pending=sorted(set(list(p.get('gate_pending') or [])+['CONFIRMED_RESCAN_NOT_SELECTED'])))
+                    c.execute('UPDATE candidates SET payload=?,last_at=? WHERE key=?',(json.dumps(e.clean(p),ensure_ascii=False),at,key));continue
+                c.execute('UPDATE candidates SET active=0,last_at=? WHERE key=?',(at,key))
+                c.execute('INSERT INTO events(at,market,lane,code,name,event,reason,payload) VALUES(?,?,?,?,?,?,?,?)',(at,market,lane,p['code'],p['name'],'EXIT','VERIFIED_CODE_NOT_SELECTED_3_CYCLES',json.dumps(self._event_snapshot(p),ensure_ascii=False)))
+    e.Store.reconcile=reconcile
+
+
+def _install_repair_scheduling(e):
+    """Repair-only calendar fallback and retry; no trading gate relaxation."""
+    from operations import history_repair as hr
+    R=hr.KRXHistoryRepair
+    from contextvars import ContextVar
+    date_basis=ContextVar("ops_v15_repair_date_basis",default=None)
+    original_expected=hr.expected_closed_daily_date
+    def expected(manifest,current,market=None):
+        day=original_expected(manifest,current,market)
+        if day:
+            date_basis.set("KIS_MANIFEST_AND_XKRX");return day
+        if market!='KRX' or not R.allowed(current):return day
+        # batch still requires source('KRX').complete and verifies all six actual
+        # LS candles before counting a repair. A missing manifest need not stop
+        # a read-only history backfill; it remains mandatory for signal gates.
+        day=e.last_closed_session(current)
+        if day and e.is_snapshot_session(day) is True:
+            date_basis.set("XKRX_CALENDAR_REPAIR_ONLY");return day
+        return None
+    hr.expected_closed_daily_date=expected
+    old_batch=R.batch
+    def batch(self,*a,**kw):
+        token=date_basis.set(None)
+        try:return old_batch(self,*a,**kw)
+        finally:date_basis.reset(token)
+    R.batch=batch
+    old_set=R._set
+    def set_state(self,**updates):
+        basis=date_basis.get()
+        if basis:updates.setdefault('repair_target_basis',basis)
+        status=updates.get('status') or self.state.get('status')
+        if status not in (None,'PAUSED') and updates.get('reason'):
+            updates.update(last_active_status=status,last_active_reason=updates['reason'],last_active_at=updates.get('asof') or e.stamp(),last_active_error=updates.get('last_error',self.state.get('last_error')))
+        if updates.get('status')=='PAUSED':
+            updates.setdefault('next_repair_target',e.last_closed_session(self.clock()))
+        return old_set(self,**updates)
+    R._set=set_state
+    old_init=R.__init__
+    def init(self,*a,**kw):
+        old_init(self,*a,**kw)
+        import json
+        try:
+            prior=json.loads(self.path.read_text(encoding='utf-8'))
+            for k in ('last_active_status','last_active_reason','last_active_at','last_active_error','repair_target_basis'):
+                if k in prior:self.state[k]=prior[k]
+        except (OSError,ValueError,TypeError):pass
+    R.__init__=init
+    def start(self):
+        if self.thread and self.thread.is_alive():return
+        import threading
+        def loop():
+            self.stop.wait(40)
+            while not self.stop.is_set():
+                try:
+                    result=self.batch();reason=result.get('reason')
+                    if reason=='NATIVE_SCAN_RUNNING':wait=60
+                    elif reason in ('LS_BROKER_CIRCUIT_OPEN','LS_HISTORY_ADAPTER_UNAVAILABLE','KIS_UNIVERSE_OR_COMPLETED_DAY_UNVERIFIED','LS_SYMBOL_RETRY_COOLDOWN'):wait=900
+                    elif result.get('status')=='REPAIRING':wait=45
+                    else:wait=600
+                except Exception as exc:
+                    self._set(status='PENDING',reason='UNEXPECTED_REPAIR_EXCEPTION',last_error=type(exc).__name__,asof=e.stamp());wait=900
+                self.stop.wait(wait)
+        self.thread=threading.Thread(target=loop,name='krx-ls-daily-repair-v15',daemon=True);self.thread.start()
+    R.start=start
 
 
 def apply() -> None:
@@ -445,7 +775,7 @@ def apply() -> None:
         logging.getLogger(__name__).exception("HVTB dashboard integration failed")
         e.HVTB_DASHBOARD_STATUS = "ERROR:" + type(exc).__name__
     repair_errors={}
-    for label,installer in (("AUDIT",lambda:_install_operations_audit(e)),("HISTORY",lambda:_install_history_cutoff_repair(e)),("CHECKPOINT",_install_compact_checkpoint),("DAILY_DISCOVERY",lambda:_install_independent_daily(e))):
+    for label,installer in (("AUDIT",lambda:_install_operations_audit(e)),("HISTORY",lambda:_install_history_cutoff_repair(e)),("CHECKPOINT",_install_compact_checkpoint),("DAILY_DISCOVERY",lambda:_install_independent_daily(e)),("CANDIDATE_LIFECYCLE",lambda:_install_candidate_lifecycle(e)),("REPAIR_SCHEDULING",lambda:_install_repair_scheduling(e))):
         try:installer()
         except Exception as exc:repair_errors[label]=type(exc).__name__
     e.OPERATIONS_REPAIR_ERRORS=repair_errors
@@ -1575,6 +1905,56 @@ def _install_compact_checkpoint():
     Checkpoint.save=save
 
 
+def _project_pool_row(row,payload,now,e,refresh_seconds=600):
+    """Uniform safety projection followed by independent candidate membership."""
+    # Every row, including later native pages, must pass the same
+    # HVTB-specific freshness projection before display.
+    # Preserve the persisted classification before live projection.
+    row["stored_classification"]=row.get("classification")
+    row["stored_spike_age"]=row.get("spike_age") if row.get("lane")=="RE_EXPLOSION_25" else None
+    if row.get("lane")=="RE_EXPLOSION_25":
+        age,event_status=_re25_calendar_age(row,now,e)
+        row["spike_age"]=age
+        row["event_window_status"]=event_status
+    row["stored_decision"]=row.get("decision")
+    if row.get("lane")=="HVTB_V1_6":
+        _hvtb_project_row(row,payload.get("hvtb_lane_status") or {},now,e.fresh,e.session_open_for_market)
+    ch=e.number(row.get("change_pct")); p=e.number(row.get("price")); st=e.number(row.get("stop_price")); t=e.number(row.get("target_price"))
+    valid=all(v is not None for v in (p,st,t)) and 0<st<p<t
+    rr=(t-p)/(p-st) if valid else None
+    row["live_rr"]=rr
+    cap=_finite_number(row.get("market_cap_100m"))
+    excluded=_explicit_exclusion(row.get("name")) or row.get("common_stock_confirmed") is False or (cap is not None and not 700<=cap<=_cap_ceiling())
+    chase=_chase_ok(row)
+    if excluded:row["live_board_state"]="EXCLUDED_SECURITY"
+    elif row.get("lane")=="RE_EXPLOSION_25" and (_entry_policy(row).get("RE25_EVENT_VALID") is False):row["live_board_state"]="EVENT_ONLY"
+    elif chase is False:row["live_board_state"]="NO_CHASE"
+    elif row.get("classification")=="REJECT":row["live_board_state"]="REJECT"
+    elif row.get("candidate_lifecycle") in ("DATA_HOLD","OBSERVED_UNVERIFIED") or not e.fresh(row.get("price_asof"),now):row["live_board_state"]="DATA_HOLD"
+    else:row["live_board_state"]=row.get("classification") or "WATCH"
+    original_prime=row.get("stored_classification")=="PRIME" or row.get("stored_decision")=="PRIME"
+    safe=False
+    if row.get("classification")=="PRIME" or row.get("decision")=="PRIME":
+        gates=row.get("gates") or {}
+        fresh_trade=((row.get("timestamp_quality")=="EXCHANGE_TIMESTAMP" and e.fresh(row.get("price_asof"),now) and row.get("quote_quality") not in ("STALE","EXPIRED","REST_STALE")) or _corroborated_rest(row,now,e.fresh))
+        safe=(row.get("live_board_state")!="EVENT_ONLY" and all(v is True for v in _entry_policy(row).values()) and not excluded and chase is True and cap is not None and 700<=cap<=_cap_ceiling() and row.get("common_stock_confirmed") is True and (row.get("market")!="KRX" or row.get("authority_symbol_membership_verified") is True) and row.get("candidate_lifecycle") not in ("DATA_HOLD","OBSERVED_UNVERIFIED") and row.get("candidate_stale") is not True and fresh_trade and e.fresh(row.get("signal_asof"),now,600) and e.session_open_for_market(row.get("market"),now,row.get("session_open")) and (row.get("lane")!="NXT_POST_ACCEL_LANE" or (row.get("market")=="NXT" and ((1000 if now.date().isoformat()==e.SPECIAL_SESSION_DATE else 940)<=now.hour*60+now.minute<1200))) and bool(gates) and all(v=="PASS" for v in gates.values()) and rr is not None and rr>=2 and (p-st)/p<=.06 and row.get("target_source") not in (None,"","PENDING","UNAVAILABLE") and row.get("stop_source") not in (None,"","PENDING","UNAVAILABLE"))
+        if not safe:
+            row.update(classification="WATCH",decision="PENDING",entry_phase="진입 전 · 현재 상태 재검증",live_board_state="EXCLUDED_SECURITY" if excluded else "EVENT_ONLY" if row.get("live_board_state")=="EVENT_ONLY" else "NO_CHASE" if chase is False else "DATA_HOLD")
+            if row.get("lane")=="HVTB_V1_6":row.update(hvtb_action_state="ACTION_WAIT",hvtb_action_reason="LIVE_COMMON_GATE_RECONFIRM")
+            row["runtime_lane_state"]=row["live_board_state"]
+    group,state,refresh,age=_candidate_pool(row,now,e,refresh_seconds)
+    if original_prime and not safe and group=="FOCUS":
+        group,state="MONITOR","ENTRY_RECONFIRM_PENDING"
+    row.update(candidate_pool_group=group,live_board_state=state,pool_refresh_eligible=refresh,
+               selection_verified_at=row.get("candidate_seen_at"))
+    if row.get("lane")=="RE_EXPLOSION_25":row["spike_age"]=age
+    if group=="MONITOR":
+        if row.get("classification") in ("PRIME","ARMED","PRE_EXPLOSION_ARMED") or row.get("decision") in ("PRIME","ARMED","PRE_EXPLOSION_ARMED"):
+            row.update(classification="WATCH",decision="PENDING",entry_phase="집중후보 제외 · 재검증 필요")
+        if row.get("hvtb_action_state")=="ACTION":row.update(hvtb_action_state="ACTION_WAIT",hvtb_action_reason=state)
+    return row
+
+
 def _install_operations_audit(e):
     """Observation-only diagnostics across all lanes. Never modifies broker data."""
     import time
@@ -1607,7 +1987,7 @@ def _install_operations_audit(e):
         payload["repair_version"]=REPAIR_VERSION
         payload["repair_errors"]=getattr(e,"OPERATIONS_REPAIR_ERRORS",{}).copy()
         payload["provider_diagnostics"]=getattr(self,"_v11_provider_diagnostics",{}).copy()
-        payload["policy"]={"cap_min_100m":700,"cap_max_100m":_cap_ceiling(),"min_live_rr":2,"max_live_risk_pct":6,"krx_no_chase_above_pct":5,"nxt_post_no_chase_at_pct":10,"broker_identity_required_for_entry":True,"daily_proxy_is_not_investor_flow":True}
+        payload["policy"]={"cap_min_100m":700,"cap_max_100m":_cap_ceiling(),"min_live_rr":2,"max_live_risk_pct":6,"krx_no_chase_above_pct":5,"nxt_post_no_chase_at_pct":10,"broker_identity_required_for_entry":True,"daily_proxy_is_not_investor_flow":True,"candidate_pool":"CURRENT_CONFIRMED_SELECTION_ONLY","selection_ttl_seconds":max(600,2*max(300,int(getattr(self,"candidate_refresh_seconds",600)))+180),"quote_does_not_renew_selection":True,"monitor_view":"view=monitor"}
         def label_scan(scan):
             if not isinstance(scan,dict):return scan
             scan=dict(scan)
@@ -1635,65 +2015,50 @@ def _install_operations_audit(e):
             lane=(query.get("lane") or [None])[0]
             requested_limit=max(20,min(300,int((query.get("limit") or ["80"])[0])))
             requested_offset=max(0,int((query.get("offset") or ["0"])[0]))
-            # Native Store.board is bounded at 300 per query. Rank a bounded,
-            # complete active lane before slicing; retain native audit totals.
-            # If a lane exceeds the cap, make the coverage limit explicit.
-            native_board=getattr(self.store,"board",None)
-            ranked_scope=None
-            if callable(native_board) and lane:
-                all_rows=[]; seen=set(); total=None
-                try:
-                    for start in range(0,1500,300):
-                        page=native_board(market,300,start,lane)
-                        if not isinstance(page,dict):raise ValueError("INVALID_BOARD_PAGE")
-                        total=int(page.get("total",0)); batch=page.get("rows") or []
-                        for item in batch:
-                            key=(item.get("lane"),item.get("code"))
-                            if key not in seen:seen.add(key);all_rows.append(item)
-                        if len(batch)<300 or start+300>=total:break
-                    payload["rows"]=all_rows
-                    payload["total"]=total
-                    ranked_scope=len(all_rows)
-                    payload["ranking_scope"]={"evaluated":ranked_scope,"total":total,"complete":ranked_scope==total}
-                except Exception as exc:
-                    payload["ranking_scope"]={"complete":False,"error":type(exc).__name__}
-            for row in payload.get("rows",[]):
-                if not isinstance(row,dict):continue
-                # Every row, including later native pages, must pass the same
-                # HVTB-specific freshness projection before display.
-                # Preserve the persisted classification before live projection.
-                row["stored_classification"]=row.get("classification")
-                row["stored_decision"]=row.get("decision")
-                if row.get("lane")=="HVTB_V1_6":
-                    _hvtb_project_row(row,payload.get("hvtb_lane_status") or {},now,e.fresh,e.session_open_for_market)
-                ch=e.number(row.get("change_pct")); p=e.number(row.get("price")); st=e.number(row.get("stop_price")); t=e.number(row.get("target_price"))
-                valid=all(v is not None for v in (p,st,t)) and 0<st<p<t
-                rr=(t-p)/(p-st) if valid else None
-                row["live_rr"]=rr
-                cap=_finite_number(row.get("market_cap_100m"))
-                excluded=_explicit_exclusion(row.get("name")) or row.get("common_stock_confirmed") is False or (cap is not None and not 700<=cap<=_cap_ceiling())
-                chase=_chase_ok(row)
-                if excluded:row["live_board_state"]="EXCLUDED_SECURITY"
-                elif row.get("lane")=="RE_EXPLOSION_25" and (_entry_policy(row).get("RE25_EVENT_VALID") is False):row["live_board_state"]="EVENT_ONLY"
-                elif chase is False:row["live_board_state"]="NO_CHASE"
-                elif row.get("classification")=="REJECT":row["live_board_state"]="REJECT"
-                elif row.get("candidate_lifecycle") in ("DATA_HOLD","OBSERVED_UNVERIFIED") or not e.fresh(row.get("price_asof"),now):row["live_board_state"]="DATA_HOLD"
-                else:row["live_board_state"]=row.get("classification") or "WATCH"
-                if row.get("classification")=="PRIME" or row.get("decision")=="PRIME":
-                    gates=row.get("gates") or {}
-                    fresh_trade=((row.get("timestamp_quality")=="EXCHANGE_TIMESTAMP" and e.fresh(row.get("price_asof"),now) and row.get("quote_quality") not in ("STALE","EXPIRED","REST_STALE")) or _corroborated_rest(row,now,e.fresh))
-                    safe=(row.get("live_board_state")!="EVENT_ONLY" and all(v is True for v in _entry_policy(row).values()) and not excluded and chase is True and cap is not None and 700<=cap<=_cap_ceiling() and row.get("common_stock_confirmed") is True and (row.get("market")!="KRX" or row.get("authority_symbol_membership_verified") is True) and row.get("candidate_lifecycle") not in ("DATA_HOLD","OBSERVED_UNVERIFIED") and row.get("candidate_stale") is not True and fresh_trade and e.fresh(row.get("signal_asof"),now,600) and e.session_open_for_market(row.get("market"),now,row.get("session_open")) and (row.get("lane")!="NXT_POST_ACCEL_LANE" or (row.get("market")=="NXT" and ((1000 if now.date().isoformat()==e.SPECIAL_SESSION_DATE else 940)<=now.hour*60+now.minute<1200))) and bool(gates) and all(v=="PASS" for v in gates.values()) and rr is not None and rr>=2 and (p-st)/p<=.06 and row.get("target_source") not in (None,"","PENDING","UNAVAILABLE") and row.get("stop_source") not in (None,"","PENDING","UNAVAILABLE"))
-                    if not safe:
-                        row.update(classification="WATCH",decision="PENDING",entry_phase="진입 전 · 현재 상태 재검증",live_board_state="EXCLUDED_SECURITY" if excluded else "EVENT_ONLY" if row.get("live_board_state")=="EVENT_ONLY" else "NO_CHASE" if chase is False else "DATA_HOLD")
-                        if row.get("lane")=="HVTB_V1_6":row.update(hvtb_action_state="ACTION_WAIT",hvtb_action_reason="LIVE_COMMON_GATE_RECONFIRM")
-                        row["runtime_lane_state"]=row["live_board_state"]
-            # Active candidates are ranked before pagination within the explicit bounded scope.
-            rank={"PRIME":0,"ARMED":1,"PRE_EXPLOSION_ARMED":2,"WATCH":3,"DATA_HOLD":4,"NO_CHASE":5,"EXCLUDED_SECURITY":6,"REJECT":7,"EVENT_ONLY":8}
-            if isinstance(payload.get("rows"),list):
-                payload["rows"].sort(key=lambda z:rank.get(z.get("live_board_state"),4))
-                if ranked_scope is not None:
-                    payload["rows"]=payload["rows"][requested_offset:requested_offset+requested_limit]
-                    payload["offset"]=requested_offset
+            view=(query.get("view") or ["focus"])[0]
+            if view not in ("focus","monitor","all"):return 400,{"error":"view must be focus, monitor or all"}
+            # One consistent, streamed registry snapshot. Only current focus
+            # rows compete for its page. Historical/blocked rows have their own
+            # count and page; no quote refresh can grant a candidate slot.
+            from collections import Counter
+            from bisect import insort
+            focus=[]; monitor=[]; counts=Counter(); evaluated=0
+            page_cap=min(10000,requested_offset+requested_limit)
+            if requested_offset>=10000:return 400,{"error":"offset must be below 10000"}
+            try:
+                registry=_registry_iter(self.store,market,lane)
+                for _,row in registry:
+                    evaluated+=1
+                    _project_pool_row(row, payload, now, e, getattr(self,"candidate_refresh_seconds",600))
+                    group=row["candidate_pool_group"]
+                    counts[group]+=1;counts["state:"+row["live_board_state"]]+=1
+                    bucket=focus if group=="FOCUS" else monitor
+                    # Unique registry key is implicit in the ranking tuple (lane/code).
+                    # Bound retained memory even on the all-market news view.
+                    item=(_registry_rank(row,e),row)
+                    insort(bucket,item,key=lambda z:z[0])
+                    if len(bucket)>page_cap:bucket.pop()
+            except Exception as exc:
+                return 503,{"status":"PENDING","error":"CANDIDATE_REGISTRY_READ_FAILED","error_type":type(exc).__name__,"rows":[],"repair_version":REPAIR_VERSION}
+            frows=[z[1] for z in focus];mrows=[z[1] for z in monitor]
+            chosen=frows if view=="focus" else mrows if view=="monitor" else frows+mrows
+            total=counts["FOCUS"] if view=="focus" else counts["MONITOR"] if view=="monitor" else evaluated
+            # In the all view, the focus count (not the truncated focus list)
+            # establishes the monitor offset. For offsets >= focus count the
+            # retained monitor prefix still covers the requested monitor page.
+            if view=="all":
+                fstart=requested_offset;fend=min(counts["FOCUS"],requested_offset+requested_limit)
+                fpage=frows[fstart:fend] if fstart<counts["FOCUS"] else []
+                mstart=max(0,requested_offset-counts["FOCUS"])
+                mend=max(0,requested_offset+requested_limit-counts["FOCUS"])
+                selected=fpage+mrows[mstart:mend]
+            else:selected=chosen[requested_offset:requested_offset+requested_limit]
+            payload.update(rows=selected,total=total,offset=requested_offset,view=view,
+                           focus_total=counts["FOCUS"],monitor_total=counts["MONITOR"],registry_total=evaluated,
+                           monitor_rows=mrows[:requested_limit] if view=="focus" else [],
+                           pool_state_counts={k[6:]:v for k,v in counts.items() if k.startswith("state:")},
+                           ranking_scope={"evaluated":evaluated,"total":evaluated,"complete":True},
+                           pool_status="CURRENT_FOCUS" if counts["FOCUS"] else "NO_CURRENT_FOCUS")
         return status,payload
     e.Operations.api=api_v11
 
