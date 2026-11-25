@@ -31767,3 +31767,23 @@ COPY operations /app/operations
 RUN python /app/operations/install.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
  && python -m py_compile /app/operations/*.py /app/오백종목_통합엔진_웹서비스_V1_0.py \
  && PYTHONPATH=/app python -m unittest operations.test_engine -q
+# Add to Dockerfile.alpha500-onebox.txt after Python dependencies and before final runtime start.
+COPY smart_reaccel_mtf_backtest.py /app/smart_reaccel_mtf_backtest.py
+ENV SMART_REACCEL_BT_AUTORUN=true \
+    SMART_REACCEL_BT_DAYS=10 \
+    SMART_REACCEL_BT_MAX_EVENTS=500 \
+    SMART_REACCEL_BT_LS_INTERVAL=1.12
+RUN python -m py_compile /app/smart_reaccel_mtf_backtest.py && python - <<'PY'
+from pathlib import Path
+p=Path('/app/오백종목_통합엔진_웹서비스_V1_0.py')
+s=p.read_text(encoding='utf-8')
+mark='SMART_REACCEL_MTF_BACKTEST_V2_IMPORT'
+anchor='\nif __name__ == "__main__":\n    main()'
+if mark not in s:
+    if anchor not in s:
+        raise SystemExit('SMART_REACCEL_PATCH_MAIN_ANCHOR_NOT_FOUND')
+    block='\n# '+mark+'\ntry:\n    import smart_reaccel_mtf_backtest\nexcept Exception as _smart_bt_err:\n    print(f"SMART_REACCEL_IMPORT_ERROR {type(_smart_bt_err).__name__}: {_smart_bt_err}", flush=True)\n'
+    s=s.replace(anchor,block+anchor,1)
+    p.write_text(s,encoding='utf-8')
+print('SMART_REACCEL_MTF_PATCH_OK')
+PY
