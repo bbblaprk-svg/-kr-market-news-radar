@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 from datetime import time as dtime
 
-REPAIR_VERSION = "OPS_V15_CANDIDATE_LIFECYCLE_20261125"
+REPAIR_VERSION = "OPS_REVIEWED_RECOVERY_20261125"
 
 _APPLIED = False
 
@@ -118,6 +118,65 @@ def _hvtb_authority_adapter(row):
     return r
 
 
+def _merge_identity(*values):
+    # An explicit exclusion must never be overridden by a positive classification.
+    # Unknown is not an exclusion and is not a positive classification.
+    if any(v is False for v in values):return False
+    if any(v is True for v in values):return True
+    return None
+
+
+def _master_identity(ops, market, symbol, current, e):
+    """Read only existing configured metadata, no new broker or network call.
+
+    Explicit source type required. A conflicting record is ineligible, not
+    silently upgraded. Stale, malformed, or absent sources remain unknown.
+    Metadata cannot establish KRX/NXT membership or live quote freshness.
+    """
+    import json, time
+    from pathlib import Path
+    cache=getattr(ops,'_ops_identity_master_cache',{})
+    now_mono=time.monotonic(); hit=cache.get(market)
+    if hit and now_mono-hit[0]<60 and hit[1]==current.date().isoformat():return hit[2].get(symbol)
+    objects=[]; errors=[]
+    fn=(getattr(ops,'providers',{}) or {}).get('security_master')
+    if callable(fn):
+        try:objects.append(fn(market))
+        except Exception as exc:errors.append('PROVIDER:'+type(exc).__name__)
+    path=os.getenv('OPS_SECURITY_MASTER_JSON','').strip()
+    if path:
+        try:
+            p=Path(path)
+            if p.stat().st_size<=16_000_000:objects.append(json.loads(p.read_text(encoding='utf-8')))
+            else:errors.append('MASTER_FILE_TOO_LARGE')
+        except (OSError,ValueError,TypeError) as exc:errors.append('FILE:'+type(exc).__name__)
+    result={}; accepted=0; conflicts=0
+    for obj in objects:
+        if not isinstance(obj,dict) or obj.get('market')!=market or not e.fresh(obj.get('asof'),current,86400):
+            errors.append('MASTER_SOURCE_OR_DATE_UNVERIFIED');continue
+        rows=obj.get('rows')
+        if not isinstance(rows,list) or len(rows)>20000:
+            errors.append('MASTER_ROWS_INVALID');continue
+        accepted+=1
+        for raw in rows:
+            if not isinstance(raw,dict):continue
+            c=e.code(raw)
+            if not e.valid_code(c) or e.venue(raw) not in (None,market):continue
+            typ=str(raw.get('security_type') or raw.get('instrument_type') or '').upper()
+            if typ in ('COMMON','COMMON_STOCK','보통주'):
+                v=False if raw.get('auto_eligible') is False or any(raw.get(k) is True for k in ('trading_halt','liquidation','management')) or _explicit_exclusion(raw.get('name')) else True
+            elif typ in ('ETF','ETN','ETP','PREFERRED','SPAC','REIT','NON_COMMON','FOREIGN_LISTED','NON_DOMESTIC_MARKET','우선주','스팩','리츠'):
+                v=False
+            else:continue
+            if c in result and result[c]!=v:conflicts+=1
+            result[c]=_merge_identity(result.get(c),v)
+    cache[market]=(now_mono,current.date().isoformat(),result);ops._ops_identity_master_cache=cache
+    diag=getattr(ops,'_ops_identity_master_diagnostics',{})
+    diag[market]={'status':'READY' if result else 'PENDING','verified_count':len(result),'common_count':sum(v is True for v in result.values()),'exclusion_count':sum(v is False for v in result.values()),'accepted_sources':accepted,'conflicts':conflicts,'errors':errors or ([] if objects else ['NO_CONFIGURED_EXPLICIT_MASTER']),'checked_at':e.stamp(current)}
+    ops._ops_identity_master_diagnostics=diag
+    return result.get(symbol)
+
+
 def _corroborated_rest(row,current,fresh):
     """Two independent price observations; request time is still NOT exchange time."""
     from math import isfinite
@@ -208,7 +267,7 @@ def _hvtb_patch_dashboard_v14(html):
 
 def _hvtb_patch_dashboard(html):
     html=_hvtb_patch_dashboard_v14(html)
-    if 'OPS_V15_POOL_UI' in html:return html
+    if 'OPS_V15_POOL_UI' in html:return _research_dashboard(html)
     edits=[
         ("let shown=[],latestScan={},hvtbMeta={}; // HVTB_OPERATIONS_UI_20261124", "let shown=[],latestScan={},hvtbMeta={},monitorRows=[],poolMeta={}; // HVTB_OPERATIONS_UI_20261124 OPS_V15_POOL_UI"),
         ("수신 후보 전체 보기", "보류·재무장·사건 기록 함께 보기"),
@@ -231,6 +290,24 @@ def _hvtb_patch_dashboard(html):
     ]
     for old,new in edits:
         if html.count(old)!=1:raise ValueError('V15_POOL_UI_ANCHOR_MISMATCH: '+old[:75])
+        html=html.replace(old,new,1)
+    return _research_dashboard(html)
+
+
+def _research_dashboard(html):
+    if 'OPS_RESEARCH_PANEL_20261125' in html:return html
+    edits=[
+        ('</section><div class="rules">','</section><section class="panel" id="researchPanel" hidden><div class="panelhead"><h2>신규 발굴 · 매수 미승인</h2><p id="researchDescription"></p></div><div id="researchList" style="padding:12px"></div></section><div class="rules">'),
+        ('hvtbMeta={},monitorRows=[],poolMeta={};','hvtbMeta={},monitorRows=[],poolMeta={},researchRows=[],researchTotal=0; /* OPS_RESEARCH_PANEL_20261125 */'),
+        ('function render(){drawTabs();stats();','function render(){drawTabs();stats();renderResearch();'),
+        ('async function fetchJSON(path,signal){',"function renderResearch(){const panel=$('researchPanel'),list=$('researchList');if(!panel||!list)return;panel.hidden=['events','outcomes','news'].includes(tab)||!researchRows.length;list.replaceChildren();$('researchDescription').textContent='현재 거래일의 신규 구조 '+researchTotal+'건 · 집중후보와 별도 · 매수 금지 · 데이터/위험 확인 대기';for(const r of researchRows){const item=document.createElement('div');item.className='rule';const title=document.createElement('b');title.textContent=String(r.name||'UNAVAILABLE')+'('+String(r.code||'')+') · '+String(r.price??'UNAVAILABLE')+'원 · '+String(r.change_pct??'UNAVAILABLE')+'%';const note=document.createElement('div');note.className='small muted';note.textContent=(r.hvtb_reason||r.upstream_state||r.re25_setup_state||'신규 구조')+' / '+(r.hvtb_action_reason||'매수 미승인')+' / '+[...(r.gate_failures||[]),...(r.gate_pending||[])].join(', ');item.append(title,note);list.append(item);}}\nasync function fetchJSON(path,signal){"),
+        ('monitorRows=b.value.monitor_rows||[];','monitorRows=b.value.monitor_rows||[];researchRows=b.value.research_rows||[];researchTotal=b.value.research_total||0;'),
+        ('latestScan={};board=[];monitorRows=[];poolMeta={};events=[];','latestScan={};board=[];monitorRows=[];researchRows=[];researchTotal=0;poolMeta={};events=[];'),
+        ('tab=t.dataset.tab;loaded=200;board=[];monitorRows=[];poolMeta={};render();','tab=t.dataset.tab;loaded=200;board=[];monitorRows=[];researchRows=[];researchTotal=0;poolMeta={};render();'),
+        ('catch(e){if(id!==requestId)return;board=[];monitorRows=[];poolMeta={pending:true};','catch(e){if(id!==requestId)return;board=[];monitorRows=[];researchRows=[];researchTotal=0;poolMeta={pending:true};'),
+    ]
+    for old,new in edits:
+        if html.count(old)!=1:raise ValueError('RESEARCH_UI_ANCHOR_MISMATCH:'+old[:70])
         html=html.replace(old,new,1)
     return html
 
@@ -316,6 +393,8 @@ def _candidate_pool(row,current,e,refresh_seconds=600,*,require_quote=True):
     cap=_finite_number(row.get('market_cap_100m'))
     if _explicit_exclusion(row.get('name')) or row.get('common_stock_confirmed') is False or (cap is not None and not 700<=cap<=_cap_ceiling()):
         return 'MONITOR','EXCLUDED_SECURITY',False,age
+    if row.get('news_gate') in getattr(e,'NEWS_BLOCK',set()) or row.get('market_state') in getattr(e,'VETO',set()) or row.get('overhang_veto') is True:
+        return 'MONITOR','EXPLICIT_RISK_VETO',False,age
     if not proof:
         return 'MONITOR','DATA_HOLD' if row.get('candidate_lifecycle') in ('DATA_HOLD','HIDDEN_STALE') else 'SELECTION_RECONFIRM_PENDING',False,age
     # Price refresh never repairs a missing completed KRX history window.
@@ -491,6 +570,29 @@ def _install_candidate_lifecycle(e):
     e.Store.reconcile=reconcile
 
 
+def _repair_roster(result,current,e):
+    """History-only symbol roster from an already fetched native source.
+
+    Never elevate this fallback to a live authority snapshot or an exact full
+    market match. Only the dedicated EOD worker sees the repairable roster.
+    """
+    rows,manifest,complete,path,errors=result
+    if complete:return result,'LIVE_ROSTER'
+    if path!='/api/ledger/latest/rows' or not isinstance(manifest,dict):return result,'PENDING_ROSTER'
+    if manifest.get('status')!='READY' or manifest.get('market')!='KRX' or manifest.get('immutable') is not True:return result,'PENDING_ROSTER'
+    if not e.fresh(manifest.get('completed_at'),current,7*86400):return result,'PENDING_ROSTER'
+    expected=_finite_number(manifest.get('collected_symbols'))
+    if expected is None or expected!=len(rows) or not rows:return result,'PENDING_ROSTER'
+    full=_finite_number(manifest.get('expected_symbols'))
+    if full is not None and full!=expected:return result,'PENDING_ROSTER'
+    rid=manifest.get('round_id')
+    if not isinstance(rid,str) or not rid.endswith('_KRX'):return result,'PENDING_ROSTER'
+    if any(isinstance(r,dict) and r.get('round_id') not in (None,rid) for r in rows):return result,'PENDING_ROSTER'
+    codes=[e.code(r) for r in rows if isinstance(r,dict) and e.venue(r)=='KRX' and e.valid_code(e.code(r))]
+    if len(codes)!=len(rows) or len(set(codes))!=len(rows):return result,'PENDING_ROSTER'
+    return (rows,manifest,True,path,list(errors or [])+['REPAIR_ONLY_IMMUTABLE_ROSTER_NOT_LIVE_AUTHORITY']),'IMMUTABLE_REPAIR_ROSTER'
+
+
 def _install_repair_scheduling(e):
     """Repair-only calendar fallback and retry; no trading gate relaxation."""
     from operations import history_repair as hr
@@ -513,6 +615,8 @@ def _install_repair_scheduling(e):
     hr.expected_closed_daily_date=expected
     old_batch=R.batch
     def batch(self,*a,**kw):
+        # No intraday work. The original worker enforces native busy, pacing,
+        # broker circuit breaker, and session boundary before every request.
         token=date_basis.set(None)
         try:return old_batch(self,*a,**kw)
         finally:date_basis.reset(token)
@@ -531,6 +635,20 @@ def _install_repair_scheduling(e):
     old_init=R.__init__
     def init(self,*a,**kw):
         old_init(self,*a,**kw)
+        # Only the dedicated history worker gets a roster adapter. Trading
+        # Operations.source, its API and audit stay exactly unchanged.
+        target=getattr(self,'operations',None)
+        if target is not None:
+            owner=self
+            class RepairOperations:
+                def __getattr__(proxy,name):return getattr(target,name)
+                def source(proxy,market):
+                    raw=target.source(market)
+                    if market!='KRX':return raw
+                    result,basis=_repair_roster(raw,owner.clock(),e)
+                    owner._set(repair_roster_basis=basis,repair_roster_size=len(result[0]),repair_roster_only=(basis=='IMMUTABLE_REPAIR_ROSTER'))
+                    return result
+            self.operations=RepairOperations()
         import json
         try:
             prior=json.loads(self.path.read_text(encoding='utf-8'))
@@ -546,7 +664,7 @@ def _install_repair_scheduling(e):
             while not self.stop.is_set():
                 try:
                     result=self.batch();reason=result.get('reason')
-                    if reason=='NATIVE_SCAN_RUNNING':wait=60
+                    if reason in ('NATIVE_SCAN_RUNNING','DAY_REPAIR_BUDGET_COOLDOWN'):wait=60
                     elif reason in ('LS_BROKER_CIRCUIT_OPEN','LS_HISTORY_ADAPTER_UNAVAILABLE','KIS_UNIVERSE_OR_COMPLETED_DAY_UNVERIFIED','LS_SYMBOL_RETRY_COOLDOWN'):wait=900
                     elif result.get('status')=='REPAIRING':wait=45
                     else:wait=600
@@ -737,12 +855,13 @@ def apply() -> None:
         audit=(getattr(ops,"authority_audit",{}) or {}).get(market,{})
         with scope_lock:
             proof=scope_cache.get(audit.get("symbol_scope_key"))
-        if proof is None:return None,None
-        day=proof[2]
         now=current or e.now()
+        master=_master_identity(ops,market,symbol,now,e)
+        if proof is None:return None,master
+        day=proof[2]
         if not day or day not in (now.date().isoformat(),last_closed_session_v10(now)):
-            return None,None
-        return symbol in proof[0],proof[1].get(symbol)
+            return None,master
+        return symbol in proof[0],_merge_identity(proof[1].get(symbol),master)
 
     e._V11_SCOPE_ENTRY=scope_entry
     original_base=e.Operations.base
@@ -750,8 +869,7 @@ def apply() -> None:
         normalized=_hvtb_authority_adapter(r)
         evaluation_clock=kwargs.get("current") or (args[5] if len(args)>5 else None)
         match,identity=scope_entry(self,market,e.code(r),evaluation_clock)
-        if normalized.get("common_stock_confirmed") is None and identity is not None:
-            normalized["common_stock_confirmed"]=identity
+        normalized["common_stock_confirmed"]=_merge_identity(normalized.get("common_stock_confirmed"),identity)
         out=original_base(self,normalized,market,*args,**kwargs)
         if normalized.get("common_stock_confirmed") is not None:
             out["common_stock_confirmed"]=normalized["common_stock_confirmed"]
@@ -992,7 +1110,7 @@ def _hvtb_merge_pool(pool, limit):
         return float(v) if isinstance(v,(int,float)) and v==v else -1e99
     original=sorted((z for z in pool if z.get("hvtb_v16_state")=="HVTB_FOCUS" and z.get("hvtb_state")=="HVTB_FOCUS"), key=lambda z:rank(z,"focus_priority"), reverse=True)
     challenger=sorted((z for z in pool if z.get("hvtb_paths") and z.get("hvtb_state")=="HVTB_FOCUS"),key=lambda z:(z.get("hvtb_v16_state")!="HVTB_FOCUS",rank(z,"hvtb_v17_priority")),reverse=True)
-    rest=sorted(pool,key=lambda z:({"HVTB_FOCUS":2,"ARMED":1,"WATCH":0}.get(z.get("hvtb_state"),-1),z.get("hvtb_identity_verified") is True,rank(z,"hvtb_v17_priority")),reverse=True)
+    rest=sorted(pool,key=lambda z:({"HVTB_FOCUS":2,"ARMED":1,"WATCH":0}.get(z.get("hvtb_state"),-1),bool(z.get("hvtb_paths") or (z.get("transfer_detected") is True and z.get("absorption_confirmed") is True)),z.get("hvtb_identity_verified") is True,rank(z,"hvtb_v17_priority")),reverse=True)
     result=[]; seen=set()
     def add(z):
         if z["code"] not in seen and len(result)<limit:
@@ -1220,18 +1338,19 @@ def _install_hvtb(e):
         except Exception as exc:
             return {"hvtb_action_state":"ACTION_WAIT", "hvtb_action_reason":"LS_5M_UNAVAILABLE", "ls_5m_error":type(exc).__name__}
 
-    def alpha_map(ops):
+    def alpha_map(ops,current):
         obj = ops.local("alpha", "KRX")
         out = {}
         if not isinstance(obj, dict):
             return out
         for key in ("sector_live_pool", "live_pool", "top_watch", "top_final"):
             for z in obj.get(key, []) or []:
-                if isinstance(z, dict) and e.valid_code(e.code(z)):
+                if isinstance(z, dict) and e.valid_code(e.code(z)) and (e.venue(z) or e.venue(obj))=='KRX':
                     zz=dict(z)
                     if not e.pick(zz,"source_timestamp","timestamp_kst","price_asof"):
                         zz["timestamp_kst"]=e.pick(obj,"source_timestamp","timestamp_kst","generated_at")
-                    if not zz.get("market_state") and obj.get("market_state"):
+                    state_at=e.pick(obj,"source_timestamp","timestamp_kst","generated_at")
+                    if not zz.get("market_state") and obj.get("market_state") and e.fresh(state_at,current,1200):
                         zz["market_state"]=obj["market_state"]
                     out[e.code(z)] = zz
         return out
@@ -1519,8 +1638,9 @@ def _install_hvtb(e):
 
     def _run_with_history(ops, current, allow_action, rows, hist, live_clock=False, refresh_only=False):
         meta = ((ops.runtime or {}).get("markets") or {}).get("KRX") or {}
-        expected = meta.get("history_expected_date") or e.last_closed_session(current)
-        amap = alpha_map(ops)
+        expected=e.last_closed_session(current)
+        if not expected:return {'status':'PENDING','error':'COMPLETED_SESSION_UNVERIFIED','observed':0,'evaluated_scope':0}
+        amap = alpha_map(ops,current)
         fmrows, fm_fresh, fmobj = fullmarket_map(ops, current)
         news = ops.local("news", "KRX", current)
         news_meta = news.get("__meta__", {}) if isinstance(news, dict) else {}
@@ -1531,6 +1651,7 @@ def _install_hvtb(e):
         else:
             mcur,mprev,market_cur_count,market_prev_count=market_proxy(rows,hist,live,expected,current)
             ops._hvtb_market_proxy_cache={"expected":expected,"asof":e.stamp(current),"values":(mcur,mprev,market_cur_count,market_prev_count)}
+        if market_cur_count<10 or market_prev_count<10:mcur=mprev=None
         qmap = {e.code(r): r for r in rows}
         pool, evaluated, excluded_proven = [], set(), set()
         from collections import Counter
@@ -1549,8 +1670,7 @@ def _install_hvtb(e):
             fmrow = fmrows.get(c, {})
             cap = n(r.get("market_cap_100m"))
             match,identity=e._V11_SCOPE_ENTRY(ops,"KRX",c,current)
-            if r.get("common_stock_confirmed") is None and identity is not None:
-                r["common_stock_confirmed"]=identity
+            r["common_stock_confirmed"]=_merge_identity(r.get("common_stock_confirmed"),identity)
             r["authority_symbol_membership_verified"]=match
             if cap is None or not 700 <= cap <= _cap_ceiling() or r.get("common_stock_confirmed") is False:
                 diagnostics["CAP_OR_EXCLUDED_SECURITY"]+=1
@@ -1630,8 +1750,11 @@ def _install_hvtb(e):
             r = qmap[c]
             if live_clock:current=e.now()
             symbol_ok,identity=e._V11_SCOPE_ENTRY(ops,"KRX",c,current)
-            if r.get("common_stock_confirmed") is None and identity is not None:r["common_stock_confirmed"]=identity
-            if z.get("hvtb_state") == "HVTB_FOCUS":
+            r["common_stock_confirmed"]=_merge_identity(r.get("common_stock_confirmed"),identity)
+            discovery_focus=z.get("hvtb_state")=="HVTB_FOCUS"
+            detail_watch=(z.get("hvtb_state") in ("ARMED","WATCH") and
+                          (z.get("transfer_detected") is True and z.get("absorption_confirmed") is True or bool(z.get("hvtb_paths"))))
+            if discovery_focus or detail_watch:
                 if not live or not allow_action:
                     z.update(hvtb_action_state="PREOPEN_FOCUS" if not live else "ACTION_WAIT", hvtb_action_reason="WAIT_LIVE_5M")
                 elif z.get("overhang_veto") or r.get("common_stock_confirmed") is False or str(r.get("market_state") or "").upper() in BLOCK_MARKET_STATES:
@@ -1640,12 +1763,18 @@ def _install_hvtb(e):
                     z.update(hvtb_action_state="NO_CHASE", hvtb_action_reason="NO_CHASE_EXPANDED")
                 elif action_count >= 3 or count >= max_action:
                     z.update(hvtb_action_state="ACTION_WAIT", hvtb_action_reason="BOUNDED_SCAN_BUDGET")
-                elif not e.fresh(r.get("price_asof"), current) or not z.get("history_current_for_hvtb"):
+                elif not e.fresh(r.get("price_asof"), current) or r.get("quality") in ("EXPIRED","REST_STALE","STALE") or not z.get("history_current_for_hvtb"):
                     z.update(hvtb_action_state="ACTION_WAIT", hvtb_action_reason="STALE_AUTHORITY_OR_DAILY")
                 else:
                     count += 1
-                    z.update(action(ops, c, _hvtb_closed_bars(hist.get(c, []), expected), z.get("price"), current))
+                    detail=action(ops, c, _hvtb_closed_bars(hist.get(c, []), expected), z.get("price"), current)
+                    z.update(detail)
+                    z['hvtb_detail_checked']=True
+                    if not discovery_focus and z.get('hvtb_action_state')=='ACTION':
+                        z.update(hvtb_action_state='ACTION_WAIT',hvtb_action_reason='DETAIL_CONFIRMED_DISCOVERY_PENDING')
                     if live_clock:current=e.now()
+            if not (discovery_focus or detail_watch):
+                z.update(hvtb_action_state='ACTION_WAIT',hvtb_action_reason='DISCOVERY_STRUCTURE_INCOMPLETE')
             z["hvtb_discovery_origin"] = ("BOTH" if z.get("hvtb_v16_state")=="HVTB_FOCUS" and z.get("hvtb_paths") else "ORIGINAL" if z.get("hvtb_v16_state")=="HVTB_FOCUS" else "CHALLENGER" if z.get("hvtb_reason")=="INDEPENDENT_DISCOVERY" else "WATCH")
             signal = dict(z)
             signal["signal_track"] = "ACTION" if z.get("hvtb_action_state") == "ACTION" else z.get("hvtb_state")
@@ -1879,6 +2008,49 @@ def _install_history_cutoff_repair(e):
         return expected
     R._store_inventory=inventory
     R._validate_latest=validate
+    old_fetch=R._fetch_safe_krx_ohlc
+    @classmethod
+    def fetch_safe(cls,worker,symbol,expected,current):
+        from datetime import date,timedelta
+        import pandas as pd
+        store=worker.store
+        required=e.recent_sessions(expected.isoformat(),220)
+        rebase=getattr(worker,'_ops_daily_rebase',None)
+        if rebase is None:rebase=set();worker._ops_daily_rebase=rebase
+        if symbol in rebase or not required or not hasattr(store,'read') or not hasattr(worker,'ls') or not hasattr(store,'upsert'):
+            out=old_fetch(worker,symbol,expected,current)
+            rebase.discard(symbol);return out
+        cached=store.read('LS','KRX',symbol,limit=260)
+        existing={}
+        if cached is not None and not cached.empty:
+            for _,r in cached.iterrows():
+                day=str(r.get('timestamp'))[:10]
+                if cls._valid_bar(*(r.get(k) for k in ('open','high','low','close','volume'))):existing[day]=r
+        # Never use delta to hide old gaps or insufficient V1.7/MA depth.
+        if not set(required[:-1])<=set(existing):return old_fetch(worker,symbol,expected,current)
+        # Same native LS t8410 path, authentication, pacing and call count.
+        # Include 5 overlapping trading sessions for adjusted-price verification.
+        start=date.fromisoformat(required[-6]);df=worker.ls.get_daily_bars(symbol,start,expected)
+        if df is None or df.empty:raise ValueError('LS_DELTA_EMPTY')
+        good={}
+        for _,r in df.iterrows():
+            day=str(r.get('timestamp'))[:10]
+            if day not in required[-6:] or not cls._valid_bar(*(r.get(k) for k in ('open','high','low','close','volume'))):continue
+            good[day]=r
+        if not set(required[-6:])<=set(good):
+            rebase.add(symbol);raise ValueError('LS_DELTA_WINDOW_INCOMPLETE_FULL_RETRY')
+        for day in required[-6:-1]:
+            for k in ('open','high','low','close'):
+                if abs(float(good[day][k])/float(existing[day][k])-1)>0.001:
+                    # Adjusted history changed. Do not mix price bases; next
+                    # bounded retry performs the original full lookback.
+                    rebase.add(symbol);raise ValueError('LS_DELTA_REBASE_REQUIRED')
+        # Only real provider rows. Upsert canonicalizes timestamps in the
+        # existing HistoryStore. No new DB, schema or synthetic OHLCV.
+        safe=pd.DataFrame([good[d] for d in required[-6:]])
+        store.upsert('LS','KRX',symbol,safe)
+        return safe
+    R._fetch_safe_krx_ohlc=fetch_safe
 
 
 def _install_compact_checkpoint():
@@ -1955,6 +2127,44 @@ def _project_pool_row(row,payload,now,e,refresh_seconds=600):
     return row
 
 
+def _research_reason(row,now,e,refresh_seconds=600):
+    if row.get('candidate_pool_group')!='MONITOR':return None
+    if row.get('classification')=='REJECT' or row.get('stored_classification')=='REJECT' or row.get('candidate_stale') is True:return None
+    if row.get('candidate_lifecycle') not in ('CONFIRMED_THIS_CYCLE','OBSERVED_UNVERIFIED'):return None
+    if (_finite_number(row.get('candidate_miss_count')) or 0)!=0:return None
+    at=row.get('candidate_observed_at') or row.get('candidate_seen_at')
+    seen=e.dt(at)
+    if not seen or seen.date()!=now.date() or not e.fresh(at,now,max(600,2*int(refresh_seconds)+180)):return None
+    cap=_finite_number(row.get('market_cap_100m'))
+    if cap is None or not 700<=cap<=_cap_ceiling() or row.get('common_stock_confirmed') is False or _explicit_exclusion(row.get('name')):return None
+    if _chase_ok(row) is not True or row.get('news_gate') in getattr(e,'NEWS_BLOCK',set()) or row.get('market_state') in getattr(e,'VETO',set()) or row.get('overhang_veto') is True:return None
+    if not e.fresh(row.get('price_asof'),now) or row.get('quote_quality') in ('STALE','EXPIRED','REST_STALE'):return None
+    market=row.get('market');lane=row.get('lane')
+    if market=='KRX':
+        last=e.last_closed_session(now)
+        if not last or row.get('history_current') is not True or e.trade_date(row.get('history_asof'))!=last:return None
+    if lane=='HVTB_V1_6':
+        if market!='KRX' or not (row.get('hvtb_state')=='HVTB_FOCUS' or (row.get('hvtb_state')=='ARMED' and row.get('armed_structure') is True) or bool(row.get('hvtb_paths'))):return None
+    elif lane=='RE_EXPLOSION_25':
+        age,status=_re25_calendar_age(row,now,e)
+        if market!='KRX' or status!='IN_WINDOW' or (_finite_number(row.get('spike_high_pct')) or 0)<25:return None
+        if row.get('re25_event_only') is True or row.get('re25_daily_setup_confirmed') is not True or row.get('re25_setup_state')!='COMPRESSION_ARMED' or row.get('re25_runtime_state')=='INVALIDATED':return None
+    elif lane in ('RS_DAILY_DISCOVERY','ROTATION_DAILY_PROXY'):
+        if market!='KRX' or row.get('upstream_state')!='WATCH_PROXY' or (_finite_number(row.get('proxy_benchmark_sample')) or 0)<10:return None
+        if (_finite_number(row.get('rs5')) or 0)<=0 or (_finite_number(row.get('rs_delta')) or 0)<=0:return None
+        if lane=='ROTATION_DAILY_PROXY' and not row.get('proxy_leader_code'):return None
+    elif lane=='NXT_POST_ACCEL_LANE':
+        if market!='NXT' or not e.session_open_for_market('NXT',now,None) or now.hour*60+now.minute< (1000 if now.date().isoformat()==e.SPECIAL_SESSION_DATE else 940):return None
+        if not all(row.get(k) is True for k in ('impulse_seen','recompression_seen','reaccel_seen','high_hold60_confirmed')):return None
+        if not e.fresh(row.get('signal_asof'),now,600):return None
+    elif lane in ('V17_ACTION_PRE','ASYMMETRIC_RS','CAPITAL_HANDOFF'):
+        if not e.fresh(row.get('signal_asof'),now,600):return None
+        if lane=='V17_ACTION_PRE' and e.trade_date(row.get('signal_reference_date'))!=e.last_closed_session(now):return None
+        if row.get('lane_confirmed') is not True and row.get('upstream_state') not in ('ARMED','PRE_EXPLOSION_ARMED','PRE_LATENT','V_TURN_ARMED','SHOCK_ARMED'):return None
+    else:return None
+    return 'CURRENT_DISCOVERY_PENDING_ENTRY'
+
+
 def _install_operations_audit(e):
     """Observation-only diagnostics across all lanes. Never modifies broker data."""
     import time
@@ -1987,6 +2197,7 @@ def _install_operations_audit(e):
         payload["repair_version"]=REPAIR_VERSION
         payload["repair_errors"]=getattr(e,"OPERATIONS_REPAIR_ERRORS",{}).copy()
         payload["provider_diagnostics"]=getattr(self,"_v11_provider_diagnostics",{}).copy()
+        payload["identity_master_diagnostics"]=getattr(self,"_ops_identity_master_diagnostics",{}).copy()
         payload["policy"]={"cap_min_100m":700,"cap_max_100m":_cap_ceiling(),"min_live_rr":2,"max_live_risk_pct":6,"krx_no_chase_above_pct":5,"nxt_post_no_chase_at_pct":10,"broker_identity_required_for_entry":True,"daily_proxy_is_not_investor_flow":True,"candidate_pool":"CURRENT_CONFIRMED_SELECTION_ONLY","selection_ttl_seconds":max(600,2*max(300,int(getattr(self,"candidate_refresh_seconds",600)))+180),"quote_does_not_renew_selection":True,"monitor_view":"view=monitor"}
         def label_scan(scan):
             if not isinstance(scan,dict):return scan
@@ -2013,8 +2224,10 @@ def _install_operations_audit(e):
             query=parse_qs(urlparse(raw_path).query)
             market=(query.get("market") or ["KRX"])[0]
             lane=(query.get("lane") or [None])[0]
-            requested_limit=max(20,min(300,int((query.get("limit") or ["80"])[0])))
-            requested_offset=max(0,int((query.get("offset") or ["0"])[0]))
+            try:
+                requested_limit=max(20,min(300,int((query.get("limit") or ["80"])[0])))
+                requested_offset=max(0,int((query.get("offset") or ["0"])[0]))
+            except (ValueError,TypeError):return 400,{"error":"invalid pagination"}
             view=(query.get("view") or ["focus"])[0]
             if view not in ("focus","monitor","all"):return 400,{"error":"view must be focus, monitor or all"}
             # One consistent, streamed registry snapshot. Only current focus
@@ -2022,7 +2235,7 @@ def _install_operations_audit(e):
             # count and page; no quote refresh can grant a candidate slot.
             from collections import Counter
             from bisect import insort
-            focus=[]; monitor=[]; counts=Counter(); evaluated=0
+            focus=[]; monitor=[]; research=[]; counts=Counter(); evaluated=0
             page_cap=min(10000,requested_offset+requested_limit)
             if requested_offset>=10000:return 400,{"error":"offset must be below 10000"}
             try:
@@ -2038,6 +2251,12 @@ def _install_operations_audit(e):
                     item=(_registry_rank(row,e),row)
                     insort(bucket,item,key=lambda z:z[0])
                     if len(bucket)>page_cap:bucket.pop()
+                    reason=_research_reason(row,now,e,getattr(self,'candidate_refresh_seconds',600))
+                    if reason:
+                        counts['RESEARCH']+=1
+                        observation=dict(row,research_status=reason,classification='WATCH',decision='PENDING',candidate_pool_group='MONITOR',hvtb_action_state='ACTION_WAIT' if row.get('lane')=='HVTB_V1_6' else row.get('hvtb_action_state'),entry_phase='신규 발굴 · 매수 미승인')
+                        insort(research,(_registry_rank(observation,e),observation),key=lambda z:z[0])
+                        if len(research)>20:research.pop()
             except Exception as exc:
                 return 503,{"status":"PENDING","error":"CANDIDATE_REGISTRY_READ_FAILED","error_type":type(exc).__name__,"rows":[],"repair_version":REPAIR_VERSION}
             frows=[z[1] for z in focus];mrows=[z[1] for z in monitor]
@@ -2056,6 +2275,7 @@ def _install_operations_audit(e):
             payload.update(rows=selected,total=total,offset=requested_offset,view=view,
                            focus_total=counts["FOCUS"],monitor_total=counts["MONITOR"],registry_total=evaluated,
                            monitor_rows=mrows[:requested_limit] if view=="focus" else [],
+                           research_total=counts['RESEARCH'],research_rows=[z[1] for z in research] if view=='focus' else [],
                            pool_state_counts={k[6:]:v for k,v in counts.items() if k.startswith("state:")},
                            ranking_scope={"evaluated":evaluated,"total":evaluated,"complete":True},
                            pool_status="CURRENT_FOCUS" if counts["FOCUS"] else "NO_CURRENT_FOCUS")
@@ -2156,7 +2376,7 @@ def _install_independent_daily(e):
             for raw in rows:
                 r=_hvtb_authority_adapter(raw);c=e.code(r)
                 match,identity=e._V11_SCOPE_ENTRY(self,'KRX',c,t)
-                if r.get('common_stock_confirmed') is None and identity is not None:r['common_stock_confirmed']=identity
+                r['common_stock_confirmed']=_merge_identity(r.get('common_stock_confirmed'),identity)
                 if not r.get('sector') and c in sector_by_code:r['sector']=sector_by_code[c]
                 # EOD benchmark is independent of intraday freshness, but no stale
                 # quote can create a new current watch candidate or a verified miss.
