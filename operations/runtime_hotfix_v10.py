@@ -21,6 +21,7 @@ from __future__ import annotations
 HVTB_UI_REDEPLOY_SAFE_R4 = "HVTB_UI_REDEPLOY_SAFE_R4"
 DASHBOARD_COMPOSITION_R4 = "LIMIT_ATTACK_HVTB_V15_RESEARCH_BUILD_COMPOSE_R4"
 CANDIDATE_VISIBILITY_R5 = "PER_SYMBOL_PROOF__VISIBLE_PENDING__KEEP_LAST_GOOD"
+CANDIDATE_VISIBILITY_R6 = "FOCUS_ZERO_SHOW_LATEST_MONITOR__KEEP_LAST_GOOD_ON_FETCH_ERROR"
 
 import os
 from datetime import time as dtime
@@ -307,9 +308,9 @@ def _hvtb_patch_dashboard(html):
         ("후보 풀은 10분 단위로만 교체합니다. COMPRESSION_ARMED와 RED_NO_CHASE 재무장 감시 종목은 풀을 유지하고, 그 사이에는 30초 상태 확인으로 RED_NO_CHASE → REARM_WATCH → REARMED만 갱신합니다. 승격 2회 확인, 강등 3회 실패 또는 지지 즉시 이탈을 적용합니다.", "집중후보는 현재 거래일의 검증된 선정 결과만 표시합니다. RED_NO_CHASE·REARM_WATCH·DATA_HOLD·신규/만료 사건은 별도 감시 기록입니다. 10분 재선정·30초 상태 확인, 승격 2회·강등 3회 확인 및 지지 이탈 기준은 유지합니다."),
         ("직전 화면은 ", "마지막 정상 수신은 "),
         (" 수신 자료입니다.", "입니다. 현재 집중후보는 표시하지 않습니다."),
-        ("function emptyStateMessage(){", "function emptyStateMessage(){\n if(!['events','outcomes','news'].includes(tab)&&!$('allRows').checked&&poolMeta.focus===0)return '<strong>현재 확인된 집중후보 0건</strong><div class=\"cellnote\">보류·재무장·사건 '+esc(poolMeta.monitor??0)+'건은 별도 감시 기록에 보존됩니다. '+(poolMeta.pending?'원장 검증 대기 · 신규 후보 미확정':'현재 집중후보 조건 미충족')+'</div>';"),
+        ("function emptyStateMessage(){", "function emptyStateMessage(){\n if(!['events','outcomes','news'].includes(tab)&&!$('allRows').checked&&poolMeta.focus===0)return '<strong>현재 매수승인 집중후보 0건</strong><div class=\"cellnote\">감시 후보 '+esc(poolMeta.monitor??0)+'건 · 최신 후보는 표에 표시하며 매수는 미승인 상태입니다. '+(poolMeta.pending?'원장/일봉 검증 대기':'현재 진입 게이트 미충족')+'</div>';"),
         ("board.filter(r=>tab==='news'||", "(board.concat($('allRows').checked||search?monitorRows:(poolMeta.focus===0?fallbackMonitorRows():[]))).filter(r=>tab==='news'||"),
-        ("if(!['news','events','outcomes'].includes(tab)&&!$('allRows').checked&&!search)source=source.filter(r=>!['EXCLUDED_SECURITY','EVENT_ONLY'].includes(r.live_board_state)&&(tab==='RE_EXPLOSION_25'||r.live_board_state!=='NO_CHASE'));", "if(!['news','events','outcomes'].includes(tab)&&!$('allRows').checked&&!search)source=source.filter(r=>r.candidate_pool_group==='FOCUS');"),
+        ("if(!['news','events','outcomes'].includes(tab)&&!$('allRows').checked&&!search)source=source.filter(r=>!['EXCLUDED_SECURITY','EVENT_ONLY'].includes(r.live_board_state)&&(tab==='RE_EXPLOSION_25'||r.live_board_state!=='NO_CHASE'));", "if(!['news','events','outcomes'].includes(tab)&&!$('allRows').checked&&!search){if(poolMeta.focus===0){const fallbackCodes=new Set(fallbackMonitorRows().map(r=>String(r.code||'')));source=source.filter(r=>fallbackCodes.has(String(r.code||'')));}else{source=source.filter(r=>r.candidate_pool_group==='FOCUS');}}"),
         ("$('rowCount').textContent=shown.length+' / '+source.length+'건';", "$('rowCount').textContent=shown.length+' / '+source.length+'건';if(!['events','outcomes','news'].includes(tab)&&poolMeta.focus!==undefined){$('rowCount').textContent+=' · 집중 '+poolMeta.focus+' / 감시 '+poolMeta.monitor;if(poolMeta.focus===0&&!$('allRows').checked&&!search){const fb=fallbackMonitorRows();if(fb.length)$('rowCount').textContent+=' · 최근후보 '+fb.length+' 표시';}}"),
         ("'종목 클릭 → 승격 조건·무효화·데이터 검증 상세';", "'집중후보 '+(poolMeta.focus??'미확인')+'건 · 별도 감시 '+(poolMeta.monitor??'미확인')+'건 · 종목 클릭 → 검증 상세';"),
         ("tab==='RE_EXPLOSION_25'?badge(r.re25_runtime_state||r.re25_setup_state)", "tab==='RE_EXPLOSION_25'?badge(r.candidate_pool_group==='MONITOR'?(r.live_board_state||'PENDING'):(r.re25_runtime_state||r.re25_setup_state))"),
@@ -319,7 +320,7 @@ def _hvtb_patch_dashboard(html):
         ("board=b.value.rows||[];lastGood=Date.now();", "board=b.value.rows||[];monitorRows=b.value.monitor_rows||[];poolMeta={focus:b.value.focus_total,monitor:b.value.monitor_total,pending:b.value.status!=='READY'};lastGood=Date.now();"),
         ("latestScan={};board=[];events=[];", "latestScan={};board=[];monitorRows=[];poolMeta={};events=[];"),
         ("tab=t.dataset.tab;loaded=200;board=[];render();", "tab=t.dataset.tab;loaded=200;board=[];monitorRows=[];poolMeta={};render();"),
-        ("catch(e){if(id!==requestId)return;$('connection')", "catch(e){if(id!==requestId)return;board=[];monitorRows=[];poolMeta={pending:true};render();$('connection')"),
+        ("catch(e){if(id!==requestId)return;$('connection')", "catch(e){if(id!==requestId)return;poolMeta={...poolMeta,pending:true};render();$('connection')"),
     ]
     for old,new in edits:
         if new in html:
