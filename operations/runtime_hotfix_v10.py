@@ -18,6 +18,8 @@ This module does not place orders, mutate broker caches, or change KIS/LS auth.
 """
 from __future__ import annotations
 
+HVTB_UI_REDEPLOY_SAFE_R2 = "HVTB_UI_REDEPLOY_SAFE_R2"
+
 import os
 from datetime import time as dtime
 
@@ -259,8 +261,13 @@ def _hvtb_patch_dashboard_v14(html):
         ("if(t){tab=t.dataset.tab;loaded=200;render();load(true)}", "if(t){tab=t.dataset.tab;loaded=200;board=[];render();load(true)}"),
     ]
     for old,new in edits:
-        if html.count(old)!=1:
-            raise ValueError("HVTB_UI_ANCHOR_MISMATCH: "+old[:75])
+        # Re-deploy safe: another additive patch may already have applied this exact
+        # transformation before runtime_hotfix runs. In that case do not fail.
+        if new in html:
+            continue
+        n=html.count(old)
+        if n!=1:
+            raise ValueError("HVTB_UI_ANCHOR_MISMATCH: "+old[:75]+f" count={n}")
         html=html.replace(old,new,1)
     return html
 
@@ -289,7 +296,10 @@ def _hvtb_patch_dashboard(html):
         ("catch(e){if(id!==requestId)return;$('connection')", "catch(e){if(id!==requestId)return;board=[];monitorRows=[];poolMeta={pending:true};render();$('connection')"),
     ]
     for old,new in edits:
-        if html.count(old)!=1:raise ValueError('V15_POOL_UI_ANCHOR_MISMATCH: '+old[:75])
+        if new in html:
+            continue
+        n=html.count(old)
+        if n!=1:raise ValueError('V15_POOL_UI_ANCHOR_MISMATCH: '+old[:75]+f' count={n}')
         html=html.replace(old,new,1)
     return _research_dashboard(html)
 
@@ -307,7 +317,10 @@ def _research_dashboard(html):
         ('catch(e){if(id!==requestId)return;board=[];monitorRows=[];poolMeta={pending:true};','catch(e){if(id!==requestId)return;board=[];monitorRows=[];researchRows=[];researchTotal=0;poolMeta={pending:true};'),
     ]
     for old,new in edits:
-        if html.count(old)!=1:raise ValueError('RESEARCH_UI_ANCHOR_MISMATCH:'+old[:70])
+        if new in html:
+            continue
+        n=html.count(old)
+        if n!=1:raise ValueError('RESEARCH_UI_ANCHOR_MISMATCH:'+old[:70]+f' count={n}')
         html=html.replace(old,new,1)
     return html
 

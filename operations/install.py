@@ -6,8 +6,10 @@ import sys
 
 try:
     from .apply_limit_attack_live_v1 import patch_all as _limit_attack_patch_all
+    from .apply_runtime_resource_guard_r2 import patch_all as _runtime_resource_guard_patch_all
 except ImportError:
     from apply_limit_attack_live_v1 import patch_all as _limit_attack_patch_all
+    from apply_runtime_resource_guard_r2 import patch_all as _runtime_resource_guard_patch_all
 
 MARK='OPERATIONS_PROJECTION_V1'
 SYNC_MARK='US_PRE_NXT_SYNC_V1_HOOK'
@@ -75,4 +77,8 @@ if __name__=='__main__':
     # Patch only the copied /app/operations projection. If any anchor changed,
     # fail the Docker build rather than deploying a partially wired lane.
     _limit_attack_patch_all(Path(__file__).resolve().parent)
+    # Patch the already-embedded read-only common-gate runner in /app.
+    # This is build-time only and does not change broker/data routes.
+    status = _runtime_resource_guard_patch_all(Path("/app"))
+    print("RUNTIME_RESOURCE_GUARD_R2", status)
     patch(sys.argv[1])
