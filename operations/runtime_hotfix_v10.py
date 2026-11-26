@@ -20,6 +20,7 @@ from __future__ import annotations
 
 HVTB_UI_REDEPLOY_SAFE_R4 = "HVTB_UI_REDEPLOY_SAFE_R4"
 DASHBOARD_COMPOSITION_R4 = "LIMIT_ATTACK_HVTB_V15_RESEARCH_BUILD_COMPOSE_R4"
+CANDIDATE_VISIBILITY_R5 = "PER_SYMBOL_PROOF__VISIBLE_PENDING__KEEP_LAST_GOOD"
 
 import os
 from datetime import time as dtime
@@ -301,15 +302,15 @@ def _hvtb_patch_dashboard(html):
     html=_hvtb_patch_dashboard_v14(html)
     if 'OPS_V15_POOL_UI' in html:return _research_dashboard(html)
     edits=[
-        ("let shown=[],latestScan={},hvtbMeta={}; // HVTB_OPERATIONS_UI_20261124", "let shown=[],latestScan={},hvtbMeta={},monitorRows=[],poolMeta={}; // HVTB_OPERATIONS_UI_20261124 OPS_V15_POOL_UI"),
+        ("let shown=[],latestScan={},hvtbMeta={}; // HVTB_OPERATIONS_UI_20261124", "let shown=[],latestScan={},hvtbMeta={},monitorRows=[],poolMeta={}; // HVTB_OPERATIONS_UI_20261124 OPS_V15_POOL_UI CANDIDATE_VISIBILITY_R5\nfunction monitorEvidenceDay(r){const at=r.selection_verified_at||r.candidate_seen_at||r.candidate_observed_at||r.signal_asof;if(missing(at))return '';const d=new Date(at);if(Number.isNaN(+d))return '';return d.toLocaleDateString('en-CA',{timeZone:'Asia/Seoul'});}\nfunction fallbackMonitorRows(){const blocked=['EXCLUDED_SECURITY','EVENT_ONLY','EXPIRED_EVENT','EXPLICIT_RISK_VETO'];const safe=monitorRows.filter(r=>r&&r.candidate_stale!==true&&!blocked.includes(r.live_board_state));let latest='';for(const r of safe){const d=monitorEvidenceDay(r);if(d>latest)latest=d;}return latest?safe.filter(r=>monitorEvidenceDay(r)===latest):[];}"),
         ("수신 후보 전체 보기", "보류·재무장·사건 기록 함께 보기"),
         ("후보 풀은 10분 단위로만 교체합니다. COMPRESSION_ARMED와 RED_NO_CHASE 재무장 감시 종목은 풀을 유지하고, 그 사이에는 30초 상태 확인으로 RED_NO_CHASE → REARM_WATCH → REARMED만 갱신합니다. 승격 2회 확인, 강등 3회 실패 또는 지지 즉시 이탈을 적용합니다.", "집중후보는 현재 거래일의 검증된 선정 결과만 표시합니다. RED_NO_CHASE·REARM_WATCH·DATA_HOLD·신규/만료 사건은 별도 감시 기록입니다. 10분 재선정·30초 상태 확인, 승격 2회·강등 3회 확인 및 지지 이탈 기준은 유지합니다."),
         ("직전 화면은 ", "마지막 정상 수신은 "),
         (" 수신 자료입니다.", "입니다. 현재 집중후보는 표시하지 않습니다."),
         ("function emptyStateMessage(){", "function emptyStateMessage(){\n if(!['events','outcomes','news'].includes(tab)&&!$('allRows').checked&&poolMeta.focus===0)return '<strong>현재 확인된 집중후보 0건</strong><div class=\"cellnote\">보류·재무장·사건 '+esc(poolMeta.monitor??0)+'건은 별도 감시 기록에 보존됩니다. '+(poolMeta.pending?'원장 검증 대기 · 신규 후보 미확정':'현재 집중후보 조건 미충족')+'</div>';"),
-        ("board.filter(r=>tab==='news'||", "(board.concat($('allRows').checked||search?monitorRows:[])).filter(r=>tab==='news'||"),
+        ("board.filter(r=>tab==='news'||", "(board.concat($('allRows').checked||search?monitorRows:(poolMeta.focus===0?fallbackMonitorRows():[]))).filter(r=>tab==='news'||"),
         ("if(!['news','events','outcomes'].includes(tab)&&!$('allRows').checked&&!search)source=source.filter(r=>!['EXCLUDED_SECURITY','EVENT_ONLY'].includes(r.live_board_state)&&(tab==='RE_EXPLOSION_25'||r.live_board_state!=='NO_CHASE'));", "if(!['news','events','outcomes'].includes(tab)&&!$('allRows').checked&&!search)source=source.filter(r=>r.candidate_pool_group==='FOCUS');"),
-        ("$('rowCount').textContent=shown.length+' / '+source.length+'건';", "$('rowCount').textContent=shown.length+' / '+source.length+'건';if(!['events','outcomes','news'].includes(tab)&&poolMeta.focus!==undefined)$('rowCount').textContent+=' · 집중 '+poolMeta.focus+' / 감시 '+poolMeta.monitor;"),
+        ("$('rowCount').textContent=shown.length+' / '+source.length+'건';", "$('rowCount').textContent=shown.length+' / '+source.length+'건';if(!['events','outcomes','news'].includes(tab)&&poolMeta.focus!==undefined){$('rowCount').textContent+=' · 집중 '+poolMeta.focus+' / 감시 '+poolMeta.monitor;if(poolMeta.focus===0&&!$('allRows').checked&&!search){const fb=fallbackMonitorRows();if(fb.length)$('rowCount').textContent+=' · 최근후보 '+fb.length+' 표시';}}"),
         ("'종목 클릭 → 승격 조건·무효화·데이터 검증 상세';", "'집중후보 '+(poolMeta.focus??'미확인')+'건 · 별도 감시 '+(poolMeta.monitor??'미확인')+'건 · 종목 클릭 → 검증 상세';"),
         ("tab==='RE_EXPLOSION_25'?badge(r.re25_runtime_state||r.re25_setup_state)", "tab==='RE_EXPLOSION_25'?badge(r.candidate_pool_group==='MONITOR'?(r.live_board_state||'PENDING'):(r.re25_runtime_state||r.re25_setup_state))"),
         ("esc(r.expansion_phase||'PENDING')", "esc(r.candidate_pool_group==='MONITOR'?('별도 감시 · '+(r.live_board_state||'PENDING')):(r.expansion_phase||'PENDING'))"),
@@ -339,7 +340,7 @@ def _research_dashboard(html):
         ('monitorRows=b.value.monitor_rows||[];','monitorRows=b.value.monitor_rows||[];researchRows=b.value.research_rows||[];researchTotal=b.value.research_total||0;'),
         ('latestScan={};board=[];monitorRows=[];poolMeta={};events=[];','latestScan={};board=[];monitorRows=[];researchRows=[];researchTotal=0;poolMeta={};events=[];'),
         ('tab=t.dataset.tab;loaded=200;board=[];monitorRows=[];poolMeta={};render();','tab=t.dataset.tab;loaded=200;board=[];monitorRows=[];researchRows=[];researchTotal=0;poolMeta={};render();'),
-        ('catch(e){if(id!==requestId)return;board=[];monitorRows=[];poolMeta={pending:true};','catch(e){if(id!==requestId)return;board=[];monitorRows=[];researchRows=[];researchTotal=0;poolMeta={pending:true};'),
+        ('catch(e){if(id!==requestId)return;board=[];monitorRows=[];poolMeta={pending:true};','catch(e){if(id!==requestId)return;poolMeta={...poolMeta,pending:true}; /* KEEP_LAST_GOOD_R5 */'),
     ]
     for old,new in edits:
         if new in html:
@@ -359,6 +360,8 @@ def _validate_dashboard_composition(html):
         "RESEARCH": "OPS_RESEARCH_PANEL_20261125",
         "LIMIT_COLUMNS": "const limitColumns=",
         "RESEARCH_RENDER": "function renderResearch()",
+        "VISIBILITY_R5": "CANDIDATE_VISIBILITY_R5",
+        "KEEP_LAST_GOOD_R5": "KEEP_LAST_GOOD_R5",
     }
     missing=[name for name,mark in required.items() if mark not in html]
     if missing:
@@ -498,8 +501,11 @@ def _candidate_pool(row,current,e,refresh_seconds=600,*,require_quote=True):
         hm=current.hour*60+current.minute
         if market!='NXT' or not ((1000 if current.date().isoformat()==e.SPECIAL_SESSION_DATE else 940)<=hm<1200) or not e.session_open_for_market('NXT',current,None):
             return 'MONITOR','OUTSIDE_LANE_SESSION',False,age
-    if cap is None or row.get('common_stock_confirmed') is not True:
-        return 'MONITOR','IDENTITY_OR_CAP_PENDING',True,age
+    if cap is None:
+        return 'MONITOR','CAP_PENDING',True,age
+    # CANDIDATE_VISIBILITY_R5: unknown security identity blocks ENTRY, not candidate visibility.
+    # Explicit non-common securities were already excluded above; SECURITY_COMMON stays PENDING in gates.
+    identity_pending = row.get('common_stock_confirmed') is not True
     if require_quote and (not e.fresh(row.get('price_asof'),current) or row.get('quote_quality') in ('STALE','EXPIRED','REST_STALE') or row.get('runtime_quote_grade')=='STALE'):
         return 'MONITOR','QUOTE_RECONFIRM_PENDING',True,age
     if lane=='RE_EXPLOSION_25':
@@ -518,7 +524,7 @@ def _candidate_pool(row,current,e,refresh_seconds=600,*,require_quote=True):
     if row.get('classification')=='REJECT':return 'MONITOR','REJECT',False,age
     if row.get('classification') not in ('PRIME','ARMED','PRE_EXPLOSION_ARMED','WATCH'):
         return 'MONITOR','SETUP_PENDING',True,age
-    return 'FOCUS',str(row['classification']),True,age
+    return 'FOCUS','IDENTITY_PENDING' if identity_pending else str(row['classification']),True,age
 
 
 def _registry_iter(store,market,lane=None):
@@ -537,7 +543,7 @@ def _registry_iter(store,market,lane=None):
 def _registry_rank(row,e):
     """Proof time outranks quote time; current valid setups outrank monitoring."""
     state=row.get('live_board_state') or row.get('classification')
-    states={'PRIME':0,'ARMED':1,'PRE_EXPLOSION_ARMED':2,'WATCH':3,'REARM_MONITOR':4,'IDENTITY_OR_CAP_PENDING':5,'QUOTE_RECONFIRM_PENDING':6,'DAILY_RECONFIRM_PENDING':7,'DATA_HOLD':8,'SELECTION_RECONFIRM_PENDING':9,'NO_CHASE':10,'REJECT':11,'EVENT_ONLY':12,'EXPIRED_EVENT':13,'EXCLUDED_SECURITY':14}
+    states={'PRIME':0,'ARMED':1,'PRE_EXPLOSION_ARMED':2,'WATCH':3,'IDENTITY_PENDING':4,'REARM_MONITOR':5,'CAP_PENDING':6,'IDENTITY_OR_CAP_PENDING':7,'QUOTE_RECONFIRM_PENDING':8,'DAILY_RECONFIRM_PENDING':9,'DATA_HOLD':10,'SELECTION_RECONFIRM_PENDING':11,'NO_CHASE':12,'REJECT':13,'EVENT_ONLY':14,'EXPIRED_EVENT':15,'EXCLUDED_SECURITY':16}
     seen=e.dt(row.get('candidate_seen_at'))
     return (states.get(state,15),-(seen.timestamp() if seen else 0),str(row.get('lane') or ''),str(row.get('code') or ''))
 

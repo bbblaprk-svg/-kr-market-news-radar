@@ -7,10 +7,12 @@ import sys
 try:
     from .apply_limit_attack_live_v1 import patch_all as _limit_attack_patch_all
     from .apply_runtime_resource_guard_r2 import patch_all as _runtime_resource_guard_patch_all
+    from .apply_candidate_visibility_repair_r5 import patch_all as _candidate_visibility_patch_all
     from .runtime_hotfix_v10 import compose_dashboard_file as _compose_dashboard_file, dashboard_composition_selftest as _dashboard_composition_selftest
 except ImportError:
     from apply_limit_attack_live_v1 import patch_all as _limit_attack_patch_all
     from apply_runtime_resource_guard_r2 import patch_all as _runtime_resource_guard_patch_all
+    from apply_candidate_visibility_repair_r5 import patch_all as _candidate_visibility_patch_all
     from runtime_hotfix_v10 import compose_dashboard_file as _compose_dashboard_file, dashboard_composition_selftest as _dashboard_composition_selftest
 
 MARK='OPERATIONS_PROJECTION_V1'
@@ -82,8 +84,11 @@ if __name__=='__main__':
     selftest=_dashboard_composition_selftest()
     print("DASHBOARD_COMPOSITION_R4_SELFTEST", selftest)
 
-    # Single-writer build order:
-    # LIMIT_ATTACK -> HVTB/V15/Research composition -> resource guard -> HTTP wiring
+    # Single build-time repair order:
+    # candidate proof/visibility -> LIMIT_ATTACK -> HVTB/V15/Research composition -> resource guard -> HTTP wiring
+    visibility_status=_candidate_visibility_patch_all(ops_root)
+    print("CANDIDATE_VISIBILITY_R5", visibility_status)
+
     _limit_attack_patch_all(ops_root)
 
     dashboard_status=_compose_dashboard_file(ops_root / "dashboard.html")
