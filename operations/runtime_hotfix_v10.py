@@ -18,7 +18,8 @@ This module does not place orders, mutate broker caches, or change KIS/LS auth.
 """
 from __future__ import annotations
 
-HVTB_UI_REDEPLOY_SAFE_R2 = "HVTB_UI_REDEPLOY_SAFE_R2"
+HVTB_UI_REDEPLOY_SAFE_R4 = "HVTB_UI_REDEPLOY_SAFE_R4"
+DASHBOARD_COMPOSITION_R4 = "LIMIT_ATTACK_HVTB_V15_RESEARCH_BUILD_COMPOSE_R4"
 
 import os
 from datetime import time as dtime
@@ -237,6 +238,19 @@ def _hvtb_project_row(row, meta, current, fresh, session_open):
     return row
 
 
+def _dashboard_replace_one_of(html, variants, new, label):
+    """Replace exactly one recognized predecessor, or accept the final form."""
+    if new in html:
+        return html
+    hits=[old for old in variants if old in html]
+    if len(hits)!=1:
+        raise ValueError(f"{label}_VARIANT_MISMATCH hits={len(hits)}")
+    old=hits[0]
+    if html.count(old)!=1:
+        raise ValueError(f"{label}_ANCHOR_COUNT={html.count(old)}")
+    return html.replace(old,new,1)
+
+
 def _hvtb_patch_dashboard_v14(html):
     """Exact anchors from deployed operations/dashboard.html; fail before writing if layout differs."""
     marker = "HVTB_OPERATIONS_UI_20261124"
@@ -257,7 +271,6 @@ def _hvtb_patch_dashboard_v14(html):
         ("source=source.filter(r=>(!search", "if(!['news','events','outcomes'].includes(tab)&&!$('allRows').checked&&!search)source=source.filter(r=>!['EXCLUDED_SECURITY','EVENT_ONLY'].includes(r.live_board_state)&&(tab==='RE_EXPLOSION_25'||r.live_board_state!=='NO_CHASE'));source=source.filter(r=>(!search"),
         ("latestScan=scan;$('scanTime')", "latestScan=scan;hvtbMeta=b.value.hvtb_lane_status||{};$('scanTime')"),
         ("if(results[1]?.status==='fulfilled')", "if(b.value.provider_diagnostics){const q=b.value.provider_diagnostics;const bad=Object.entries(q).filter(([k,v])=>v.error||v.status==='PENDING');if(bad.length)$('notice').textContent+=' · 공급자 확인: '+bad.map(([k,v])=>k+':'+(v.error||v.status)).join(', ');}if(b.value.runtime_error){$('notice').textContent+=' · 실행 오류 '+esc(b.value.runtime_error_context)+' / '+esc(b.value.runtime_error)+' / '+when(b.value.runtime_error_at);$('notice').className='notice error';}if(results[1]?.status==='fulfilled')"),
-        ("if(market==='NXT'&&tab==='V17_ACTION_PRE')", "if(market==='NXT'&&['V17_ACTION_PRE','HVTB_V1_6','RS_DAILY_DISCOVERY','ROTATION_DAILY_PROXY'].includes(tab))"),
         ("if(t){tab=t.dataset.tab;loaded=200;render();load(true)}", "if(t){tab=t.dataset.tab;loaded=200;board=[];render();load(true)}"),
     ]
     for old,new in edits:
@@ -269,6 +282,18 @@ def _hvtb_patch_dashboard_v14(html):
         if n!=1:
             raise ValueError("HVTB_UI_ANCHOR_MISMATCH: "+old[:75]+f" count={n}")
         html=html.replace(old,new,1)
+
+    final_nxt="if(market==='NXT'&&['V17_ACTION_PRE','LIMIT_ATTACK','HVTB_V1_6','RS_DAILY_DISCOVERY','ROTATION_DAILY_PROXY'].includes(tab))"
+    html=_dashboard_replace_one_of(
+        html,
+        [
+            "if(market==='NXT'&&tab==='V17_ACTION_PRE')",
+            "if(market==='NXT'&&['V17_ACTION_PRE','LIMIT_ATTACK'].includes(tab))",
+            "if(market==='NXT'&&['V17_ACTION_PRE','HVTB_V1_6','RS_DAILY_DISCOVERY','ROTATION_DAILY_PROXY'].includes(tab))",
+        ],
+        final_nxt,
+        "HVTB_NXT_SWITCH",
+    )
     return html
 
 
@@ -325,25 +350,79 @@ def _research_dashboard(html):
     return html
 
 
-def _hvtb_install_dashboard():
+def _validate_dashboard_composition(html):
+    """Fail closed unless all additive dashboard layers coexist once."""
+    required = {
+        "LIMIT_ATTACK": "LIMIT_ATTACK_LIVE_V1_0_RUNTIME_PATCH",
+        "HVTB": "HVTB_OPERATIONS_UI_20261124",
+        "POOL": "OPS_V15_POOL_UI",
+        "RESEARCH": "OPS_RESEARCH_PANEL_20261125",
+        "LIMIT_COLUMNS": "const limitColumns=",
+        "RESEARCH_RENDER": "function renderResearch()",
+    }
+    missing=[name for name,mark in required.items() if mark not in html]
+    if missing:
+        raise ValueError("DASHBOARD_COMPOSITION_MISSING:"+",".join(missing))
+    final_nxt="if(market==='NXT'&&['V17_ACTION_PRE','LIMIT_ATTACK','HVTB_V1_6','RS_DAILY_DISCOVERY','ROTATION_DAILY_PROXY'].includes(tab))"
+    if html.count(final_nxt)!=1:
+        raise ValueError(f"DASHBOARD_FINAL_NXT_SWITCH_COUNT={html.count(final_nxt)}")
+    stale=[
+        "if(market==='NXT'&&tab==='V17_ACTION_PRE')",
+        "if(market==='NXT'&&['V17_ACTION_PRE','LIMIT_ATTACK'].includes(tab))",
+    ]
+    if any(x in html for x in stale):
+        raise ValueError("DASHBOARD_STALE_SWITCH_REMAINS")
+    for tab in ("LIMIT_ATTACK","HVTB_V1_6","RS_DAILY_DISCOVERY","ROTATION_DAILY_PROXY"):
+        if html.count("['"+tab+"'") < 1:
+            raise ValueError("DASHBOARD_TAB_MISSING:"+tab)
+    return True
+
+
+def compose_dashboard_file(path):
+    """Single build-time writer for LIMIT_ATTACK + HVTB + V15 + Research UI."""
     from pathlib import Path
     from tempfile import NamedTemporaryFile
-    path = Path(__file__).resolve().with_name("dashboard.html")
-    old = path.read_text(encoding="utf-8")
-    new = _hvtb_patch_dashboard(old)
-    if new == old:
-        return "READY_ALREADY_PATCHED"
-    tmp = None
+    path=Path(path)
+    old=path.read_text(encoding="utf-8")
+    new=_hvtb_patch_dashboard(old)
+    _validate_dashboard_composition(new)
+    if new==old:
+        return "READY_BUILD_COMPOSED"
+    tmp=None
     try:
-        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as f:
-            tmp = Path(f.name)
+        with NamedTemporaryFile(mode="w",encoding="utf-8",dir=path.parent,delete=False) as f:
+            tmp=Path(f.name)
             f.write(new)
-        os.chmod(tmp, path.stat().st_mode & 0o777)
-        os.replace(tmp, path)
+        os.chmod(tmp,path.stat().st_mode & 0o777)
+        os.replace(tmp,path)
     finally:
         if tmp is not None and tmp.exists():
             tmp.unlink()
-    return "READY_HVTB_TAB"
+    return "READY_BUILD_COMPOSED_PATCHED"
+
+
+def dashboard_composition_selftest():
+    final="if(market==='NXT'&&['V17_ACTION_PRE','LIMIT_ATTACK','HVTB_V1_6','RS_DAILY_DISCOVERY','ROTATION_DAILY_PROXY'].includes(tab))"
+    variants=[
+        "if(market==='NXT'&&tab==='V17_ACTION_PRE')",
+        "if(market==='NXT'&&['V17_ACTION_PRE','LIMIT_ATTACK'].includes(tab))",
+        "if(market==='NXT'&&['V17_ACTION_PRE','HVTB_V1_6','RS_DAILY_DISCOVERY','ROTATION_DAILY_PROXY'].includes(tab))",
+        final,
+    ]
+    for predecessor in variants:
+        result=_dashboard_replace_one_of(predecessor,variants[:-1],final,"SELFTEST_NXT")
+        if result!=final:
+            raise AssertionError("DASHBOARD_VARIANT_SELFTEST_FAILED")
+    return "PASS"
+
+
+def _hvtb_install_dashboard():
+    # Runtime is validation-only. No live dashboard mutation is allowed.
+    from pathlib import Path
+    path=Path(__file__).resolve().with_name("dashboard.html")
+    html=path.read_text(encoding="utf-8")
+    _validate_dashboard_composition(html)
+    return "READY_BUILD_COMPOSED"
 
 
 # ---------------------------------------------------------------------------
