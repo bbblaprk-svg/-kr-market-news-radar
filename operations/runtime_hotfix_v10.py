@@ -22,6 +22,7 @@ HVTB_UI_REDEPLOY_SAFE_R4 = "HVTB_UI_REDEPLOY_SAFE_R4"
 DASHBOARD_COMPOSITION_R4 = "LIMIT_ATTACK_HVTB_V15_RESEARCH_BUILD_COMPOSE_R4"
 CANDIDATE_VISIBILITY_R5 = "PER_SYMBOL_PROOF__VISIBLE_PENDING__KEEP_LAST_GOOD"
 CANDIDATE_VISIBILITY_R6_BUILD_SAFE = "FOCUS_ZERO_SHOW_LATEST_MONITOR_ONLY"
+CANDIDATE_VISIBILITY_R7 = "LATEST_VALID_MONITOR_TIMESTAMP__UNAVAILABLE_SENTINEL_SAFE"
 
 import os
 from datetime import time as dtime
@@ -303,7 +304,7 @@ def _hvtb_patch_dashboard(html):
     html=_hvtb_patch_dashboard_v14(html)
     if 'OPS_V15_POOL_UI' in html:return _research_dashboard(html)
     edits=[
-        ("let shown=[],latestScan={},hvtbMeta={}; // HVTB_OPERATIONS_UI_20261124", "let shown=[],latestScan={},hvtbMeta={},monitorRows=[],poolMeta={}; // HVTB_OPERATIONS_UI_20261124 OPS_V15_POOL_UI CANDIDATE_VISIBILITY_R5\nfunction monitorEvidenceDay(r){const at=r.selection_verified_at||r.candidate_seen_at||r.candidate_observed_at||r.signal_asof;if(missing(at))return '';const d=new Date(at);if(Number.isNaN(+d))return '';return d.toLocaleDateString('en-CA',{timeZone:'Asia/Seoul'});}\nfunction fallbackMonitorRows(){const blocked=['EXCLUDED_SECURITY','EVENT_ONLY','EXPIRED_EVENT','EXPLICIT_RISK_VETO'];const safe=monitorRows.filter(r=>r&&r.candidate_stale!==true&&!blocked.includes(r.live_board_state));let latest='';for(const r of safe){const d=monitorEvidenceDay(r);if(d>latest)latest=d;}return latest?safe.filter(r=>monitorEvidenceDay(r)===latest):[];}"),
+        ("let shown=[],latestScan={},hvtbMeta={}; // HVTB_OPERATIONS_UI_20261124", "let shown=[],latestScan={},hvtbMeta={},monitorRows=[],poolMeta={}; // HVTB_OPERATIONS_UI_20261124 OPS_V15_POOL_UI CANDIDATE_VISIBILITY_R5\nfunction monitorEvidenceDay(r){const vals=[r.selection_verified_at,r.candidate_seen_at,r.candidate_observed_at,r.signal_asof,r.price_asof].filter(v=>!missing(v));let latest='';for(const v of vals){const d=new Date(v);if(Number.isNaN(+d))continue;const day=d.toLocaleDateString('en-CA',{timeZone:'Asia/Seoul'});if(day>latest)latest=day;}return latest;}\nfunction fallbackMonitorRows(){const blocked=['EXCLUDED_SECURITY','EVENT_ONLY','EXPIRED_EVENT','EXPLICIT_RISK_VETO'];const safe=monitorRows.filter(r=>r&&r.candidate_stale!==true&&!blocked.includes(r.live_board_state));let latest='';for(const r of safe){const d=monitorEvidenceDay(r);if(d>latest)latest=d;}return latest?safe.filter(r=>monitorEvidenceDay(r)===latest):[];}"),
         ("수신 후보 전체 보기", "보류·재무장·사건 기록 함께 보기"),
         ("후보 풀은 10분 단위로만 교체합니다. COMPRESSION_ARMED와 RED_NO_CHASE 재무장 감시 종목은 풀을 유지하고, 그 사이에는 30초 상태 확인으로 RED_NO_CHASE → REARM_WATCH → REARMED만 갱신합니다. 승격 2회 확인, 강등 3회 실패 또는 지지 즉시 이탈을 적용합니다.", "집중후보는 현재 거래일의 검증된 선정 결과만 표시합니다. RED_NO_CHASE·REARM_WATCH·DATA_HOLD·신규/만료 사건은 별도 감시 기록입니다. 10분 재선정·30초 상태 확인, 승격 2회·강등 3회 확인 및 지지 이탈 기준은 유지합니다."),
         ("직전 화면은 ", "마지막 정상 수신은 "),
