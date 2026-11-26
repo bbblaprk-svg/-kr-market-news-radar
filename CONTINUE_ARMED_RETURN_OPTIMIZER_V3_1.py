@@ -43,6 +43,8 @@ import json
 import math
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -53,11 +55,61 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-VERSION = "CONTINUE_ARMED_RETURN_OPTIMIZER_V3_1"
+VERSION = "CONTINUE_ARMED_RETURN_OPTIMIZER_V3_1_RESOURCE_ISOLATED_R1"
 DEFAULT_ROOT = Path("/data/results/smart_reaccel_mtf_v2_1")
 COST_BPS_TOTAL = float(os.getenv("RETURN_OPT_COST_BPS", "16"))
 SIDE_SLIP = (COST_BPS_TOTAL / 2.0) / 10000.0
 THRESHOLDS = (18.0, 20.0, 22.0, 25.0, 29.5)
+
+
+# -----------------------------------------------------------------------------
+# Runtime isolation controls
+# -----------------------------------------------------------------------------
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except Exception:
+        return max(minimum, int(default))
+
+
+def _parse_hhmm(v: str) -> int:
+    h, m = str(v).strip().split(":", 1)
+    hh, mm = int(h), int(m)
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        raise ValueError(f"invalid HH:MM: {v}")
+    return hh * 60 + mm
+
+
+def _in_run_window(ts=None) -> bool:
+    """True only in the configured KST low-impact batch window.
+
+    Default 20:10~07:30 deliberately excludes KRX regular hours and NXT evening
+    trading. A crossing-midnight window is supported.
+    """
+    if str(os.getenv("RETURN_OPT_FORCE_NOW", "false")).strip().lower() in {"1","true","yes","on"}:
+        return True
+    now = pd.Timestamp.now(tz="Asia/Seoul") if ts is None else pd.Timestamp(ts)
+    if now.tzinfo is None:
+        now = now.tz_localize("Asia/Seoul")
+    else:
+        now = now.tz_convert("Asia/Seoul")
+    cur = int(now.hour) * 60 + int(now.minute)
+    start = _parse_hhmm(os.getenv("RETURN_OPT_RUN_WINDOW_START", "20:10"))
+    end = _parse_hhmm(os.getenv("RETURN_OPT_RUN_WINDOW_END", "07:30"))
+    if start == end:
+        return True
+    if start < end:
+        return start <= cur < end
+    return cur >= start or cur < end
+
+
+def _cooperative_yield(counter: int) -> None:
+    """Small explicit yield used only by the offline optimizer loops."""
+    every = _env_int("RETURN_OPT_YIELD_EVERY", 20, 1)
+    ms = _env_int("RETURN_OPT_YIELD_MS", 25, 0)
+    if ms > 0 and counter > 0 and counter % every == 0:
+        time.sleep(ms / 1000.0)
+
 
 
 @dataclass(frozen=True)
@@ -571,6 +623,7 @@ def build_cohort(root: Path, event_df: pd.DataFrame, p: ArmedParams):
     rows = []
     frames = {}
     for k, e in event_df.iterrows():
+        _cooperative_yield(int(k) if isinstance(k, (int, np.integer)) else len(rows))
         one = load_cached_1m(root, e.date, e.code)
         if one.empty:
             continue
@@ -637,7 +690,8 @@ def run(args):
 
     trades = []
     entries_cache = {}
-    for _, e in cohort.iterrows():
+    for _row_i, (_, e) in enumerate(cohort.iterrows(), 1):
+        _cooperative_yield(_row_i)
         key = (str(e.date), str(e.code).zfill(6))
         f = frames[key]
         for style in ["ARMED_NEXT","VWAP_RETEST","MICRO_BOS_RETEST"]:
@@ -813,32 +867,51 @@ def self_test():
             s = Strategy(style,3.0,5.0,partial=True,trail=True)
             tr = simulate_trade(ff,i,s)
             assert tr is not None
-    print(json.dumps({"self_test":"PASS","armed":a},ensure_ascii=False,default=str,indent=2))
+    # Resource-isolation schedule contract.
+    os.environ.pop("RETURN_OPT_FORCE_NOW", None)
+    os.environ["RETURN_OPT_RUN_WINDOW_START"] = "20:10"
+    os.environ["RETURN_OPT_RUN_WINDOW_END"] = "07:30"
+    assert _in_run_window("2026-11-26 20:10:00+09:00")
+    assert _in_run_window("2026-11-27 07:29:00+09:00")
+    assert not _in_run_window("2026-11-26 09:00:00+09:00")
+    assert not _in_run_window("2026-11-26 19:59:00+09:00")
+    print(json.dumps({"self_test":"PASS","resource_isolation":"PASS","armed":a},ensure_ascii=False,default=str,indent=2))
 
 
 
 def _autorun():
-    """Optional same-service one-shot autorun.
+    """Low-impact scheduler for the offline optimizer.
 
-    Read-only consumer of the SMART_REACCEL persistent result/cache. It never
-    calls broker APIs and never changes upstream files or live lane state.
+    IMPORTANT: the heavy optimization never runs in the web-service process.
+    The web process keeps only this sleeping scheduler thread. When the KST
+    low-impact window opens, it launches a separate *nice* subprocess which
+    reads the persistent SMART_REACCEL cache. This protects KRX/NXT collectors,
+    HTTP latency, and websocket handling from optimizer CPU pressure.
     """
+    global _AUTORUN_STARTED
     if str(os.getenv("RETURN_OPT_AUTORUN", "false")).strip().lower() not in {"1","true","yes","on"}:
         return
-    outdir = Path(os.getenv(
-        "RETURN_OPT_OUTDIR",
-        "/data/results/continue_armed_return_optimizer_v3_1"
-    ))
-    marker = outdir / f"AUTORUN_{VERSION}_DONE.json"
+    if globals().get("_AUTORUN_STARTED", False):
+        return
+    _AUTORUN_STARTED = True
 
-    def job():
-        wait_s = max(5, int(os.getenv("RETURN_OPT_WAIT_SECONDS", "30")))
-        max_checks = max(1, int(os.getenv("RETURN_OPT_MAX_CHECKS", "120")))
-        root = Path(os.getenv("RETURN_OPT_ROOT", str(DEFAULT_ROOT)))
-        last_error = None
-        for _ in range(max_checks):
+    outdir = Path(os.getenv("RETURN_OPT_OUTDIR", "/data/results/continue_armed_return_optimizer_v3_1"))
+    marker = outdir / f"AUTORUN_{VERSION}_DONE.json"
+    poll_s = _env_int("RETURN_OPT_SCHEDULER_POLL_SECONDS", 300, 30)
+    retry_s = _env_int("RETURN_OPT_WAIT_SECONDS", 60, 10)
+    child_nice = min(19, _env_int("RETURN_OPT_CHILD_NICE", 15, 0))
+    root = Path(os.getenv("RETURN_OPT_ROOT", str(DEFAULT_ROOT)))
+
+    def _lower_child_priority():
+        try:
+            os.nice(child_nice)
+        except Exception:
+            pass
+
+    def scheduler():
+        announced_wait = False
+        while True:
             try:
-                # Require a completed upstream result directory and its cache.
                 latest = find_latest_result_dir(root)
                 if marker.exists():
                     try:
@@ -848,33 +921,74 @@ def _autorun():
                             return
                     except Exception:
                         pass
+
+                if not _in_run_window():
+                    if not announced_wait:
+                        print(
+                            "RETURN_OPT_SCHEDULED "
+                            + json.dumps({
+                                "mode":"SUBPROCESS_LOW_PRIORITY",
+                                "window_kst":f"{os.getenv('RETURN_OPT_RUN_WINDOW_START','20:10')}~{os.getenv('RETURN_OPT_RUN_WINDOW_END','07:30')}",
+                                "child_nice":child_nice,
+                                "root":str(root),
+                            }, ensure_ascii=False),
+                            flush=True,
+                        )
+                        announced_wait = True
+                    time.sleep(poll_s)
+                    continue
+
+                announced_wait = False
                 if not (root / "bar_cache_1m").exists():
                     raise FileNotFoundError(f"bar cache missing under {root}")
-                args = SimpleNamespace(
-                    root=str(root),
-                    input_csv=None,
-                    outdir=str(outdir),
+
+                child_env = os.environ.copy()
+                # Prevent BLAS/OpenMP helpers from multiplying CPU contention.
+                child_env.update({
+                    "OPENBLAS_NUM_THREADS":"1",
+                    "OMP_NUM_THREADS":"1",
+                    "MKL_NUM_THREADS":"1",
+                    "NUMEXPR_NUM_THREADS":"1",
+                    "VECLIB_MAXIMUM_THREADS":"1",
+                })
+                cmd = [
+                    sys.executable, str(Path(__file__).resolve()),
+                    "--root", str(root),
+                    "--outdir", str(outdir),
+                ]
+                print("RETURN_OPT_CHILD_START " + json.dumps({"cmd":cmd,"nice":child_nice}, ensure_ascii=False), flush=True)
+                proc = subprocess.Popen(
+                    cmd,
+                    env=child_env,
+                    stdout=None,
+                    stderr=None,
+                    preexec_fn=_lower_child_priority if os.name == "posix" else None,
                 )
-                run(args)
+                rc = proc.wait()
+                if rc != 0:
+                    raise RuntimeError(f"optimizer child exit={rc}")
+                report_path = outdir / "report.json"
+                if not report_path.exists():
+                    raise FileNotFoundError(f"optimizer report missing: {report_path}")
                 outdir.mkdir(parents=True, exist_ok=True)
                 marker.write_text(json.dumps({
-                    "version": VERSION,
-                    "source_result_dir": str(latest),
-                    "completed_at": pd.Timestamp.now(tz="Asia/Seoul").isoformat(),
-                    "status": "DONE",
+                    "version":VERSION,
+                    "source_result_dir":str(latest),
+                    "completed_at":pd.Timestamp.now(tz="Asia/Seoul").isoformat(),
+                    "status":"DONE",
+                    "execution_mode":"SUBPROCESS_LOW_PRIORITY",
+                    "child_nice":child_nice,
                 }, ensure_ascii=False, indent=2), encoding="utf-8")
                 print(f"RETURN_OPT_AUTORUN_DONE {marker}", flush=True)
                 return
             except Exception as e:
-                last_error = f"{type(e).__name__}:{e}"
-                # The upstream backtest may still be building its 1m cache.
-                time.sleep(wait_s)
-        print(f"RETURN_OPT_AUTORUN_ERROR {last_error}", flush=True)
+                print(f"RETURN_OPT_SCHEDULER_RETRY {type(e).__name__}:{e}", flush=True)
+                time.sleep(retry_s)
 
     threading.Thread(
-        target=job,
+        target=scheduler,
         daemon=True,
-        name="continue-armed-return-opt-v31",
+        name="return-opt-v31-low-impact-scheduler",
     ).start()
 
 

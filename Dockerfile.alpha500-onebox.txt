@@ -31789,17 +31789,26 @@ print('SMART_REACCEL_MTF_PATCH_OK')
 PY
 
 # ===== CONTINUE_ARMED_RETURN_OPTIMIZER_V3_1_PATCH_BEGIN =====
-# Additive only: consumes the existing SMART_REACCEL persistent cache.
-# It does not open broker sessions, change KRX/NXT data routes, or alter live lane decisions.
+# RESOURCE-ISOLATED R1: the web process keeps only a sleeping scheduler.
+# Heavy optimization starts only in the KST 20:10~07:30 low-impact window
+# as a separate low-priority subprocess. KRX/NXT live collectors stay priority.
 COPY CONTINUE_ARMED_RETURN_OPTIMIZER_V3_1.py /app/CONTINUE_ARMED_RETURN_OPTIMIZER_V3_1.py
 ENV RETURN_OPT_AUTORUN=true \
     RETURN_OPT_ROOT=/data/results/smart_reaccel_mtf_v2_1 \
     RETURN_OPT_OUTDIR=/data/results/continue_armed_return_optimizer_v3_1 \
-    RETURN_OPT_WAIT_SECONDS=30 \
-    RETURN_OPT_MAX_CHECKS=120
+    RETURN_OPT_RUN_WINDOW_START=20:10 \
+    RETURN_OPT_RUN_WINDOW_END=07:30 \
+    RETURN_OPT_SCHEDULER_POLL_SECONDS=300 \
+    RETURN_OPT_WAIT_SECONDS=60 \
+    RETURN_OPT_CHILD_NICE=15 \
+    RETURN_OPT_YIELD_EVERY=20 \
+    RETURN_OPT_YIELD_MS=25 \
+    RETURN_OPT_FORCE_NOW=false
 
 RUN python -m py_compile /app/CONTINUE_ARMED_RETURN_OPTIMIZER_V3_1.py \
  && python /app/CONTINUE_ARMED_RETURN_OPTIMIZER_V3_1.py --self-test \
+ && grep -Fq 'CONTINUE_ARMED_RETURN_OPTIMIZER_V3_1_RESOURCE_ISOLATED_R1' /app/CONTINUE_ARMED_RETURN_OPTIMIZER_V3_1.py \
+ && grep -Fq 'SUBPROCESS_LOW_PRIORITY' /app/CONTINUE_ARMED_RETURN_OPTIMIZER_V3_1.py \
  && python - <<'PY'
 from pathlib import Path
 p=Path('/app/오백종목_통합엔진_웹서비스_V1_0.py')
