@@ -21,7 +21,7 @@ from __future__ import annotations
 HVTB_UI_REDEPLOY_SAFE_R4 = "HVTB_UI_REDEPLOY_SAFE_R4"
 DASHBOARD_COMPOSITION_R4 = "LIMIT_ATTACK_HVTB_V15_RESEARCH_BUILD_COMPOSE_R4"
 CANDIDATE_VISIBILITY_R5 = "PER_SYMBOL_PROOF__VISIBLE_PENDING__KEEP_LAST_GOOD"
-CANDIDATE_VISIBILITY_R6 = "FOCUS_ZERO_SHOW_LATEST_MONITOR__KEEP_LAST_GOOD_ON_FETCH_ERROR"
+CANDIDATE_VISIBILITY_R6_BUILD_SAFE = "FOCUS_ZERO_SHOW_LATEST_MONITOR_ONLY"
 
 import os
 from datetime import time as dtime
@@ -320,7 +320,7 @@ def _hvtb_patch_dashboard(html):
         ("board=b.value.rows||[];lastGood=Date.now();", "board=b.value.rows||[];monitorRows=b.value.monitor_rows||[];poolMeta={focus:b.value.focus_total,monitor:b.value.monitor_total,pending:b.value.status!=='READY'};lastGood=Date.now();"),
         ("latestScan={};board=[];events=[];", "latestScan={};board=[];monitorRows=[];poolMeta={};events=[];"),
         ("tab=t.dataset.tab;loaded=200;board=[];render();", "tab=t.dataset.tab;loaded=200;board=[];monitorRows=[];poolMeta={};render();"),
-        ("catch(e){if(id!==requestId)return;$('connection')", "catch(e){if(id!==requestId)return;poolMeta={...poolMeta,pending:true};render();$('connection')"),
+        ("catch(e){if(id!==requestId)return;$('connection')", "catch(e){if(id!==requestId)return;board=[];monitorRows=[];poolMeta={pending:true};render();$('connection')"),
     ]
     for old,new in edits:
         if new in html:
